@@ -43,7 +43,7 @@ const config = {
   
   // CORS
   cors: {
-    allowedOrigins: process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:3000'],
+    allowedOrigins: process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:3000'],['https://umrahmarket-backend.onrender.com'],
     credentials: true,
   },
   
