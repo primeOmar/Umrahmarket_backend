@@ -1,4 +1,5 @@
 import express from 'express';
+import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import config, { validateConfig } from './config/security.config.js';
@@ -35,74 +36,104 @@ try {
 const app = express();
 
 // ===========================================
-// TRUST PROXY (for accurate IP detection behind load balancers)
+// TRUST PROXY (CRITICAL FOR RENDER)
 // ===========================================
-if (config.production.trustProxy) {
-  app.set('trust proxy', 1);
-}
+app.set('trust proxy', 1);
 
 // ===========================================
-// MIDDLEWARE - ORDER MATTERS!
+// CORS - MUST BE FIRST MIDDLEWARE
+// ===========================================
+const allowedOrigins = [
+  'http://localhost:5173',
+  'http://localhost:3000',
+  'https://umrahmarket.vercel.app',
+  ...(process.env.ALLOWED_ORIGINS?.split(',').map(o => o.trim()) || [])
+].filter(Boolean);
+
+console.log('🌐 CORS enabled for origins:', allowedOrigins);
+
+app.use(cors({
+  origin: function (origin, callback) {
+    // Allow requests with no origin (mobile apps, Postman, curl)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      console.warn('❌ CORS blocked:', origin);
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  exposedHeaders: ['X-RateLimit-Limit', 'X-RateLimit-Remaining'],
+  maxAge: 86400 // 24 hours
+}));
+
+// Handle preflight for all routes
+app.options('*', cors());
+
+// ===========================================
+// OTHER MIDDLEWARE
 // ===========================================
 
-// 1. CORS — must be first so the OPTIONS preflight gets
-//    Access-Control-Allow-* headers before anything else
-//    can reject or redirect the request.
-app.use(securityMiddleware.cors);
-app.options('*', securityMiddleware.cors); // explicit preflight short-circuit
-
-// 2. Security Headers
+// Security Headers (after CORS)
 app.use(securityMiddleware.securityHeaders);
 
-// 3. HTTPS Enforcement
-app.use(securityMiddleware.httpsEnforce);
+// HTTPS Enforcement (but not in dev)
+if (config.env === 'production') {
+  app.use(securityMiddleware.httpsEnforce);
+}
 
-// 4. Helmet (Security Headers)
+// Helmet (but with CORS-friendly settings)
 if (config.production.enableHelmet) {
   app.use(securityMiddleware.helmet);
 }
 
-// 5. Compression
+// Compression
 if (config.production.enableCompression) {
   app.use(securityMiddleware.compression);
 }
 
-// 6. Request Logger
+// Request Logger
 app.use(securityMiddleware.requestLogger);
 
-// 7. Body Parsers with size limits
+// Body Parsers
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// 8. Validation Error Handler
+// Validation Error Handler
 app.use(handleValidationErrors);
 
-// 9. Cookie Parser
+// Cookie Parser
 app.use(securityMiddleware.cookieParser);
 
-// 9. Request Size Limiter
+// Request Size Limiter
 app.use(securityMiddleware.requestSizeLimit);
 
-// 10. General Rate Limiter
+// General Rate Limiter
 app.use(securityMiddleware.generalRateLimit);
 
-// 11. Speed Limiter — skip for file uploads (legitimately slow, timeout otherwise)
+// Speed Limiter (skip for uploads)
 app.use((req, res, next) => {
-  if (req.path.startsWith('/upload')) return next();
+  if (req.path.startsWith('/upload') || req.path.startsWith('/api/upload') || req.path.startsWith('/api/documents')) {
+    return next();
+  }
   return securityMiddleware.speedLimit(req, res, next);
 });
 
-// 12. NoSQL Injection Prevention
+// NoSQL Injection Prevention
 app.use(securityMiddleware.sanitize);
 
-// 13. HTTP Parameter Pollution Prevention
+// HTTP Parameter Pollution Prevention
 app.use(securityMiddleware.hpp);
 
-// 14. IP Filter (Blacklist)
+// IP Filter
 app.use(securityMiddleware.ipFilter);
 
 // ===========================================
-// HEALTH CHECK ENDPOINT
+// HEALTH & DEBUG ENDPOINTS
 // ===========================================
 app.get('/health', (req, res) => {
   res.status(200).json({
@@ -114,13 +145,22 @@ app.get('/health', (req, res) => {
   });
 });
 
+app.get('/cors-test', (req, res) => {
+  res.json({
+    success: true,
+    message: 'CORS is working!',
+    origin: req.headers.origin,
+    allowedOrigins: allowedOrigins,
+    env: config.env
+  });
+});
+
 // ===========================================
 // API ROUTES
 // ===========================================
-app.use('/api/auth',      authRoutes);
-app.use('/api/upload',    uploadRoutes);
-app.use('/api/documents', documentRoutes); // Agent document uploads
-
+app.use('/api/auth', authRoutes);
+app.use('/api/upload', uploadRoutes);
+app.use('/api/documents', documentRoutes);
 
 // ===========================================
 // ROOT ENDPOINT
@@ -128,13 +168,14 @@ app.use('/api/documents', documentRoutes); // Agent document uploads
 app.get('/', (req, res) => {
   res.json({
     success: true,
-    message: 'Secure Authentication API',
+    message: 'Umrah Market API',
     version: '1.0.0',
-    documentation: '/api/docs',
     endpoints: {
       auth: '/api/auth',
       upload: '/api/upload',
+      documents: '/api/documents',
       health: '/health',
+      corsTest: '/cors-test'
     },
   });
 });
@@ -160,7 +201,6 @@ app.use((req, res) => {
 // GLOBAL ERROR HANDLER
 // ===========================================
 app.use((err, req, res, next) => {
-  // Log error
   logger.error('Unhandled error', {
     error: err.message,
     stack: err.stack,
@@ -169,7 +209,6 @@ app.use((err, req, res, next) => {
     ip: req.ip,
   });
   
-  // Don't leak error details in production
   const errorMessage = config.env === 'production'
     ? 'An unexpected error occurred'
     : err.message;
@@ -192,7 +231,6 @@ const gracefulShutdown = (signal) => {
     process.exit(0);
   });
   
-  // Force shutdown after 30 seconds
   setTimeout(() => {
     logger.error('Forced shutdown after timeout');
     process.exit(1);
@@ -218,7 +256,6 @@ process.on('uncaughtException', (error) => {
     stack: error.stack,
   });
   
-  // Exit process in production for safety
   if (config.env === 'production') {
     process.exit(1);
   }
@@ -227,35 +264,34 @@ process.on('uncaughtException', (error) => {
 // ===========================================
 // START SERVER
 // ===========================================
-const server = app.listen(config.port, async () => {
+const PORT = process.env.PORT || config.port || 10000;
+const server = app.listen(PORT, '0.0.0.0', async () => {
   logger.info('🚀 Server starting...', {
-    port: config.port,
+    port: PORT,
     environment: config.env,
     nodeVersion: process.version,
   });
   
-  // Verify Supabase connection
+  console.log('\n🌐 CORS Configuration:');
+  console.log('   Allowed origins:', allowedOrigins);
+  console.log('   Credentials:', true);
+  
   const supabaseConnected = await verifySupabaseConnection();
   if (!supabaseConnected) {
-    logger.warn('Supabase connection could not be verified. Some features may not work.');
+    logger.warn('⚠️  Supabase connection could not be verified');
   }
   
   logger.info('✅ Server is ready', {
-    port: config.port,
+    port: PORT,
     environment: config.env,
     supabase: supabaseConnected ? 'connected' : 'not verified',
   });
   
-  // Display security features enabled
   logger.info('🔒 Security features enabled:', {
     helmet: config.production.enableHelmet,
     cors: true,
     rateLimit: true,
-    inputValidation: true,
-    fileUploadValidation: true,
-    jwtAuth: true,
-    accountLockout: true,
-    https: config.production.forceHttps,
+    https: config.env === 'production' && config.production.forceHttps,
   });
 });
 
