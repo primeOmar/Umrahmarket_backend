@@ -464,16 +464,15 @@ router.post(
 // ===========================================
 router.post('/google', authRateLimiter, async (req, res) => {
   try {
-    const { accessToken } = req.body;
+    const { idToken } = req.body;
 
-    if (!accessToken) {
-      return res.status(400).json({ success: false, error: 'accessToken is required' });
+    if (!idToken) {
+      return res.status(400).json({ success: false, error: 'idToken is required' });
     }
 
-    // Supabase accepts Google OAuth access tokens directly
     const { data, error } = await supabase.auth.signInWithIdToken({
       provider: 'google',
-      token: accessToken,
+      token: idToken,
     });
 
     if (error) {
@@ -481,11 +480,11 @@ router.post('/google', authRateLimiter, async (req, res) => {
       return res.status(400).json({ success: false, error: error.message });
     }
 
-    const accessTokenJWT = generateAccessToken(
+    const accessToken = generateAccessToken(
       data.user.id,
       data.user.user_metadata?.role || 'client'
     );
-    const refreshTokenJWT = generateRefreshToken(data.user.id);
+    const refreshToken = generateRefreshToken(data.user.id);
 
     res.json({
       success: true,
@@ -496,8 +495,8 @@ router.post('/google', authRateLimiter, async (req, res) => {
           email: data.user.email,
           role: data.user.user_metadata?.role || 'client',
         },
-        accessToken: accessTokenJWT,
-        refreshToken: refreshTokenJWT,
+        accessToken,
+        refreshToken,
       },
     });
 
@@ -506,7 +505,6 @@ router.post('/google', authRateLimiter, async (req, res) => {
     res.status(500).json({ success: false, error: 'Google login failed' });
   }
 });
-
 // ===========================================
 // 5. REFRESH TOKEN
 // ===========================================
