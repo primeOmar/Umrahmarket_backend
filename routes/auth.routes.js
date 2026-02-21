@@ -464,44 +464,29 @@ router.post(
 // ===========================================
 router.post('/google', authRateLimiter, async (req, res) => {
   try {
-    const { idToken } = req.body;
-    
-    if (!idToken) {
-      return res.status(400).json({
-        success: false,
-        error: 'ID token is required',
-      });
+    const { accessToken } = req.body;
+
+    if (!accessToken) {
+      return res.status(400).json({ success: false, error: 'accessToken is required' });
     }
-    
-    // Sign in with Google
+
+    // Supabase accepts Google OAuth access tokens directly
     const { data, error } = await supabase.auth.signInWithIdToken({
       provider: 'google',
-      token: idToken,
+      token: accessToken,
     });
-    
+
     if (error) {
-      logger.error('Google login failed', {
-        error: error.message,
-        ip: req.ip,
-      });
-      
-      return res.status(400).json({
-        success: false,
-        error: error.message,
-      });
+      logger.error('Google login failed', { error: error.message, ip: req.ip });
+      return res.status(400).json({ success: false, error: error.message });
     }
-    
-    // Generate custom tokens
-    const accessToken = generateAccessToken(
+
+    const accessTokenJWT = generateAccessToken(
       data.user.id,
-      data.user.user_metadata.role || 'client'
+      data.user.user_metadata?.role || 'client'
     );
-    const refreshToken = generateRefreshToken(data.user.id);
-    
-    logAuthAttempt(true, data.user.id, req.ip, req.get('user-agent'), {
-      type: 'google-login',
-    });
-    
+    const refreshTokenJWT = generateRefreshToken(data.user.id);
+
     res.json({
       success: true,
       message: 'Google login successful',
@@ -509,25 +494,19 @@ router.post('/google', authRateLimiter, async (req, res) => {
         user: {
           id: data.user.id,
           email: data.user.email,
-          role: data.user.user_metadata.role || 'client',
+          role: data.user.user_metadata?.role || 'client',
         },
-        accessToken,
-        refreshToken,
+        accessToken: accessTokenJWT,
+        refreshToken: refreshTokenJWT,
       },
     });
+
   } catch (error) {
-    logger.error('Google login error', {
-      error: error.message,
-      ip: req.ip,
-    });
-    
-    res.status(500).json({
-      success: false,
-      error: 'Google login failed',
-    });
+    logger.error('Google login error', { error: error.message, ip: req.ip });
+    res.status(500).json({ success: false, error: 'Google login failed' });
   }
 });
-
+``
 // ===========================================
 // 5. REFRESH TOKEN
 // ===========================================
