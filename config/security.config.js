@@ -41,9 +41,13 @@ const config = {
     sameSite: process.env.COOKIE_SAMESITE || 'strict',
   },
   
-  // CORS
+// CORS
   cors: {
-    allowedOrigins: process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:3000'],
+    allowedOrigins: process.env.ALLOWED_ORIGINS?.split(',') || [
+      'http://localhost:3000',
+      'http://localhost:5173',
+      'https://umrahmarket.vercel.app'
+    ],
     credentials: true,
   },
   
