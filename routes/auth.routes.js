@@ -464,7 +464,7 @@ router.post(
 // ===========================================
 router.post('/google', authRateLimiter, async (req, res) => {
   try {
-    const { idToken } = req.body;
+    const { idToken, nonce } = req.body;    
 
     if (!idToken) {
       return res.status(400).json({ success: false, error: 'idToken is required' });
@@ -473,6 +473,7 @@ router.post('/google', authRateLimiter, async (req, res) => {
     const { data, error } = await supabase.auth.signInWithIdToken({
       provider: 'google',
       token: idToken,
+      nonce: nonce || undefined,   
     });
 
     if (error) {
@@ -505,6 +506,7 @@ router.post('/google', authRateLimiter, async (req, res) => {
     res.status(500).json({ success: false, error: 'Google login failed' });
   }
 });
+
 // ===========================================
 // 5. REFRESH TOKEN
 // ===========================================
