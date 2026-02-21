@@ -506,7 +506,7 @@ router.post('/google', authRateLimiter, async (req, res) => {
     res.status(500).json({ success: false, error: 'Google login failed' });
   }
 });
-``
+
 // ===========================================
 // 5. REFRESH TOKEN
 // ===========================================
