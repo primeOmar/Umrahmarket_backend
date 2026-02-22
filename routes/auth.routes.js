@@ -464,37 +464,68 @@ router.post(
 // ===========================================
 router.post('/google', authRateLimiter, async (req, res) => {
   try {
-    const { idToken, nonce } = req.body;    
+    const { idToken } = req.body;
 
     if (!idToken) {
-      return res.status(400).json({ success: false, error: 'idToken is required' });
+      return res.status(400).json({
+        success: false,
+        error: 'idToken is required',
+      });
     }
+
+    // DEBUG — log to Render so you can see exactly what Supabase returns
+    console.log('[Google Auth] Received idToken, length:', idToken.length);
 
     const { data, error } = await supabase.auth.signInWithIdToken({
       provider: 'google',
       token: idToken,
-      nonce: nonce || undefined,   
     });
 
+    // DEBUG — log the full Supabase response
+    console.log('[Google Auth] Supabase error:', error);
+    console.log('[Google Auth] Supabase data:', data?.user?.id);
+
     if (error) {
-      logger.error('Google login failed', { error: error.message, ip: req.ip });
+      logger.error('Google login failed', { error: error.message, code: error.code, ip: req.ip });
       return res.status(400).json({ success: false, error: error.message });
     }
 
-    const accessToken = generateAccessToken(
+    // Upsert into profiles table so the user exists there
+    if (supabaseAdmin && data.user) {
+      const meta      = data.user.user_metadata || {};
+      const fullName  = meta.full_name || meta.name || '';
+      const nameParts = fullName.trim().split(' ');
+      await supabaseAdmin
+        .from('profiles')
+        .upsert({
+          id:         data.user.id,
+          email:      data.user.email,
+          first_name: nameParts[0] || '',
+          last_name:  nameParts.slice(1).join(' ') || '',
+          role:       meta.role || 'client',
+          approved:   true,
+          created_at: new Date().toISOString(),
+        }, { onConflict: 'id' });
+    }
+
+    const accessToken  = generateAccessToken(
       data.user.id,
       data.user.user_metadata?.role || 'client'
     );
     const refreshToken = generateRefreshToken(data.user.id);
 
-    res.json({
+    logAuthAttempt(true, data.user.id, req.ip, req.get('user-agent'), { type: 'google-login' });
+
+    return res.json({
       success: true,
       message: 'Google login successful',
       data: {
         user: {
-          id: data.user.id,
-          email: data.user.email,
-          role: data.user.user_metadata?.role || 'client',
+          id:        data.user.id,
+          email:     data.user.email,
+          firstName: data.user.user_metadata?.full_name?.split(' ')[0] || '',
+          lastName:  data.user.user_metadata?.full_name?.split(' ').slice(1).join(' ') || '',
+          role:      data.user.user_metadata?.role || 'client',
         },
         accessToken,
         refreshToken,
@@ -502,10 +533,11 @@ router.post('/google', authRateLimiter, async (req, res) => {
     });
 
   } catch (error) {
-    logger.error('Google login error', { error: error.message, ip: req.ip });
-    res.status(500).json({ success: false, error: 'Google login failed' });
+    logger.error('Google login error', { error: error.message, stack: error.stack, ip: req.ip });
+    return res.status(500).json({ success: false, error: 'Google login failed. Please try again.' });
   }
 });
+
 
 // ===========================================
 // 5. REFRESH TOKEN
