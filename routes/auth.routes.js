@@ -188,6 +188,8 @@ const { data: authData, error: authError } = await supabase.auth.signUp({
           user: {
             id: authData.user.id,
             email: authData.user.email,
+            firstName,
+            lastName,
             role: 'client',
           },
         },
@@ -334,6 +336,8 @@ router.post(
           user: {
             id: authData.user.id,
             email: authData.user.email,
+            firstName,
+            lastName,
             role: 'agent',
             approved: false,
           },

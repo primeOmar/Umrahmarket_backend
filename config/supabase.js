@@ -56,10 +56,20 @@ export const verifySupabaseConnection = async () => {
       .select('*')
       .limit(1);
     
-    if (error && error.code !== 'PGRST116') {
-      // PGRST116 is "table not found" which is fine for health check
-      logger.warn('Supabase connection check failed', { error: error.message });
-      return false;
+    if (error) {
+      // Check for various "table not found" error conditions
+      const isTableNotFound = 
+        error.code === 'PGRST116' || 
+        error.message?.includes("Could not find the table") ||
+        error.message?.includes("relation") && error.message?.includes("does not exist");
+      
+      if (!isTableNotFound) {
+        logger.warn('Supabase connection check failed', { error: error.message });
+        return false;
+      }
+      // If table doesn't exist, connection is still valid
+      logger.info('Supabase connection verified (health check table not yet created)');
+      return true;
     }
     
     logger.info('Supabase connection verified successfully');
