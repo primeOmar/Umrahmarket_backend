@@ -25,6 +25,37 @@ import {
 
 const router = express.Router();
 
+// ===========================================
+// Agent Number Generator
+// ===========================================
+const generateAgentNumber = async () => {
+  const year = new Date().getFullYear();
+  const prefix = `UMRH${year}`;
+
+  // Find the highest existing agent_number for this year
+  const { data, error } = await supabaseAdmin
+    .from('profiles')
+    .select('agent_number')
+    .like('agent_number', `${prefix}%`)
+    .order('agent_number', { ascending: false })
+    .limit(1);
+
+  if (error) {
+    logger.error('Failed to fetch last agent number', { error: error.message });
+    throw new Error('Could not generate agent number');
+  }
+
+  let nextSeq = 1;
+  if (data && data.length > 0 && data[0].agent_number) {
+    const lastSeq = parseInt(data[0].agent_number.replace(prefix, ''), 10);
+    if (!isNaN(lastSeq)) nextSeq = lastSeq + 1;
+  }
+
+  // Zero-pad to 3 digits minimum (UMRH2026001, ..., UMRH2026999, UMRH20261000)
+  const seq = String(nextSeq).padStart(3, '0');
+  return `${prefix}${seq}`;
+};
+
 /**
  * Authentication Routes
  * Secure endpoints for user registration, login, and session management
@@ -290,6 +321,16 @@ router.post(
         });
       }
       
+      // Generate unique agent number
+      let agentNumber = null;
+      if (supabaseAdmin) {
+        try {
+          agentNumber = await generateAgentNumber();
+        } catch (err) {
+          logger.error('Agent number generation failed', { error: err.message });
+        }
+      }
+
       // Create profile in database
       if (supabaseAdmin) {
         const { error: profileError } = await supabaseAdmin
@@ -302,6 +343,7 @@ router.post(
             phone,
             company_name: companyName,
             license_number: licenseNumber,
+            agent_number: agentNumber,
             role: 'agent',
             approved: false,
             created_at: new Date().toISOString(),
@@ -324,6 +366,7 @@ router.post(
         userId: authData.user.id,
         email,
         companyName,
+        agentNumber,
         ip: req.ip,
       });
       
@@ -340,6 +383,8 @@ router.post(
             lastName,
             role: 'agent',
             approved: false,
+            agentNumber,
+            agentName: companyName,
           },
         },
       });
@@ -432,6 +477,21 @@ router.post(
         role: data.user.user_metadata.role,
       });
       
+      // For agents, fetch agentNumber and companyName from profiles table
+      let agentNumber = null;
+      let agentName = null;
+      if (data.user.user_metadata.role === 'agent') {
+        const { data: profile } = await supabase
+          .from('profiles')
+          .select('agent_number, company_name')
+          .eq('id', data.user.id)
+          .single();
+        if (profile) {
+          agentNumber = profile.agent_number || null;
+          agentName   = profile.company_name || null;
+        }
+      }
+
       res.json({
         success: true,
         message: 'Login successful',
@@ -443,6 +503,7 @@ router.post(
             firstName: data.user.user_metadata.firstName,
             lastName: data.user.user_metadata.lastName,
             approved: data.user.user_metadata.approved,
+            ...(data.user.user_metadata.role === 'agent' && { agentNumber, agentName }),
           },
           accessToken,
           refreshToken,
