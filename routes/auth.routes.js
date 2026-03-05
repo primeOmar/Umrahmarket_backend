@@ -478,14 +478,18 @@ router.post(
       });
       
       // For agents, fetch agentNumber and companyName from profiles table
+      // Uses supabaseAdmin to bypass RLS (anon key would be blocked at this point)
       let agentNumber = null;
       let agentName = null;
       if (data.user.user_metadata.role === 'agent') {
-        const { data: profile } = await supabase
+        const { data: profile, error: profileFetchError } = await supabaseAdmin
           .from('profiles')
           .select('agent_number, company_name')
           .eq('id', data.user.id)
           .single();
+        if (profileFetchError) {
+          logger.error('Failed to fetch agent profile on login', { error: profileFetchError.message, userId: data.user.id });
+        }
         if (profile) {
           agentNumber = profile.agent_number || null;
           agentName   = profile.company_name || null;
