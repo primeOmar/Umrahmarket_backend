@@ -25,6 +25,37 @@ import {
 
 const router = express.Router();
 
+// ===========================================
+// Agent Number Generator
+// ===========================================
+const generateAgentNumber = async () => {
+  const year = new Date().getFullYear();
+  const prefix = `UMRH${year}`;
+
+  // Find the highest existing agent_number for this year
+  const { data, error } = await supabaseAdmin
+    .from('profiles')
+    .select('agent_number')
+    .like('agent_number', `${prefix}%`)
+    .order('agent_number', { ascending: false })
+    .limit(1);
+
+  if (error) {
+    logger.error('Failed to fetch last agent number', { error: error.message });
+    throw new Error('Could not generate agent number');
+  }
+
+  let nextSeq = 1;
+  if (data && data.length > 0 && data[0].agent_number) {
+    const lastSeq = parseInt(data[0].agent_number.replace(prefix, ''), 10);
+    if (!isNaN(lastSeq)) nextSeq = lastSeq + 1;
+  }
+
+  // Zero-pad to 3 digits minimum (UMRH2026001, ..., UMRH2026999, UMRH20261000)
+  const seq = String(nextSeq).padStart(3, '0');
+  return `${prefix}${seq}`;
+};
+
 /**
  * Authentication Routes
  * Secure endpoints for user registration, login, and session management
@@ -188,6 +219,8 @@ const { data: authData, error: authError } = await supabase.auth.signUp({
           user: {
             id: authData.user.id,
             email: authData.user.email,
+            firstName,
+            lastName,
             role: 'client',
           },
         },
@@ -288,6 +321,16 @@ router.post(
         });
       }
       
+      // Generate unique agent number
+      let agentNumber = null;
+      if (supabaseAdmin) {
+        try {
+          agentNumber = await generateAgentNumber();
+        } catch (err) {
+          logger.error('Agent number generation failed', { error: err.message });
+        }
+      }
+
       // Create profile in database
       if (supabaseAdmin) {
         const { error: profileError } = await supabaseAdmin
@@ -300,6 +343,7 @@ router.post(
             phone,
             company_name: companyName,
             license_number: licenseNumber,
+            agent_number: agentNumber,
             role: 'agent',
             approved: false,
             created_at: new Date().toISOString(),
@@ -322,6 +366,7 @@ router.post(
         userId: authData.user.id,
         email,
         companyName,
+        agentNumber,
         ip: req.ip,
       });
       
@@ -334,8 +379,12 @@ router.post(
           user: {
             id: authData.user.id,
             email: authData.user.email,
+            firstName,
+            lastName,
             role: 'agent',
             approved: false,
+            agentNumber,
+            agentName: companyName,
           },
         },
       });
@@ -428,6 +477,25 @@ router.post(
         role: data.user.user_metadata.role,
       });
       
+      // For agents, fetch agentNumber and companyName from profiles table
+      // Uses supabaseAdmin to bypass RLS (anon key would be blocked at this point)
+      let agentNumber = null;
+      let agentName = null;
+      if (data.user.user_metadata.role === 'agent') {
+        const { data: profile, error: profileFetchError } = await supabaseAdmin
+          .from('profiles')
+          .select('agent_number, company_name')
+          .eq('id', data.user.id)
+          .single();
+        if (profileFetchError) {
+          logger.error('Failed to fetch agent profile on login', { error: profileFetchError.message, userId: data.user.id });
+        }
+        if (profile) {
+          agentNumber = profile.agent_number || null;
+          agentName   = profile.company_name || null;
+        }
+      }
+
       res.json({
         success: true,
         message: 'Login successful',
@@ -439,6 +507,7 @@ router.post(
             firstName: data.user.user_metadata.firstName,
             lastName: data.user.user_metadata.lastName,
             approved: data.user.user_metadata.approved,
+            ...(data.user.user_metadata.role === 'agent' && { agentNumber, agentName }),
           },
           accessToken,
           refreshToken,
@@ -464,37 +533,68 @@ router.post(
 // ===========================================
 router.post('/google', authRateLimiter, async (req, res) => {
   try {
-    const { idToken, nonce } = req.body;    
+    const { idToken } = req.body;
 
     if (!idToken) {
-      return res.status(400).json({ success: false, error: 'idToken is required' });
+      return res.status(400).json({
+        success: false,
+        error: 'idToken is required',
+      });
     }
+
+    // DEBUG — log to Render so you can see exactly what Supabase returns
+    console.log('[Google Auth] Received idToken, length:', idToken.length);
 
     const { data, error } = await supabase.auth.signInWithIdToken({
       provider: 'google',
       token: idToken,
-      nonce: nonce || undefined,   
     });
 
+    // DEBUG — log the full Supabase response
+    console.log('[Google Auth] Supabase error:', error);
+    console.log('[Google Auth] Supabase data:', data?.user?.id);
+
     if (error) {
-      logger.error('Google login failed', { error: error.message, ip: req.ip });
+      logger.error('Google login failed', { error: error.message, code: error.code, ip: req.ip });
       return res.status(400).json({ success: false, error: error.message });
     }
 
-    const accessToken = generateAccessToken(
+    // Upsert into profiles table so the user exists there
+    if (supabaseAdmin && data.user) {
+      const meta      = data.user.user_metadata || {};
+      const fullName  = meta.full_name || meta.name || '';
+      const nameParts = fullName.trim().split(' ');
+      await supabaseAdmin
+        .from('profiles')
+        .upsert({
+          id:         data.user.id,
+          email:      data.user.email,
+          first_name: nameParts[0] || '',
+          last_name:  nameParts.slice(1).join(' ') || '',
+          role:       meta.role || 'client',
+          approved:   true,
+          created_at: new Date().toISOString(),
+        }, { onConflict: 'id' });
+    }
+
+    const accessToken  = generateAccessToken(
       data.user.id,
       data.user.user_metadata?.role || 'client'
     );
     const refreshToken = generateRefreshToken(data.user.id);
 
-    res.json({
+    logAuthAttempt(true, data.user.id, req.ip, req.get('user-agent'), { type: 'google-login' });
+
+    return res.json({
       success: true,
       message: 'Google login successful',
       data: {
         user: {
-          id: data.user.id,
-          email: data.user.email,
-          role: data.user.user_metadata?.role || 'client',
+          id:        data.user.id,
+          email:     data.user.email,
+          firstName: data.user.user_metadata?.full_name?.split(' ')[0] || '',
+          lastName:  data.user.user_metadata?.full_name?.split(' ').slice(1).join(' ') || '',
+          role:      data.user.user_metadata?.role || 'client',
         },
         accessToken,
         refreshToken,
@@ -502,10 +602,11 @@ router.post('/google', authRateLimiter, async (req, res) => {
     });
 
   } catch (error) {
-    logger.error('Google login error', { error: error.message, ip: req.ip });
-    res.status(500).json({ success: false, error: 'Google login failed' });
+    logger.error('Google login error', { error: error.message, stack: error.stack, ip: req.ip });
+    return res.status(500).json({ success: false, error: 'Google login failed. Please try again.' });
   }
 });
+
 
 // ===========================================
 // 5. REFRESH TOKEN

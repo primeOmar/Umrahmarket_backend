@@ -70,24 +70,49 @@ export const generateRefreshToken = (userId, userType, email) => {
 // ─────────────────────────────────────────────
 // TOKEN VERIFICATION - Access Token
 // ─────────────────────────────────────────────
-export const verifyToken = (token) => {
-  try {
-    const decoded = jwt.verify(token, config.jwt.accessTokenSecret, {
-      issuer: config.jwt.issuer,
-      audience: config.jwt.audience,
-    });
 
-    // Ensure it's an access token
-    if (decoded.tokenType !== 'access') {
-      throw new Error('Invalid token type');
+export const verifyToken = async (req, res, next) => {
+  try {
+    const token = req.cookies.access_token || req.headers.authorization?.split(' ')[1];
+
+    if (!token) {
+      return res.status(401).json({ success: false, error: 'Access token required' });
     }
 
-    return decoded;
-  } catch (error) {
-    logger.warn('Access token verification failed', {
-      error: error.message,
+    const decoded = jwt.verify(token, process.env.JWT_SECRET, {
+      audience: 'web-app',
+      issuer: 'secure-auth-backend',
     });
-    return null;
+
+    // Fetch full profile from DB so controllers get firstName, agentNumber, etc.
+    const { data: profile, error } = await supabaseAdmin
+      .from('profiles')
+      .select('id, first_name, last_name, role, company_name, agent_number, approved')
+      .eq('id', decoded.userId)
+      .single();
+
+    if (error || !profile) {
+      return res.status(401).json({ success: false, error: 'User not found' });
+    }
+
+    // Attach to req.user — matches what createPackage destructures
+    req.user = {
+      id:          profile.id,
+      firstName:   profile.first_name,
+      lastName:    profile.last_name,
+      role:        profile.role,
+      agentName:   profile.company_name,
+      agentNumber: profile.agent_number,
+      approved:    profile.approved,
+    };
+
+    req.userId = profile.id; // keep backward compat
+    next();
+  } catch (error) {
+    if (error.name === 'TokenExpiredError') {
+      return res.status(401).json({ success: false, error: 'Access token expired', code: 'TOKEN_EXPIRED' });
+    }
+    return res.status(401).json({ success: false, error: 'Invalid access token' });
   }
 };
 

@@ -10,7 +10,7 @@ import { handleValidationErrors } from './middleware/validation.middleware.js';
 import authRoutes from './routes/auth.routes.js';
 import uploadRoutes from './routes/upload.routes.js';
 import documentRoutes from './routes/document.routes.js';
-
+import packagesRoutes  from './routes/packages/packages.route.js'
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -161,6 +161,7 @@ app.get('/cors-test', (req, res) => {
 app.use('/api/auth', authRoutes);
 app.use('/api/upload', uploadRoutes);
 app.use('/api/documents', documentRoutes);
+app.use('/api/packages', packagesRoutes);
 
 // ===========================================
 // ROOT ENDPOINT
