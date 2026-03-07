@@ -1,7 +1,7 @@
 import jwt from 'jsonwebtoken';
 import config from '../config/security.config.js';
 import logger from '../config/logger.js';
-
+import { supabaseAdmin } from '../config/supabase.js';
 /**
  * Authentication Middleware & Token Generation
  * Handles JWT token generation, validation, and verification
@@ -73,29 +73,58 @@ export const generateRefreshToken = (userId, userType, email) => {
 
 export const verifyToken = async (req, res, next) => {
   try {
+    // ─── DEBUG 1: Log all cookies received ───────────────────────────────────
+    console.log('[verifyToken] All cookies:', req.cookies);
+    console.log('[verifyToken] Authorization header:', req.headers.authorization);
+
     const token = req.cookies.access_token || req.headers.authorization?.split(' ')[1];
 
+    // ─── DEBUG 2: Token presence check ───────────────────────────────────────
+    console.log('[verifyToken] Cookie token present:', !!req.cookies.access_token);
+    console.log('[verifyToken] Header token present:', !!req.headers.authorization);
+    console.log('[verifyToken] Token resolved:', token ? `${token.substring(0, 50)}...` : 'NONE');
+
     if (!token) {
+      console.log('[verifyToken] ❌ No token found in cookies or headers');
       return res.status(401).json({ success: false, error: 'Access token required' });
     }
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET, {
-      audience: 'web-app',
-      issuer: 'secure-auth-backend',
+    // ─── DEBUG 3: Config values ───────────────────────────────────────────────
+    console.log('[verifyToken] Secret (first 10 chars):', config.jwt.accessTokenSecret?.substring(0, 10) ?? 'UNDEFINED');
+    console.log('[verifyToken] Audience:', config.jwt.audience ?? 'UNDEFINED');
+    console.log('[verifyToken] Issuer:', config.jwt.issuer ?? 'UNDEFINED');
+
+    // ─── DEBUG 4: Decode token WITHOUT verifying to inspect its payload ───────
+    const rawDecoded = jwt.decode(token);
+    console.log('[verifyToken] Token payload (unverified):', rawDecoded);
+    console.log('[verifyToken] Token aud claim:', rawDecoded?.aud);
+    console.log('[verifyToken] Token iss claim:', rawDecoded?.iss);
+    console.log('[verifyToken] Token exp:', rawDecoded?.exp ? new Date(rawDecoded.exp * 1000).toISOString() : 'NONE');
+    console.log('[verifyToken] Token expired?:', rawDecoded?.exp ? Date.now() > rawDecoded.exp * 1000 : 'NO EXP');
+
+    // ─── Actual verification ──────────────────────────────────────────────────
+    const decoded = jwt.verify(token, config.jwt.accessTokenSecret, {
+      audience: config.jwt.audience,
+      issuer:   config.jwt.issuer,
     });
 
-    // Fetch full profile from DB so controllers get firstName, agentNumber, etc.
+    console.log('[verifyToken] ✅ Token verified successfully. userId:', decoded.userId);
+
+    // ─── DB lookup ────────────────────────────────────────────────────────────
     const { data: profile, error } = await supabaseAdmin
       .from('profiles')
       .select('id, first_name, last_name, role, company_name, agent_number, approved')
       .eq('id', decoded.userId)
       .single();
 
+    console.log('[verifyToken] Profile fetch error:', error ?? 'NONE');
+    console.log('[verifyToken] Profile found:', profile ? `id=${profile.id}, role=${profile.role}` : 'NOT FOUND');
+
     if (error || !profile) {
+      console.log('[verifyToken] ❌ User not found in DB for userId:', decoded.userId);
       return res.status(401).json({ success: false, error: 'User not found' });
     }
 
-    // Attach to req.user — matches what createPackage destructures
     req.user = {
       id:          profile.id,
       firstName:   profile.first_name,
@@ -106,12 +135,27 @@ export const verifyToken = async (req, res, next) => {
       approved:    profile.approved,
     };
 
-    req.userId = profile.id; // keep backward compat
+    req.userId = profile.id;
+
+    console.log('[verifyToken] ✅ req.user set:', req.user);
     next();
+
   } catch (error) {
+    // ─── DEBUG 5: Exact error that caused failure ─────────────────────────────
+    console.log('[verifyToken] ❌ JWT verification threw an error:');
+    console.log('[verifyToken] error.name:', error.name);
+    console.log('[verifyToken] error.message:', error.message);
+
     if (error.name === 'TokenExpiredError') {
       return res.status(401).json({ success: false, error: 'Access token expired', code: 'TOKEN_EXPIRED' });
     }
+    if (error.name === 'JsonWebTokenError') {
+      return res.status(401).json({ success: false, error: `Invalid token: ${error.message}` });
+    }
+    if (error.name === 'NotBeforeError') {
+      return res.status(401).json({ success: false, error: 'Token not yet valid' });
+    }
+
     return res.status(401).json({ success: false, error: 'Invalid access token' });
   }
 };
