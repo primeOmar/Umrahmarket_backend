@@ -1,19 +1,9 @@
 import supabase from '../../config/supabase.js';
 
-
-export const handleDatabaseError = (statusCode, message) => {
-    const error = new Error();
-    error.statusCode = statusCode;
-    error.message = message;
-    return error;
-    
-  };
-  
-// ─────────────────────────────────────────────────────────────────────────────
-// Sanitisation helpers (mirror of frontend Packageformcomponents.js)
-// All user-supplied strings are re-sanitised server-side regardless of what
-// the client sent — never trust client-side sanitisation alone.
-// ─────────────────────────────────────────────────────────────────────────────
+export const handleDatabaseError = (res, error) => {
+  console.error('Database error:', error);
+  return res.status(500).json({ success: false, message: 'An internal server error occurred.' });
+};
 
 const ALLOWED_TYPES     = ['umrah', 'hajj'];
 const ALLOWED_LOCATIONS = ['makkah', 'madinah', 'jeddah'];
@@ -40,23 +30,15 @@ function sanitizeDate(value = '') {
 
 function sanitizeTags(arr, maxLen = 80, maxCount = 30) {
   if (!Array.isArray(arr)) return [];
-  return arr
-    .slice(0, maxCount)
-    .map((t) => sanitizeText(t, maxLen))
-    .filter(Boolean);
+  return arr.slice(0, maxCount).map((t) => sanitizeText(t, maxLen)).filter(Boolean);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // createPackage  POST /api/packages
 // ─────────────────────────────────────────────────────────────────────────────
-
-
 export const createPackage = async (req, res) => {
-  console.log('createPackage body received:', req);
-
   const { firstName, lastName, agentName, agentNumber } = req.user;
 
-  // ── Parse arrays (frontend may send JSON strings or repeated fields) ────────
   const parseArray = (field) => {
     const raw = req.body[field];
     if (!raw) return [];
@@ -64,7 +46,7 @@ export const createPackage = async (req, res) => {
     try { return JSON.parse(raw); } catch { return []; }
   };
 
-  // ── Destructure & sanitise ──────────────────────────────────────────────────
+  // ── Sanitise ────────────────────────────────────────────────────────────────
   const name          = sanitizeText(req.body.name, 120);
   const type          = ALLOWED_TYPES.includes(req.body.type) ? req.body.type : null;
   const location      = ALLOWED_LOCATIONS.includes(req.body.location) ? req.body.location : null;
@@ -81,7 +63,6 @@ export const createPackage = async (req, res) => {
   const available_from = sanitizeDate(req.body.available_from);
   const available_to   = sanitizeDate(req.body.available_to);
 
-  // Makkah hotel
   const makkah_hotel_name     = sanitizeText(req.body.makkah_hotel_name, 120);
   const makkah_hotel_rating   = sanitizeNumber(req.body.makkah_hotel_rating);
   const makkah_hotel_distance = sanitizeText(req.body.makkah_hotel_distance, 30);
@@ -89,7 +70,6 @@ export const createPackage = async (req, res) => {
   const makkah_check_in_date  = sanitizeDate(req.body.makkah_check_in_date);
   const makkah_check_out_date = sanitizeDate(req.body.makkah_check_out_date);
 
-  // Madinah hotel
   const madinah_hotel_name     = sanitizeText(req.body.madinah_hotel_name, 120);
   const madinah_hotel_rating   = sanitizeNumber(req.body.madinah_hotel_rating);
   const madinah_hotel_distance = sanitizeText(req.body.madinah_hotel_distance, 30);
@@ -97,92 +77,31 @@ export const createPackage = async (req, res) => {
   const madinah_check_in_date  = sanitizeDate(req.body.madinah_check_in_date);
   const madinah_check_out_date = sanitizeDate(req.body.madinah_check_out_date);
 
-  // Arrays
   const highlights = sanitizeTags(parseArray('highlights'));
   const inclusions = sanitizeTags(parseArray('inclusions'));
   const exclusions = sanitizeTags(parseArray('exclusions'));
-
-  // Images — provided by uploadImages middleware
   const image_urls = req.imageUrls ?? [];
-
-  // ── Validation ──────────────────────────────────────────────────────────────
-  const missingFields = [];
-  if (!name)     missingFields.push('name');
-  if (!type)     missingFields.push('type');
-  if (!location) missingFields.push('location');
-  if (price === null) missingFields.push('price');
-  if (duration === null) missingFields.push('duration');
-
-  if (missingFields.length > 0) {
-    return res.status(400).json({
-      success: false,
-      message: `Missing or invalid required fields: ${missingFields.join(', ')}`,
-    });
-  }
-
-  if (typeof name !== 'string' || name.trim().length === 0) {
-    return res.status(400).json({ success: false, message: 'Package name is required.' });
-  }
-
-  if (discount !== null && (discount < 0 || discount > 100)) {
-    return res.status(400).json({ success: false, message: 'Discount must be between 0 and 100.' });
-  }
 
   // ── Build record ────────────────────────────────────────────────────────────
   const currentTime = new Date().toISOString();
 
   const newPackage = {
-    // core
-    name,
-    type,
-    location,
-    description,
-
-    // pricing
-    price,
-    original_price,
-    discount,
-    duration,
-
-    // dates
-    available_from,
-    available_to,
-
-    // group
-    min_group_size,
-    max_group_size,
-
-    // makkah hotel
-    makkah_hotel_name,
-    makkah_hotel_rating,
-    makkah_hotel_distance,
-    makkah_hotel_address,
-    makkah_check_in_date,
-    makkah_check_out_date,
-
-    // madinah hotel
-    madinah_hotel_name,
-    madinah_hotel_rating,
-    madinah_hotel_distance,
-    madinah_hotel_address,
-    madinah_check_in_date,
-    madinah_check_out_date,
-
-    // arrays
-    highlights,
-    inclusions,
-    exclusions,
-
-    // images (Cloudflare CDN URLs)
+    name, type, location, description,
+    price, original_price, discount, duration,
+    available_from, available_to,
+    min_group_size, max_group_size,
+    makkah_hotel_name, makkah_hotel_rating, makkah_hotel_distance,
+    makkah_hotel_address, makkah_check_in_date, makkah_check_out_date,
+    madinah_hotel_name, madinah_hotel_rating, madinah_hotel_distance,
+    madinah_hotel_address, madinah_check_in_date, madinah_check_out_date,
+    highlights, inclusions, exclusions,
     image_urls,
-
-    // meta
-    created_by:   `${firstName} ${lastName}`,
+    created_by:  `${firstName} ${lastName}`,
     agentName,
     agentNumber,
-    status:       'Active',
-    created_at:   currentTime,
-    updated_at:   currentTime,
+    status:      'Active',
+    created_at:  currentTime,
+    updated_at:  currentTime,
   };
 
   // ── Insert ──────────────────────────────────────────────────────────────────
@@ -216,6 +135,7 @@ export const createPackage = async (req, res) => {
       package:      record,
       totalRecords: data?.length ?? 0,
     });
+
   } catch (error) {
     if (error.code === '23505') {
       const match = error.details?.match(/Key \(([^)]+)\)/);
@@ -229,40 +149,4 @@ export const createPackage = async (req, res) => {
   }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// getPackages  GET /api/packages
-// ─────────────────────────────────────────────────────────────────────────────
 
-export const getAgentPackages = async (req, res) => {
-  const { agentNumber, agentName } = req.user;
- 
-
-  try {
-    const { data, error } = await supabase
-      .from('packages')
-      .select(
-        `id, name, type, location, description,
-         price, original_price, discount, duration,
-         available_from, available_to, min_group_size, max_group_size,
-         makkah_hotel_name, makkah_hotel_rating, makkah_hotel_distance,
-         makkah_hotel_address, makkah_check_in_date, makkah_check_out_date,
-         madinah_hotel_name, madinah_hotel_rating, madinah_hotel_distance,
-         madinah_hotel_address, madinah_check_in_date, madinah_check_out_date,
-         highlights, inclusions, exclusions,
-         image_urls, created_by, status, created_at`
-      )
-      .eq('agentNumber', agentNumber)
-       .eq('agentName', agentName)
-      .order('created_at', { ascending: false });
-
-    if (error) throw error;
-
-    return res.status(200).json({
-      success:      true,
-      data:         data ?? [],
-      totalRecords: data?.length ?? 0,
-    });
-  } catch (error) {
-    return handleDatabaseError(res, error);
-  }
-};
