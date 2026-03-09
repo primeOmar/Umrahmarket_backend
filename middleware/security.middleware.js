@@ -216,7 +216,7 @@ export const compressionMiddleware = compression({
 // 11. REQUEST SIZE LIMITER – Prevent Large Payload Attacks (OWASP A06)
 // ─────────────────────────────────────────────
 export const requestSizeLimiter = (req, res, next) => {
-  const maxSize = 10 * 1024 * 1024; // 10 MB
+const maxSize = 200 * 1024 * 1024; // 200 MB 
 
   const contentLength = parseInt(req.headers['content-length'], 10);
   if (!isNaN(contentLength) && contentLength > maxSize) {

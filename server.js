@@ -100,8 +100,9 @@ if (config.production.enableCompression) {
 app.use(securityMiddleware.requestLogger);
 
 // Body Parsers
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(express.json({ limit: '200mb' }));
+app.use(express.urlencoded({ extended: true, limit: '200mb' }));
+
 
 // Validation Error Handler
 app.use(handleValidationErrors);
