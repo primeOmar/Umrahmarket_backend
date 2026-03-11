@@ -20,7 +20,6 @@ yarn-error.log*
 lerna-debug.log*
 
 # Uploaded files
-uploads/
 temp/
 
 # OS files

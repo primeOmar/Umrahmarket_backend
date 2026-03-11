@@ -1,4 +1,39 @@
 import supabase from '../../config/supabase.js';
+import { handleDatabaseError } from './createpackages.controller.js';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// getAllActivePackages  GET /api/packages/all-active
+// Public route — no auth required
+// ─────────────────────────────────────────────────────────────────────────────
+export const getAllActivePackages = async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('packages')
+      .select(
+        `id, name, type, location, description,
+         price, original_price, discount, duration,
+         image_urls, highlights, inclusions,
+         makkah_hotel_rating, status`
+      )
+      .eq('status', 'Active')
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      console.error('Supabase select error:', error);
+      throw error;
+    }
+
+    return res.status(200).json({
+      success:  true,
+      packages: data ?? [],
+      total:    data?.length ?? 0,
+    });
+
+  } catch (error) {
+    return handleDatabaseError(res, error);
+  }
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // getAgentPackages  GET /api/packages/getagentpackages
 //

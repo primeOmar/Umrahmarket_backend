@@ -1,11 +1,14 @@
 import express from 'express';
 import { parseFormData, uploadImagesToR2 } from '../../middleware/uploads/Uploadtocloudflare.js';
-import { getAgentPackages } from '../../controllers/packages/getpackages.controller.js';
+import { getAgentPackages, getAllActivePackages } from '../../controllers/packages/getpackages.controller.js';
 import { createPackage } from '../../controllers/packages/createpackages.controller.js';
 import { verifyToken } from '../../middleware/auth.middleware.js';
-import { validatePackage } from '../../middleware/uploads/validatePackage.js';
+import { validatePackage } from '../../middleware/uploads/Validatepackage.js';
 
 const router = express.Router();
+
+// GET /api/packages/all-active — public, no auth
+router.get('/all-active', getAllActivePackages);
 
 // POST /api/packages/create-packages
 //
