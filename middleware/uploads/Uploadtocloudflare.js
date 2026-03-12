@@ -49,14 +49,12 @@ const upload = multer({
 });
 
 // ─── Step 1: parseFormData ────────────────────────────────────────────────────
-// Runs multer — populates req.body and req.files (in memory)
-// Nothing is uploaded to R2 yet.
 export const parseFormData = (req, res, next) => {
   upload.array('images', MAX_FILES)(req, res, (err) => {
     if (err instanceof multer.MulterError) {
       const msgs = {
-        LIMIT_FILE_SIZE:  `File too large. Max ${MAX_SIZE / 1024 / 1024} MB per image.`,
-        LIMIT_FILE_COUNT: `Too many files. Max ${MAX_FILES} images.`,
+        LIMIT_FILE_SIZE:       `File too large. Max ${MAX_SIZE / 1024 / 1024} MB per image.`,
+        LIMIT_FILE_COUNT:      `Too many files. Max ${MAX_FILES} images.`,
         LIMIT_UNEXPECTED_FILE: 'Unexpected field name for file upload.',
       };
       return res.status(400).json({
@@ -72,7 +70,6 @@ export const parseFormData = (req, res, next) => {
 };
 
 // ─── Step 2: uploadImagesToR2 ─────────────────────────────────────────────────
-// Security-scans each buffer, uploads to R2, attaches req.imageUrls
 export const uploadImagesToR2 = async (req, res, next) => {
   try {
     const files = req.files ?? [];
@@ -88,6 +85,7 @@ export const uploadImagesToR2 = async (req, res, next) => {
       const buffer = file.buffer;
 
       // ── Deep MIME check ──────────────────────────────────────────────────
+      // Verify actual file signature matches claimed MIME type
       const detected = await fileTypeFromBuffer(buffer);
       if (!detected || !ALLOWED_MIMES.includes(detected.mime)) {
         logSuspiciousActivity('R2 upload rejected — MIME mismatch', {
@@ -98,31 +96,33 @@ export const uploadImagesToR2 = async (req, res, next) => {
         });
         return res.status(400).json({
           success: false,
-          error:   'File type verification failed. Possible file manipulation.',
+          error:   'File type verification failed. Only JPEG, PNG, and WebP images are allowed.',
         });
       }
 
       // ── PHP / shell code check ────────────────────────────────────────────
-      const str = buffer.toString('utf8');
-      if (str.includes('<?php') || str.includes('<?=')) {
+      // Scan only the first 1KB as text — binary image data beyond header
+      // is irrelevant for code injection and contains valid null bytes
+      const headerStr = buffer.slice(0, 1024).toString('latin1');
+      if (headerStr.includes('<?php') || headerStr.includes('<?=') || headerStr.includes('<script')) {
+        logSuspiciousActivity('R2 upload rejected — executable code detected', {
+          userId: req.userId,
+          ip:     req.ip,
+        });
         return res.status(400).json({
           success: false,
           error:   'File contains executable code and was rejected.',
         });
       }
 
-      // ── Null-byte check ───────────────────────────────────────────────────
-      if (buffer.includes(0x00)) {
-        return res.status(400).json({
-          success: false,
-          error:   'File contains null bytes and was rejected.',
-        });
-      }
+      // NOTE: Null-byte check removed — JPEG/PNG/WebP files legitimately
+      // contain null bytes (0x00) as part of their binary format.
+      // The MIME signature check above is sufficient security.
 
       // ── Generate safe key ─────────────────────────────────────────────────
-      const uid  = crypto.randomBytes(16).toString('hex');
-      const ext  = path.extname(file.originalname).toLowerCase() || `.${detected.ext}`;
-      const key  = `packages/${req.userId ?? 'anon'}/${Date.now()}-${uid}${ext}`;
+      const uid = crypto.randomBytes(16).toString('hex');
+      const ext = path.extname(file.originalname).toLowerCase() || `.${detected.ext}`;
+      const key = `packages/${req.userId ?? 'anon'}/${Date.now()}-${uid}${ext}`;
 
       // ── Upload to R2 ──────────────────────────────────────────────────────
       await R2.send(new PutObjectCommand({
@@ -130,7 +130,6 @@ export const uploadImagesToR2 = async (req, res, next) => {
         Key:         key,
         Body:        buffer,
         ContentType: detected.mime,
-        // R2 objects are private by default; expose via public bucket or Workers
       }));
 
       const publicUrl = `${PUBLIC_URL}/${key}`;
