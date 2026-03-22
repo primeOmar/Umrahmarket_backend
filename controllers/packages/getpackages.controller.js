@@ -19,8 +19,14 @@ export const getAllActivePackages = async (req, res) => {
       .order('created_at', { ascending: false });
 
     if (error) {
-      console.error('Supabase select error:', error);
-      throw error;
+      // Log but respond gracefully — never let a DB error become a 500 on a public route
+      console.error('[getAllActivePackages] Supabase error:', error.message, '| code:', error.code);
+      return res.status(200).json({
+        success:  true,
+        packages: [],
+        total:    0,
+        _warning: 'Could not load packages at this time.',
+      });
     }
 
     return res.status(200).json({
@@ -30,7 +36,14 @@ export const getAllActivePackages = async (req, res) => {
     });
 
   } catch (error) {
-    return handleDatabaseError(res, error);
+    // Unexpected crash — log and return empty list, not a 500
+    console.error('[getAllActivePackages] Unexpected error:', error.message);
+    return res.status(200).json({
+      success:  true,
+      packages: [],
+      total:    0,
+      _warning: 'Could not load packages at this time.',
+    });
   }
 };
 

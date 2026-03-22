@@ -187,29 +187,10 @@ export const verifyRefreshToken = (token) => {
 // ─────────────────────────────────────────────
 // MIDDLEWARE - Verify Access Token
 // ─────────────────────────────────────────────
-export const requireAuth = (req, res, next) => {
-  const authHeader = req.headers.authorization;
-
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({
-      success: false,
-      error: 'Missing or invalid authorization header',
-    });
-  }
-
-  const token = authHeader.substring(7); // Remove "Bearer " prefix
-
-  const decoded = verifyToken(token);
-  if (!decoded) {
-    return res.status(401).json({
-      success: false,
-      error: 'Invalid or expired access token',
-    });
-  }
-
-  req.user = decoded;
-  next();
-};
+// NOTE: verifyToken is an async Express middleware (req, res, next).
+// requireAuth is an alias for it — import verifyToken directly instead
+// when you need a single-call auth middleware.
+export const requireAuth = verifyToken;
 
 // ─────────────────────────────────────────────
 // MIDDLEWARE - Verify User Type
@@ -240,18 +221,36 @@ export const requireUserType = (allowedTypes) => {
 };
 
 // ─────────────────────────────────────────────
-// MIDDLEWARE - Extract User Info from Token
+// MIDDLEWARE - Extract User Info from Token (optional auth)
+// Sets req.user if a valid token is present, but never blocks the request.
 // ─────────────────────────────────────────────
-export const extractUser = (req, res, next) => {
-  const authHeader = req.headers.authorization;
+export const extractUser = async (req, res, next) => {
+  const token =
+    req.cookies?.access_token ||
+    req.headers.authorization?.split(' ')[1];
 
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    const token = authHeader.substring(7);
-    const decoded = verifyToken(token);
+  if (!token) return next();
 
-    if (decoded) {
-      req.user = decoded;
+  try {
+    const decoded = jwt.verify(token, config.jwt.accessTokenSecret, {
+      audience: config.jwt.audience,
+      issuer:   config.jwt.issuer,
+    });
+
+    if (supabaseAdmin) {
+      const { data: profile } = await supabaseAdmin
+        .from('profiles')
+        .select('id, first_name, last_name, role, company_name, agent_number, approved')
+        .eq('id', decoded.userId)
+        .single();
+
+      if (profile) {
+        req.user   = { id: profile.id, firstName: profile.first_name, lastName: profile.last_name, role: profile.role, agentName: profile.company_name, agentNumber: profile.agent_number, approved: profile.approved };
+        req.userId = profile.id;
+      }
     }
+  } catch {
+    // Invalid/expired token — silently ignore for optional-auth routes
   }
 
   next();

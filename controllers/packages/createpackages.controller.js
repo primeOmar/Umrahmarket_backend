@@ -70,10 +70,10 @@ export const createPackage = async (req, res) => {
   const makkah_check_in_date  = sanitizeDate(req.body.makkah_check_in_date);
   const makkah_check_out_date = sanitizeDate(req.body.makkah_check_out_date);
 
-  const madinah_hotel_name     = sanitizeText(req.body.madinah_hotel_name, 120);
+ const madinah_hotel_name     = sanitizeText(req.body.madinah_hotel_name, 120)     || null;
   const madinah_hotel_rating   = sanitizeNumber(req.body.madinah_hotel_rating);
-  const madinah_hotel_distance = sanitizeText(req.body.madinah_hotel_distance, 30);
-  const madinah_hotel_address  = sanitizeText(req.body.madinah_hotel_address, 120);
+const madinah_hotel_distance = sanitizeText(req.body.madinah_hotel_distance, 30)  || null;
+  const madinah_hotel_address  = sanitizeText(req.body.madinah_hotel_address, 120)  || null;
   const madinah_check_in_date  = sanitizeDate(req.body.madinah_check_in_date);
   const madinah_check_out_date = sanitizeDate(req.body.madinah_check_out_date);
 
