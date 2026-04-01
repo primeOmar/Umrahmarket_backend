@@ -1,4 +1,5 @@
 // controllers/mpesaController.js
+// Pure Supabase — no Mongoose models used anywhere in this file.
 import { supabaseAdmin } from '../config/supabase.js';
 import { stkPush, stkQuery } from '../services/Mpesaservice.js';
 
@@ -6,54 +7,54 @@ const KES_RATE       = Number(process.env.KES_PER_USD) || 130;
 const MPESA_PHONE_RE = /^254[17]\d{8}$/;
 function maskPhone(p) { return p ? `${p.slice(0, 6)}****${p.slice(-2)}` : '?'; }
 
-// ── POST /api/payments/mpesa/initiate ─────────────────────────────────────────
+// ── POST /api/payments/mpesa/initiate ────────────────────────────────────────
 export const initiate = async (req, res) => {
   try {
-    const userId = req.user?.id;
+    const userId    = req.user?.id;
     const { packageId, phone } = req.body;
 
     if (!userId)
       return res.status(401).json({ success: false, message: 'Unauthorised' });
+
     if (!packageId || !phone)
       return res.status(400).json({ success: false, message: 'packageId and phone are required' });
 
-    // FIX 1: Accept both UUID (Supabase) and MongoDB ObjectId (24-hex) formats
-    const isUUID     = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(packageId);
-    const isObjectId = /^[0-9a-f]{24}$/i.test(packageId);
-    if (!isUUID && !isObjectId)
+    // Accept Supabase UUIDs only (our single DB is Supabase)
+    const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(packageId);
+    if (!isUUID)
       return res.status(400).json({ success: false, message: 'Invalid packageId' });
 
     if (!MPESA_PHONE_RE.test(phone))
-      return res.status(400).json({ success: false, message: 'Invalid Safaricom number' });
+      return res.status(400).json({ success: false, message: 'Invalid Safaricom number (must start 2547... or 2541...)' });
 
-    // Fetch package — NEVER trust FE price
+    // ── Fetch package from Supabase — NEVER trust FE price ──────────────
     const { data: pkg, error: pkgErr } = await supabaseAdmin
       .from('packages')
-      .select('id, name, price_per_person, price, status')
+      .select('id, name, price, status')
       .eq('id', packageId)
       .maybeSingle();
 
     if (pkgErr) {
       console.error('[M-Pesa initiate] Package fetch error:', pkgErr.message);
-      return res.status(500).json({ success: false, message: 'Failed to fetch package' });
+      return res.status(500).json({ success: false, message: 'Failed to fetch package details' });
     }
     if (!pkg) {
       return res.status(404).json({ success: false, message: 'Package not found' });
     }
 
-    // FIX 2: Handle different status values your DB might use
+    // Accept any reasonable active-like status — adjust to match your DB values
     const pkgStatus = (pkg.status || '').toLowerCase();
-    if (!['active', 'published', 'approved'].includes(pkgStatus)) {
-      return res.status(404).json({ success: false, message: 'Package is not available for booking' });
+    if (!['active', 'published', 'approved', 'available'].includes(pkgStatus)) {
+      return res.status(400).json({ success: false, message: `Package is not available for booking (status: ${pkg.status})` });
     }
 
-    // FIX 3: Handle both price_per_person and price column names
+    // Resolve price — handle both column name variants
     const priceUSD  = pkg.price_per_person ?? pkg.price ?? 0;
-    const amountKes = Math.ceil(priceUSD * KES_RATE);
+    const amountKes = Math.ceil(Number(priceUSD) * KES_RATE);
     if (amountKes <= 0)
       return res.status(400).json({ success: false, message: 'Package has no valid price' });
 
-    // Idempotency — resume existing PENDING payment within last 5 min
+    // ── Idempotency — resume PENDING payment within last 5 min ──────────
     const fiveMinAgo = new Date(Date.now() - 5 * 60_000).toISOString();
     const { data: existing } = await supabaseAdmin
       .from('payments')
@@ -68,7 +69,7 @@ export const initiate = async (req, res) => {
       return res.json({ success: true, checkoutRequestId: existing.checkout_request_id, resumed: true });
     }
 
-    // Fire STK push — catch Daraja errors separately for clearer error messages
+    // ── Fire STK push ────────────────────────────────────────────────────
     let darajaRes;
     try {
       darajaRes = await stkPush({
@@ -82,16 +83,16 @@ export const initiate = async (req, res) => {
       return res.status(502).json({ success: false, message: `M-Pesa error: ${darajaErr.message}` });
     }
 
-    // FIX 4: Daraja returns PascalCase. Normalise regardless of what stkPush returns.
+    // Daraja returns PascalCase — normalise both casings
     const checkoutRequestId = darajaRes.CheckoutRequestID ?? darajaRes.checkoutRequestId;
     const merchantRequestId = darajaRes.MerchantRequestID ?? darajaRes.merchantRequestId;
 
     if (!checkoutRequestId) {
       console.error('[M-Pesa initiate] No checkoutRequestId in Daraja response:', JSON.stringify(darajaRes));
-      return res.status(502).json({ success: false, message: 'Invalid M-Pesa response. Please try again.' });
+      return res.status(502).json({ success: false, message: 'Invalid M-Pesa response — please try again.' });
     }
 
-    // Persist pending payment record
+    // ── Persist pending payment in Supabase ─────────────────────────────
     const { error: insertErr } = await supabaseAdmin
       .from('payments')
       .insert({
@@ -101,26 +102,29 @@ export const initiate = async (req, res) => {
         status:              'PENDING',
         amount_kes:          amountKes,
         phone,
-        merchant_request_id: merchantRequestId,
+        merchant_request_id: merchantRequestId ?? null,
         checkout_request_id: checkoutRequestId,
       });
 
     if (insertErr) {
-      console.error('[M-Pesa initiate] DB insert failed:', insertErr.message);
-      // STK was already sent — don't return 502, let FE poll
-      return res.status(500).json({ success: false, message: 'Payment sent but could not be recorded. Contact support if charged.' });
+      console.error('[M-Pesa initiate] DB insert failed:', insertErr.message, insertErr.details);
+      // STK was already sent — don't return 502, let FE poll so user can complete payment
+      return res.status(500).json({
+        success: false,
+        message: 'Payment prompt sent but could not be recorded. Contact support if you are charged.',
+      });
     }
 
-    console.info(`[M-Pesa] STK sent → ${maskPhone(phone)} | pkg: ${packageId} | id: ${checkoutRequestId}`);
+    console.info(`[M-Pesa] STK sent → ${maskPhone(phone)} | pkg: ${packageId} | checkout: ${checkoutRequestId}`);
     return res.json({ success: true, checkoutRequestId });
 
   } catch (err) {
     console.error('[M-Pesa initiate] Unexpected error:', err.message, err.stack);
-    return res.status(502).json({ success: false, message: 'Payment initiation failed. Please try again.' });
+    return res.status(500).json({ success: false, message: 'Payment initiation failed. Please try again.' });
   }
 };
 
-// ── POST /api/payments/mpesa/callback ─────────────────────────────────────────
+// ── POST /api/payments/mpesa/callback ────────────────────────────────────────
 const SAFARICOM_IPS = new Set([
   '196.201.214.200', '196.201.214.206', '196.201.213.114', '196.201.214.207',
   '196.201.214.208', '196.201.213.44',  '196.201.212.127', '196.201.212.138',
@@ -131,7 +135,6 @@ export const callback = async (req, res) => {
   const ip = (req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '')
     .split(',')[0].trim();
 
-  // FIX 5: Skip IP check in sandbox — Safaricom sandbox uses different IPs
   const isSandbox = (process.env.MPESA_ENV || 'sandbox') !== 'production';
   if (!isSandbox && !SAFARICOM_IPS.has(ip)) {
     console.warn(`[M-Pesa callback] Blocked unknown IP: ${ip}`);
@@ -147,45 +150,66 @@ export const callback = async (req, res) => {
 
     const { MerchantRequestID, CheckoutRequestID, ResultCode, ResultDesc, CallbackMetadata } = body;
 
-    const { data: payment } = await supabaseAdmin
+    // Look up the payment record in Supabase
+    const { data: payment, error: payErr } = await supabaseAdmin
       .from('payments')
       .select('id, user_id, package_id, amount_kes, status')
       .or(`checkout_request_id.eq.${CheckoutRequestID},merchant_request_id.eq.${MerchantRequestID}`)
       .maybeSingle();
 
+    if (payErr) {
+      console.error('[M-Pesa callback] Payment lookup error:', payErr.message);
+      return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
+    }
     if (!payment) {
       console.warn(`[M-Pesa callback] Unknown payment — checkout: ${CheckoutRequestID}`);
       return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
     }
     if (payment.status !== 'PENDING') {
+      // Already processed (duplicate callback)
       return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
     }
 
+    // ── Payment failed / cancelled by user ───────────────────────────────
     if (ResultCode !== 0) {
-      await supabaseAdmin.from('payments')
+      await supabaseAdmin
+        .from('payments')
         .update({ status: 'FAILED', result_code: String(ResultCode), result_desc: ResultDesc })
         .eq('id', payment.id);
+
       console.info(`[M-Pesa callback] FAILED — code: ${ResultCode} | ${ResultDesc}`);
       return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
     }
 
+    // ── Payment succeeded ────────────────────────────────────────────────
     const meta = {};
     (CallbackMetadata?.Item || []).forEach(i => { meta[i.Name] = i.Value; });
     const mpesaRef   = meta.MpesaReceiptNumber || '';
     const paidAmount = Number(meta.Amount) || payment.amount_kes;
 
+    // Amount sanity check (allow ±1 KES rounding)
     if (Math.abs(paidAmount - payment.amount_kes) > 1) {
       console.error(`[M-Pesa callback] Amount mismatch — expected ${payment.amount_kes}, got ${paidAmount}`);
-      await supabaseAdmin.from('payments')
+      await supabaseAdmin
+        .from('payments')
         .update({ status: 'FAILED', result_desc: 'Amount mismatch' })
         .eq('id', payment.id);
       return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
     }
 
-    await supabaseAdmin.from('payments')
-      .update({ status: 'SUCCESS', mpesa_ref: mpesaRef, result_code: '0', result_desc: ResultDesc, paid_at: new Date().toISOString() })
+    // Mark payment SUCCESS
+    await supabaseAdmin
+      .from('payments')
+      .update({
+        status:      'SUCCESS',
+        mpesa_ref:   mpesaRef,
+        result_code: '0',
+        result_desc: ResultDesc,
+        paid_at:     new Date().toISOString(),
+      })
       .eq('id', payment.id);
 
+    // Create booking in Supabase
     const { data: booking, error: bookErr } = await supabaseAdmin
       .from('bookings')
       .insert({
@@ -201,62 +225,80 @@ export const callback = async (req, res) => {
       .select('id')
       .single();
 
-    if (bookErr) console.error('[M-Pesa callback] Booking creation failed:', bookErr.message);
-    else console.info(`[M-Pesa callback] Booking ${booking.id} created — ref: ${mpesaRef}`);
+    if (bookErr) {
+      console.error('[M-Pesa callback] Booking creation failed:', bookErr.message, bookErr.details);
+    } else {
+      console.info(`[M-Pesa callback] Booking ${booking.id} created — mpesa ref: ${mpesaRef}`);
+    }
 
     return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
 
   } catch (err) {
-    console.error('[M-Pesa callback] Unexpected:', err.message);
+    console.error('[M-Pesa callback] Unexpected:', err.message, err.stack);
     return res.json({ ResultCode: 0, ResultDesc: 'Accepted' }); // always 200 to Safaricom
   }
 };
 
-// ── GET /api/payments/mpesa/status/:checkoutRequestId ─────────────────────────
+// ── GET /api/payments/mpesa/status/:checkoutRequestId ────────────────────────
 export const getStatus = async (req, res) => {
   try {
-    const userId = req.user?.id;
+    const userId            = req.user?.id;
     const { checkoutRequestId } = req.params;
 
     if (!userId)
       return res.status(401).json({ success: false, message: 'Unauthorised' });
 
-    // FIX 7: Loosened regex — Safaricom IDs vary in length/format between sandbox & production
-    if (!checkoutRequestId || !/^[a-zA-Z0-9_]{5,60}$/.test(checkoutRequestId))
+    if (!checkoutRequestId || !/^[a-zA-Z0-9_\-]{5,80}$/.test(checkoutRequestId))
       return res.status(400).json({ success: false, message: 'Invalid checkoutRequestId' });
 
-    const { data: payment } = await supabaseAdmin
+    // Fetch payment — IDOR prevention: user can only query their own
+    const { data: payment, error: payErr } = await supabaseAdmin
       .from('payments')
       .select('id, status, result_desc')
       .eq('checkout_request_id', checkoutRequestId)
-      .eq('user_id', userId) // IDOR prevention — user can only query their own
+      .eq('user_id', userId)
       .maybeSingle();
 
+    if (payErr) {
+      console.error('[M-Pesa status] DB error:', payErr.message);
+      return res.status(500).json({ success: false, message: 'Server error' });
+    }
     if (!payment)
       return res.status(404).json({ success: false, message: 'Payment not found' });
 
+    // ── SUCCESS: return booking details ──────────────────────────────────
     if (payment.status === 'SUCCESS') {
       const { data: booking } = await supabaseAdmin
         .from('bookings')
         .select('id, status, amount_paid, confirmed_at, package:package_id(id, name, price, image_urls, duration_days)')
         .eq('payment_id', payment.id)
         .maybeSingle();
+
       return res.json({ success: true, status: 'SUCCESS', booking });
     }
 
-    if (payment.status === 'FAILED') {
-      return res.json({ success: true, status: 'FAILED', resultDesc: payment.result_desc });
+    // ── FAILED / CANCELLED ───────────────────────────────────────────────
+    if (payment.status === 'FAILED' || payment.status === 'CANCELLED') {
+      return res.json({ success: true, status: payment.status, resultDesc: payment.result_desc });
     }
 
-    // Still PENDING — query Daraja directly as a fallback
+    // ── PENDING: query Daraja as fallback ────────────────────────────────
     try {
       const darajaRes = await stkQuery(checkoutRequestId);
-      // FIX 8: Handle both PascalCase and camelCase from stkQuery
       const rc = darajaRes.ResultCode ?? darajaRes.resultCode;
+
       if (rc === '0' || rc === 0)
-        return res.json({ success: true, status: 'SUCCESS', booking: null });
-      if (rc !== undefined && rc !== '1032' && rc !== 1032)
+        return res.json({ success: true, status: 'PENDING' }); // callback not yet received — keep polling
+
+      if (rc !== undefined && rc !== '1032' && rc !== 1032) {
+        // Non-pending result code from Daraja — update DB and return FAILED
+        await supabaseAdmin
+          .from('payments')
+          .update({ status: 'FAILED', result_code: String(rc), result_desc: darajaRes.ResultDesc ?? darajaRes.resultDesc })
+          .eq('id', payment.id);
+
         return res.json({ success: true, status: 'FAILED', resultDesc: darajaRes.ResultDesc ?? darajaRes.resultDesc });
+      }
     } catch (qErr) {
       console.warn('[M-Pesa status] Daraja query failed (non-fatal):', qErr.message);
     }
@@ -264,7 +306,7 @@ export const getStatus = async (req, res) => {
     return res.json({ success: true, status: 'PENDING' });
 
   } catch (err) {
-    console.error('[M-Pesa status]', err.message);
+    console.error('[M-Pesa status] Unexpected:', err.message, err.stack);
     return res.status(500).json({ success: false, message: 'Server error' });
   }
 };
