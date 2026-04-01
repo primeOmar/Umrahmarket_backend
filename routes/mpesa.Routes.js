@@ -5,7 +5,6 @@ import { initiate, callback, getStatus } from '../controllers/mpesaController.js
 import { requireAuth } from '../middleware/auth.middleware.js'; // adjust path if different
 
 const router = express.Router();
-
 // ── Rate limiters ──────────────────────────────────────────────────────────
 const initiateLimiter = rateLimit({
   windowMs: 60_000,
