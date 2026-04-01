@@ -2,7 +2,7 @@
 import express   from 'express';
 import rateLimit from 'express-rate-limit';
 import { initiate, callback, getStatus } from '../controllers/mpesaController.js';
-import { requireAuth } from '../middleware/auth.middleware.js'; // adjust path if different
+import { requireAuth } from '../middleware/auth.middleware.js'; 
 
 const router = express.Router();
 // ── Rate limiters ──────────────────────────────────────────────────────────
