@@ -1,5 +1,5 @@
 // models/Booking.js
-const mongoose = require('mongoose');
+import mongoose from 'mongoose';
 
 const BookingSchema = new mongoose.Schema(
   {
@@ -89,4 +89,4 @@ BookingSchema.virtual('id').get(function () {
   return this._id.toHexString();
 });
 
-module.exports = mongoose.model('Booking', BookingSchema);
+export default mongoose.model('Booking', BookingSchema);

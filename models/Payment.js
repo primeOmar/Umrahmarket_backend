@@ -1,5 +1,5 @@
 // models/Payment.js
-const mongoose = require('mongoose');
+import mongoose from 'mongoose';
 
 const PaymentSchema = new mongoose.Schema(
   {
@@ -90,4 +90,4 @@ PaymentSchema.index({ userId: 1, packageId: 1, status: 1, createdAt: -1 });
 // Compound index for Flutterwave dedup check
 PaymentSchema.index({ flwTxRef: 1 }, { unique: true, sparse: true });
 
-module.exports = mongoose.model('Payment', PaymentSchema);
+export default mongoose.model('Payment', PaymentSchema);
