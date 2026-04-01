@@ -49,7 +49,7 @@ export const initiate = async (req, res) => {
     }
 
     // Resolve price — handle both column name variants
-    const priceUSD  = pkg.price_per_person ?? pkg.price ?? 0;
+    const priceUSD  = pkg.price ?? 0;
     const amountKes = Math.ceil(Number(priceUSD) * KES_RATE);
     if (amountKes <= 0)
       return res.status(400).json({ success: false, message: 'Package has no valid price' });
