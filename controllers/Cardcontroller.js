@@ -7,7 +7,7 @@
 //      registers IPN, submits order → returns redirect_url to frontend
 //   2. Frontend redirects user to Pesapal hosted checkout page
 //      (user enters card / M-Pesa on Pesapal's PCI-certified servers)
-//   3. Pesapal redirects back to PESAPAL_CALLBACK_URL with ?OrderTrackingId=xxx
+//   3. Pesapal redirects back to PESAPAL_CALLBACK_URL/:packageId with ?OrderTrackingId=xxx
 //   4. Frontend calls POST /api/payments/card/verify { orderTrackingId, packageId }
 //   5. Backend queries Pesapal transaction status server-to-server
 //   6. All security checks pass → booking created in Supabase
@@ -187,8 +187,14 @@ export const initiate = async (req, res) => {
     // ── 5. Generate unique merchant order reference ───────────────────────────
     // Must be unique per transaction — tied to userId + packageId + timestamp
     const merchantRef = `UMR-${userId.slice(-6).toUpperCase()}-${Date.now()}`;
-    const callbackUrl = process.env.PESAPAL_CALLBACK_URL;
-    if (!callbackUrl) throw new Error('PESAPAL_CALLBACK_URL not set');
+    const _callbackBase = process.env.PESAPAL_CALLBACK_URL;
+    if (!_callbackBase) throw new Error('PESAPAL_CALLBACK_URL not set');
+
+    // FIX: Embed packageId in the URL PATH, not as a query param.
+    // Pesapal replaces the entire query string on redirect (dropping any params
+    // you add), but it preserves the path — so this is the only reliable way
+    // to carry packageId back to the frontend callback page.
+    const callbackUrl = `${_callbackBase}/${packageId}`;
 
     // ── 6. Submit order to Pesapal ────────────────────────────────────────────
     const orderPayload = {
