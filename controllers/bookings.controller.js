@@ -22,26 +22,32 @@ export const getMyBookings = async (req, res) => {
         currency,
         confirmed_at,
         created_at,
-        package:package_id (
+        package:packages!package_id (
           id,
           name,
           price,
-          duration_days,
+          original_price,
+          duration,
           location,
-          hotel_stars,
+          makkah_hotel_name,
+          makkah_hotel_rating,
           makkah_hotel_distance,
+          madinah_hotel_name,
+          madinah_hotel_rating,
+          madinah_hotel_distance,
           image_urls,
-          package_type,
-          agency:agency_id (
-            id,
-            name
-          )
+          type,
+          agent_name,
+          agent_number,
+          status
         ),
-        payment:payment_id (
+        payment:payments!payment_id (
           id,
           status,
           method,
           result_code,
+          result_desc,
+          mpesa_ref,
           paid_at
         )
       `)
@@ -49,8 +55,18 @@ export const getMyBookings = async (req, res) => {
       .order('created_at', { ascending: false });
 
     if (error) {
-      console.error('[getMyBookings] DB error:', error.message);
-      return res.status(500).json({ success: false, message: 'Failed to fetch bookings' });
+      // Log full error so Render logs show the exact Supabase reason
+      console.error('[getMyBookings] DB error:', {
+        message: error.message,
+        code:    error.code,
+        details: error.details,
+        hint:    error.hint,
+      });
+      return res.status(500).json({
+        success: false,
+        message: error.message,
+        hint:    error.hint ?? null,
+      });
     }
 
     return res.json({ success: true, bookings: bookings ?? [] });
