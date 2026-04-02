@@ -124,7 +124,7 @@ export const initiate = async (req, res) => {
     // ── 1. Fetch package price from DB — NEVER trust frontend ────────────────
     const { data: pkg, error: pkgErr } = await supabaseAdmin
       .from('packages')
-      .select('id, name, price_per_person, price, status')
+      .select('id, name, price, status')
       .eq('id', packageId)
       .maybeSingle();
 
@@ -139,7 +139,7 @@ export const initiate = async (req, res) => {
     if (!['active', 'published', 'approved'].includes(pkgStatus))
       return res.status(404).json({ success: false, message: 'Package not available for booking' });
 
-    const priceUSD = pkg.price_per_person ?? pkg.price ?? 0;
+    const priceUSD = pkg.price ?? 0;
     const priceKES = Math.ceil(priceUSD * KES_RATE);
     if (priceKES <= 0)
       return res.status(400).json({ success: false, message: 'Package has no valid price' });
