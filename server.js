@@ -14,6 +14,7 @@ import packagesRoutes    from './routes/packages/packages.route.js';
 import favouritesRoutes from './routes/packages/favourites.route.js';
 import mpesaRoutes from './routes/mpesa.routes.js';
 import cardRoutes  from './routes/Card.routes.js';
+import bookingsRouter from './routes/bookings.routes.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -170,6 +171,7 @@ app.use('/api/packages', packagesRoutes);
 app.use('/api/favourites', favouritesRoutes);
 app.use('/api/payments/mpesa', mpesaRoutes);
 app.use('/api/payments/card',  cardRoutes);
+app.use('/api/bookings', bookingsRouter);
 // ===========================================
 // ROOT ENDPOINT
 // ===========================================
