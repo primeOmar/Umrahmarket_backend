@@ -1,7 +1,7 @@
 // routes/card.routes.js
 import express   from 'express';
 import rateLimit from 'express-rate-limit';
-import { initiate, verify, ipn } from '../controllers/cardController.js';
+import { initiate, verify, ipn } from '../controllers/Cardcontroller.js';
 import { requireAuth } from '../middleware/auth.middleware.js';
 
 const router = express.Router();
