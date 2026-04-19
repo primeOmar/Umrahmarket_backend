@@ -112,10 +112,3 @@ CREATE TABLE IF NOT EXISTS public.bookings (
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
-
-CREATE INDEX IF NOT EXISTS idx_payments_user_id ON public.payments(user_id);
-CREATE INDEX IF NOT EXISTS idx_payments_package_id ON public.payments(package_id);
-CREATE INDEX IF NOT EXISTS idx_payments_checkout_request_id ON public.payments(checkout_request_id);
-CREATE INDEX IF NOT EXISTS idx_bookings_user_id ON public.bookings(user_id);
-CREATE INDEX IF NOT EXISTS idx_bookings_package_id ON public.bookings(package_id);
-CREATE INDEX IF NOT EXISTS idx_bookings_payment_id ON public.bookings(payment_id);
