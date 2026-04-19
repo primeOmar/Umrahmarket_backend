@@ -6,11 +6,76 @@
 
 import { supabaseAdmin } from '../config/supabase.js';
 
+const recoverMissingBookings = async (userId) => {
+  if (!supabaseAdmin) {
+    console.warn('[recoverMissingBookings] Supabase admin client not configured');
+    return;
+  }
+
+  const { data: existingBookings, error: existingErr } = await supabaseAdmin
+    .from('bookings')
+    .select('payment_id')
+    .eq('user_id', userId);
+
+  if (existingErr) {
+    console.error('[recoverMissingBookings] Existing bookings load failed:', existingErr.message, existingErr.details);
+    return;
+  }
+
+  const existingPaymentIds = (existingBookings || [])
+    .map((booking) => booking.payment_id)
+    .filter(Boolean);
+
+  let paymentsQuery = supabaseAdmin
+    .from('payments')
+    .select('id, user_id, package_id, amount_kes, method')
+    .eq('user_id', userId)
+    .eq('status', 'SUCCESS');
+
+  if (existingPaymentIds.length > 0) {
+    paymentsQuery = paymentsQuery.not('id', 'in', `(${existingPaymentIds.map((id) => `"${id}"`).join(',')})`);
+  }
+
+  const { data: successfulPayments, error: paymentsErr } = await paymentsQuery;
+
+  if (paymentsErr) {
+    console.error('[recoverMissingBookings] Successful payments load failed:', paymentsErr.message, paymentsErr.details);
+    return;
+  }
+
+  if (!successfulPayments?.length) {
+    return;
+  }
+
+  const bookingRecords = successfulPayments.map((payment) => ({
+    user_id:        payment.user_id,
+    package_id:     payment.package_id,
+    payment_id:     payment.id,
+    payment_method: payment.method || 'UNKNOWN',
+    amount_paid:    payment.amount_kes,
+    currency:       'KES',
+    status:         'confirmed',
+    confirmed_at:   new Date().toISOString(),
+  }));
+
+  const { error: insertErr } = await supabaseAdmin
+    .from('bookings')
+    .insert(bookingRecords);
+
+  if (insertErr) {
+    console.error('[recoverMissingBookings] Booking recovery insert failed:', insertErr.message, insertErr.details);
+  } else {
+    console.info(`[recoverMissingBookings] Recovered ${bookingRecords.length} booking(s) for user ${userId}`);
+  }
+};
+
 export const getMyBookings = async (req, res) => {
   try {
     const userId = req.user?.id;
     if (!userId)
       return res.status(401).json({ success: false, message: 'Unauthorised' });
+
+    await recoverMissingBookings(userId);
 
     const { data: bookings, error } = await supabaseAdmin
       .from('bookings')

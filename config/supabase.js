@@ -46,7 +46,15 @@ export const supabaseAdmin = config.supabase.serviceRoleKey
         persistSession: false,
       },
     })
-  : null;
+  : (() => {
+      console.warn('SUPABASE_SERVICE_ROLE_KEY is not configured. Falling back to anon key for server-side requests. This will likely fail for protected inserts/updates if RLS is enabled.');
+      return createClient(config.supabase.url, config.supabase.anonKey, {
+        auth: {
+          autoRefreshToken: false,
+          persistSession: false,
+        },
+      });
+    })();
 
 // Helper function to verify Supabase connection
 export const verifySupabaseConnection = async () => {
