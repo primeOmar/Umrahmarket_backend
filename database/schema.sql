@@ -112,3 +112,60 @@ CREATE TABLE IF NOT EXISTS public.bookings (
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Create favourites table
+CREATE TABLE IF NOT EXISTS public.favourites (
+    id SERIAL PRIMARY KEY,
+    user_id UUID NOT NULL,
+    package_id INTEGER NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(user_id, package_id)
+);
+
+-- Enable Row Level Security
+ALTER TABLE public.favourites ENABLE ROW LEVEL SECURITY;
+
+-- Create policies for favourites
+CREATE POLICY "favourites_select" ON public.favourites
+    FOR SELECT USING (auth.uid() = user_id);
+
+CREATE POLICY "favourites_insert" ON public.favourites
+    FOR INSERT WITH CHECK (auth.uid() = user_id);
+
+CREATE POLICY "favourites_delete" ON public.favourites
+    FOR DELETE USING (auth.uid() = user_id);
+
+-- Create indexes for better performance
+CREATE INDEX IF NOT EXISTS idx_favourites_user_id ON public.favourites(user_id);
+CREATE INDEX IF NOT EXISTS idx_favourites_package_id ON public.favourites(package_id);
+
+-- Create messages table
+CREATE TABLE IF NOT EXISTS public.messages (
+    id SERIAL PRIMARY KEY,
+    booking_id UUID NOT NULL,
+    sender_id UUID NOT NULL,
+    sender_type TEXT NOT NULL CHECK (sender_type IN ('client', 'agent')),
+    agent_id UUID,
+    client_id UUID,
+    message TEXT NOT NULL,
+    image_urls TEXT[],
+    is_read BOOLEAN DEFAULT false,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    FOREIGN KEY (booking_id) REFERENCES public.bookings(id) ON DELETE CASCADE
+);
+
+-- Enable Row Level Security
+ALTER TABLE public.messages ENABLE ROW LEVEL SECURITY;
+
+-- Create policies for messages (users can only see their own messages)
+CREATE POLICY "messages_select" ON public.messages
+    FOR SELECT USING (auth.uid() = sender_id OR auth.uid() = agent_id OR auth.uid() = client_id);
+
+CREATE POLICY "messages_insert" ON public.messages
+    FOR INSERT WITH CHECK (auth.uid() = sender_id);
+
+-- Create indexes for better performance
+CREATE INDEX IF NOT EXISTS idx_messages_booking_id ON public.messages(booking_id);
+CREATE INDEX IF NOT EXISTS idx_messages_sender_id ON public.messages(sender_id);
+CREATE INDEX IF NOT EXISTS idx_messages_created_at ON public.messages(created_at DESC);

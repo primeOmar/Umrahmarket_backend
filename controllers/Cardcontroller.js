@@ -25,6 +25,7 @@
 import axios             from 'axios';
 import crypto            from 'crypto';
 import { supabaseAdmin } from '../config/supabase.js';
+import { createBookingMessage } from './messagesController.js';
 
 const KES_RATE   = Number(process.env.KES_PER_USD) || 130;
 const IS_SANDBOX = (process.env.PESAPAL_ENV || 'sandbox') !== 'production';
@@ -350,6 +351,12 @@ export const verify = async (req, res) => {
         } else {
           booking = restoredBooking;
           console.info(`[Card verify] Recovered missing booking ${booking?.id}`);
+          
+          // Create automated booking message
+          if (booking?.id) {
+            const pkgName = booking.package?.name || 'Your booked package';
+            await createBookingMessage(booking.id, payment.user_id, null, pkgName);
+          }
         }
       }
 

@@ -2,6 +2,7 @@
 // Pure Supabase — no Mongoose models used anywhere in this file.
 import { supabaseAdmin } from '../config/supabase.js';
 import { stkPush, stkQuery } from '../services/Mpesaservice.js';
+import { createBookingMessage } from './messagesController.js';
 
 const KES_RATE       = Number(process.env.KES_PER_USD) || 130;
 const MPESA_PHONE_RE = /^254[17]\d{8}$/;
@@ -314,6 +315,12 @@ export const getStatus = async (req, res) => {
         } else {
           booking = newBooking;
           console.info(`[M-Pesa status] Recovered missing booking ${booking?.id}`);
+          
+          // Create automated booking message
+          if (booking?.id) {
+            const pkgName = booking.package?.name || 'Your booked package';
+            await createBookingMessage(booking.id, payment.user_id, null, pkgName);
+          }
         }
       }
 
