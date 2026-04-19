@@ -271,7 +271,7 @@ export const getStatus = async (req, res) => {
     if (payment.status === 'SUCCESS') {
       let { data: booking, error: bookingErr } = await supabaseAdmin
         .from('bookings')
-        .select('id, status, amount_paid, confirmed_at, package:package_id(id, name, price, image_urls, duration_days)')
+        .select('id, status, amount_paid, confirmed_at, package:package_id(id, name, price, image_urls, duration)')
         .eq('payment_id', payment.id)
         .maybeSingle();
 
@@ -288,7 +288,7 @@ export const getStatus = async (req, res) => {
             status:         'confirmed',
             confirmed_at:   new Date().toISOString(),
           })
-          .select('id, status, amount_paid, confirmed_at, package:package_id(id, name, price, image_urls, duration_days)')
+          .select('id, status, amount_paid, confirmed_at, package:package_id(id, name, price, image_urls, duration)')
           .maybeSingle();
 
         if (createErr) {

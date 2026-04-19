@@ -324,7 +324,7 @@ export const verify = async (req, res) => {
             status:         'confirmed',
             confirmed_at:   new Date().toISOString(),
           })
-          .select('id, status, amount_paid, confirmed_at')
+          .select('id, status, amount_paid, confirmed_at, package:package_id(id, name, price, image_urls, duration)')
           .maybeSingle();
 
         if (restoreErr) {
@@ -407,7 +407,7 @@ export const verify = async (req, res) => {
         status:         'confirmed',
         confirmed_at:   new Date().toISOString(),
       })
-      .select('id, status, amount_paid, confirmed_at, package:package_id(id, name, price, image_urls, duration_days)')
+      .select('id, status, amount_paid, confirmed_at, package:package_id(id, name, price, image_urls, duration)')
       .single();
 
     if (bookErr) {
