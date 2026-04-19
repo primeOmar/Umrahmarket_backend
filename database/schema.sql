@@ -100,7 +100,7 @@ CREATE TABLE IF NOT EXISTS public.payments (
 
 -- Create bookings table
 CREATE TABLE IF NOT EXISTS public.bookings (
-    id SERIAL PRIMARY KEY,
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL,
     package_id INTEGER NOT NULL,
     payment_id INTEGER NOT NULL,
