@@ -19,9 +19,10 @@ export const initiate = async (req, res) => {
     if (!packageId || !phone)
       return res.status(400).json({ success: false, message: 'packageId and phone are required' });
 
-    // Accept Supabase UUIDs only (our single DB is Supabase)
+    // Accept Supabase UUIDs or numeric package IDs
     const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(packageId);
-    if (!isUUID)
+    const isNumericId = /^[0-9]+$/.test(packageId);
+    if (!isUUID && !isNumericId)
       return res.status(400).json({ success: false, message: 'Invalid packageId' });
 
     if (!MPESA_PHONE_RE.test(phone))
@@ -254,7 +255,7 @@ export const getStatus = async (req, res) => {
     // Fetch payment — IDOR prevention: user can only query their own
     const { data: payment, error: payErr } = await supabaseAdmin
       .from('payments')
-      .select('id, status, result_desc')
+      .select('id, status, result_desc, user_id, package_id, amount_kes')
       .eq('checkout_request_id', checkoutRequestId)
       .eq('user_id', userId)
       .maybeSingle();
@@ -266,13 +267,37 @@ export const getStatus = async (req, res) => {
     if (!payment)
       return res.status(404).json({ success: false, message: 'Payment not found' });
 
-    // ── SUCCESS: return booking details ──────────────────────────────────
+    // ── SUCCESS: return booking details, and create missing booking if needed ─
     if (payment.status === 'SUCCESS') {
-      const { data: booking } = await supabaseAdmin
+      let { data: booking, error: bookingErr } = await supabaseAdmin
         .from('bookings')
         .select('id, status, amount_paid, confirmed_at, package:package_id(id, name, price, image_urls, duration_days)')
         .eq('payment_id', payment.id)
         .maybeSingle();
+
+      if (!booking) {
+        const { data: newBooking, error: createErr } = await supabaseAdmin
+          .from('bookings')
+          .insert({
+            user_id:        payment.user_id,
+            package_id:     payment.package_id,
+            payment_id:     payment.id,
+            payment_method: 'MPESA',
+            amount_paid:    payment.amount_kes,
+            currency:       'KES',
+            status:         'confirmed',
+            confirmed_at:   new Date().toISOString(),
+          })
+          .select('id, status, amount_paid, confirmed_at, package:package_id(id, name, price, image_urls, duration_days)')
+          .maybeSingle();
+
+        if (createErr) {
+          console.error('[M-Pesa status] Missing booking creation failed:', createErr.message, createErr.details);
+        } else {
+          booking = newBooking;
+          console.info(`[M-Pesa status] Recovered missing booking ${booking?.id}`);
+        }
+      }
 
       return res.json({ success: true, status: 'SUCCESS', booking });
     }

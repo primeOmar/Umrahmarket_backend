@@ -77,3 +77,45 @@ CREATE POLICY "packages_delete" ON public.packages
 CREATE INDEX IF NOT EXISTS idx_packages_status ON public.packages(status);
 CREATE INDEX IF NOT EXISTS idx_packages_type ON public.packages(type);
 CREATE INDEX IF NOT EXISTS idx_packages_created_at ON public.packages(created_at DESC);
+
+-- Create payments table
+CREATE TABLE IF NOT EXISTS public.payments (
+    id SERIAL PRIMARY KEY,
+    user_id UUID NOT NULL,
+    package_id INTEGER NOT NULL,
+    method TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    amount_kes INTEGER NOT NULL,
+    phone TEXT,
+    merchant_request_id TEXT,
+    checkout_request_id TEXT,
+    pesapal_order_tracking_id TEXT,
+    result_code TEXT,
+    result_desc TEXT,
+    mpesa_ref TEXT,
+    paid_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Create bookings table
+CREATE TABLE IF NOT EXISTS public.bookings (
+    id SERIAL PRIMARY KEY,
+    user_id UUID NOT NULL,
+    package_id INTEGER NOT NULL,
+    payment_id INTEGER NOT NULL,
+    payment_method TEXT NOT NULL,
+    amount_paid NUMERIC(10,2) NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'KES',
+    status TEXT NOT NULL DEFAULT 'confirmed',
+    confirmed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_payments_user_id ON public.payments(user_id);
+CREATE INDEX IF NOT EXISTS idx_payments_package_id ON public.payments(package_id);
+CREATE INDEX IF NOT EXISTS idx_payments_checkout_request_id ON public.payments(checkout_request_id);
+CREATE INDEX IF NOT EXISTS idx_bookings_user_id ON public.bookings(user_id);
+CREATE INDEX IF NOT EXISTS idx_bookings_package_id ON public.bookings(package_id);
+CREATE INDEX IF NOT EXISTS idx_bookings_payment_id ON public.bookings(payment_id);

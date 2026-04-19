@@ -115,10 +115,11 @@ export const initiate = async (req, res) => {
     if (!packageId)
       return res.status(400).json({ success: false, message: 'packageId is required' });
 
-    // Validate packageId (UUID or MongoDB ObjectId)
+    // Validate packageId (UUID, numeric ID, or MongoDB ObjectId)
     const isUUID     = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(packageId);
     const isObjectId = /^[0-9a-f]{24}$/i.test(packageId);
-    if (!isUUID && !isObjectId)
+    const isNumericId = /^[0-9]+$/.test(packageId);
+    if (!isUUID && !isObjectId && !isNumericId)
       return res.status(400).json({ success: false, message: 'Invalid packageId' });
 
     // ── 1. Fetch package price from DB — NEVER trust frontend ────────────────
@@ -304,11 +305,36 @@ export const verify = async (req, res) => {
 
     // Double-submit protection
     if (payment.status === 'SUCCESS') {
-      const { data: booking } = await supabaseAdmin
+      let { data: booking, error: bookingErr } = await supabaseAdmin
         .from('bookings')
         .select('id, status, amount_paid, confirmed_at')
         .eq('payment_id', payment.id)
         .maybeSingle();
+
+      if (!booking) {
+        const { data: restoredBooking, error: restoreErr } = await supabaseAdmin
+          .from('bookings')
+          .insert({
+            user_id:        payment.user_id,
+            package_id:     payment.package_id,
+            payment_id:     payment.id,
+            payment_method: 'CARD',
+            amount_paid:    payment.amount_kes,
+            currency:       'KES',
+            status:         'confirmed',
+            confirmed_at:   new Date().toISOString(),
+          })
+          .select('id, status, amount_paid, confirmed_at')
+          .maybeSingle();
+
+        if (restoreErr) {
+          console.error('[Card verify] Missing booking restore failed:', restoreErr.message, restoreErr.details);
+        } else {
+          booking = restoredBooking;
+          console.info(`[Card verify] Recovered missing booking ${booking?.id}`);
+        }
+      }
+
       return res.json({ success: true, alreadyProcessed: true, booking });
     }
 
