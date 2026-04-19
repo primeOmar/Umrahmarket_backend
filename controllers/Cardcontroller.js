@@ -145,6 +145,24 @@ export const initiate = async (req, res) => {
     if (priceKES <= 0)
       return res.status(400).json({ success: false, message: 'Package has no valid price' });
 
+    // ── Check if user already has a confirmed booking for this package ──
+    const { data: existingBooking, error: bookingErr } = await supabaseAdmin
+      .from('bookings')
+      .select('id, status')
+      .eq('user_id', userId)
+      .eq('package_id', packageId)
+      .eq('status', 'confirmed')
+      .maybeSingle();
+
+    if (bookingErr) {
+      console.error('[Card initiate] Booking check error:', bookingErr.message);
+      return res.status(500).json({ success: false, message: 'Failed to verify booking status' });
+    }
+
+    if (existingBooking) {
+      return res.status(400).json({ success: false, message: 'You have already booked this package. You cannot book the same package twice.' });
+    }
+
     // ── 2. Idempotency — resume pending within 10 min ────────────────────────
     const tenMinAgo = new Date(Date.now() - 10 * 60_000).toISOString();
     const { data: existing } = await supabaseAdmin
