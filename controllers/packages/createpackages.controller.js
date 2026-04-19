@@ -37,7 +37,16 @@ function sanitizeTags(arr, maxLen = 80, maxCount = 30) {
 // createPackage  POST /api/packages
 // ─────────────────────────────────────────────────────────────────────────────
 export const createPackage = async (req, res) => {
+  const userId = req.user.id;
   const { firstName, lastName, agentName, agentNumber } = req.user;
+
+  // Validate required agent data
+  if (!agentNumber) {
+    return res.status(400).json({
+      success: false,
+      message: 'Agent number is required. Please complete your agent profile.'
+    });
+  }
 
   const parseArray = (field) => {
     const raw = req.body[field];
@@ -64,14 +73,14 @@ export const createPackage = async (req, res) => {
   const available_to   = sanitizeDate(req.body.available_to);
 
   const makkah_hotel_name     = sanitizeText(req.body.makkah_hotel_name, 120);
-  const makkah_hotel_rating   = sanitizeNumber(req.body.makkah_hotel_rating);
+  const makkah_hotel_rating   = sanitizeNumber(req.body.makkah_hotel_rating)?.toString();
   const makkah_hotel_distance = sanitizeText(req.body.makkah_hotel_distance, 30);
   const makkah_hotel_address  = sanitizeText(req.body.makkah_hotel_address, 120);
   const makkah_check_in_date  = sanitizeDate(req.body.makkah_check_in_date);
   const makkah_check_out_date = sanitizeDate(req.body.makkah_check_out_date);
 
  const madinah_hotel_name     = sanitizeText(req.body.madinah_hotel_name, 120)     || null;
-  const madinah_hotel_rating   = sanitizeNumber(req.body.madinah_hotel_rating);
+  const madinah_hotel_rating   = sanitizeNumber(req.body.madinah_hotel_rating)?.toString();
 const madinah_hotel_distance = sanitizeText(req.body.madinah_hotel_distance, 30)  || null;
   const madinah_hotel_address  = sanitizeText(req.body.madinah_hotel_address, 120)  || null;
   const madinah_check_in_date  = sanitizeDate(req.body.madinah_check_in_date);
@@ -80,7 +89,7 @@ const madinah_hotel_distance = sanitizeText(req.body.madinah_hotel_distance, 30)
   const highlights = sanitizeTags(parseArray('highlights'));
   const inclusions = sanitizeTags(parseArray('inclusions'));
   const exclusions = sanitizeTags(parseArray('exclusions'));
-  const image_urls = req.imageUrls ?? [];
+  const image_urls = Array.isArray(req.imageUrls) ? req.imageUrls : [];
 
   // ── Build record ────────────────────────────────────────────────────────────
   const currentTime = new Date().toISOString();
@@ -96,38 +105,82 @@ const madinah_hotel_distance = sanitizeText(req.body.madinah_hotel_distance, 30)
     madinah_hotel_address, madinah_check_in_date, madinah_check_out_date,
     highlights, inclusions, exclusions,
     image_urls,
-    created_by:  `${firstName} ${lastName}`,
+    created_by:  userId,
     agent_name: agentName,
     agent_number: agentNumber,
-    status:      'Active',
-    created_at:  currentTime,
-    updated_at:  currentTime,
+    status: 'Active',
+    created_at: currentTime,
+    updated_at: currentTime,
   };
+
+  // ── Validate required fields ─────────────────────────────────────────────────
+  if (!name || !type || !location || !price || !duration) {
+    return res.status(400).json({
+      success: false,
+      message: 'Missing required fields: name, type, location, price, duration are required.'
+    });
+  }
 
   // ── Insert ──────────────────────────────────────────────────────────────────
   try {
+    // Build package with all fields, filtering out null/undefined values for optional fields
+    const packageToInsert = {
+      name,
+      type,
+      location,
+      description: description || null,
+      price,
+      original_price: original_price || null,
+      discount: discount || null,
+      duration,
+      available_from: available_from || null,
+      available_to: available_to || null,
+      min_group_size,
+      max_group_size,
+      makkah_hotel_name: makkah_hotel_name || null,
+      makkah_hotel_rating: makkah_hotel_rating || null,
+      makkah_hotel_distance: makkah_hotel_distance || null,
+      makkah_hotel_address: makkah_hotel_address || null,
+      makkah_check_in_date: makkah_check_in_date || null,
+      makkah_check_out_date: makkah_check_out_date || null,
+      madinah_hotel_name: madinah_hotel_name || null,
+      madinah_hotel_rating: madinah_hotel_rating || null,
+      madinah_hotel_distance: madinah_hotel_distance || null,
+      madinah_hotel_address: madinah_hotel_address || null,
+      madinah_check_in_date: madinah_check_in_date || null,
+      madinah_check_out_date: madinah_check_out_date || null,
+      highlights: highlights.length > 0 ? highlights : null,
+      inclusions: inclusions.length > 0 ? inclusions : null,
+      exclusions: exclusions.length > 0 ? exclusions : null,
+      image_urls: image_urls.length > 0 ? image_urls : null,
+      created_by: userId,
+      agent_name: agentName,
+      agent_number: agentNumber,
+      status: 'Active',
+      created_at: currentTime,
+      updated_at: currentTime,
+    };
+
+    console.log('[createPackage] Inserting package:', { name, type, location, price, duration });
+
     const { data, error } = await supabase
       .from('packages')
-      .insert([newPackage])
-      .select(
-        `id, name, type, location, description,
-         price, original_price, discount, duration,
-         available_from, available_to, min_group_size, max_group_size,
-         makkah_hotel_name, makkah_hotel_rating, makkah_hotel_distance,
-         makkah_hotel_address, makkah_check_in_date, makkah_check_out_date,
-         madinah_hotel_name, madinah_hotel_rating, madinah_hotel_distance,
-         madinah_hotel_address, madinah_check_in_date, madinah_check_out_date,
-         highlights, inclusions, exclusions,
-         image_urls, created_by, status, created_at`
-      );
+      .insert([packageToInsert])
+      .select('id, name, type, location, price, duration, status, created_by, agent_name, agent_number');
 
     if (error) {
-      console.error('Supabase insert error:', error);
+      console.error('[createPackage] Supabase insert error:', error);
+      console.error('[createPackage] Error details:', {
+        message: error.message,
+        code: error.code,
+        details: error.details,
+        hint: error.hint,
+      });
       throw error;
     }
 
     const record = data?.[0] ?? null;
-    console.log('Package created successfully:', name);
+    console.log('Package created successfully:', record);
 
     return res.status(201).json({
       success:      true,
