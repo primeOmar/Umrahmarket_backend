@@ -20,7 +20,6 @@ export const initiate = async (req, res) => {
     if (!packageId || !phone)
       return res.status(400).json({ success: false, message: 'packageId and phone are required' });
 
-    // Accept Supabase UUIDs or numeric package IDs
     const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(packageId);
     const isNumericId = /^[0-9]+$/.test(packageId);
     if (!isUUID && !isNumericId)
@@ -32,7 +31,7 @@ export const initiate = async (req, res) => {
     // ── Fetch package from Supabase — NEVER trust FE price ──────────────
     const { data: pkg, error: pkgErr } = await supabaseAdmin
       .from('packages')
-      .select('id, name, price, status')
+      .select('id, name, price, status, created_by, agent_name')
       .eq('id', packageId)
       .maybeSingle();
 
@@ -44,13 +43,11 @@ export const initiate = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Package not found' });
     }
 
-    // Accept any reasonable active-like status — adjust to match your DB values
     const pkgStatus = (pkg.status || '').toLowerCase();
     if (!['active', 'published', 'approved', 'available'].includes(pkgStatus)) {
       return res.status(400).json({ success: false, message: `Package is not available for booking (status: ${pkg.status})` });
     }
 
-    // Resolve price — handle both column name variants
     const priceUSD  = pkg.price ?? 0;
     const amountKes = Math.ceil(Number(priceUSD) * KES_RATE);
     if (amountKes <= 0)
@@ -103,7 +100,6 @@ export const initiate = async (req, res) => {
       return res.status(502).json({ success: false, message: `M-Pesa error: ${darajaErr.message}` });
     }
 
-    // Daraja returns PascalCase — normalise both casings
     const checkoutRequestId = darajaRes.CheckoutRequestID ?? darajaRes.checkoutRequestId;
     const merchantRequestId = darajaRes.MerchantRequestID ?? darajaRes.merchantRequestId;
 
@@ -128,7 +124,6 @@ export const initiate = async (req, res) => {
 
     if (insertErr) {
       console.error('[M-Pesa initiate] DB insert failed:', insertErr.message, insertErr.details);
-      // STK was already sent — don't return 502, let FE poll so user can complete payment
       return res.status(500).json({
         success: false,
         message: 'Payment prompt sent but could not be recorded. Contact support if you are charged.',
@@ -170,7 +165,6 @@ export const callback = async (req, res) => {
 
     const { MerchantRequestID, CheckoutRequestID, ResultCode, ResultDesc, CallbackMetadata } = body;
 
-    // Look up the payment record in Supabase
     const { data: payment, error: payErr } = await supabaseAdmin
       .from('payments')
       .select('id, user_id, package_id, amount_kes, status')
@@ -186,7 +180,6 @@ export const callback = async (req, res) => {
       return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
     }
     if (payment.status !== 'PENDING') {
-      // Already processed (duplicate callback)
       return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
     }
 
@@ -207,7 +200,6 @@ export const callback = async (req, res) => {
     const mpesaRef   = meta.MpesaReceiptNumber || '';
     const paidAmount = Number(meta.Amount) || payment.amount_kes;
 
-    // Amount sanity check (allow ±1 KES rounding)
     if (Math.abs(paidAmount - payment.amount_kes) > 1) {
       console.error(`[M-Pesa callback] Amount mismatch — expected ${payment.amount_kes}, got ${paidAmount}`);
       await supabaseAdmin
@@ -217,7 +209,6 @@ export const callback = async (req, res) => {
       return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
     }
 
-    // Mark payment SUCCESS
     await supabaseAdmin
       .from('payments')
       .update({
@@ -242,20 +233,40 @@ export const callback = async (req, res) => {
         status:         'confirmed',
         confirmed_at:   new Date().toISOString(),
       })
-      .select('id')
+      .select('id, package:package_id(id, name, created_by, agent_name)')
       .single();
 
     if (bookErr) {
       console.error('[M-Pesa callback] Booking creation failed:', bookErr.message, bookErr.details);
     } else {
       console.info(`[M-Pesa callback] Booking ${booking.id} created — mpesa ref: ${mpesaRef}`);
+      
+      // ─────────────────────────────────────────────────────────────────────────
+      // SEND AUTOMATED MESSAGE TO CLIENT AND AGENT (Callback path)
+      // ─────────────────────────────────────────────────────────────────────────
+      try {
+        const pkgName = booking.package?.name || 'Your booked package';
+        const agentId = booking.package?.created_by || null;
+        const agentName = booking.package?.agent_name || 'Travel Agency';
+        
+        await createBookingMessage(
+          booking.id,
+          payment.user_id,
+          agentId,
+          pkgName,
+          agentName
+        );
+        console.log(`[M-Pesa callback] Auto-message sent for booking ${booking.id}`);
+      } catch (msgErr) {
+        console.error('[M-Pesa callback] Failed to send auto-message:', msgErr.message);
+      }
     }
 
     return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
 
   } catch (err) {
     console.error('[M-Pesa callback] Unexpected:', err.message, err.stack);
-    return res.json({ ResultCode: 0, ResultDesc: 'Accepted' }); // always 200 to Safaricom
+    return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
   }
 };
 
@@ -271,7 +282,6 @@ export const getStatus = async (req, res) => {
     if (!checkoutRequestId || !/^[a-zA-Z0-9_\-]{5,80}$/.test(checkoutRequestId))
       return res.status(400).json({ success: false, message: 'Invalid checkoutRequestId' });
 
-    // Fetch payment — IDOR prevention: user can only query their own
     const { data: payment, error: payErr } = await supabaseAdmin
       .from('payments')
       .select('id, status, result_desc, user_id, package_id, amount_kes')
@@ -290,7 +300,7 @@ export const getStatus = async (req, res) => {
     if (payment.status === 'SUCCESS') {
       let { data: booking, error: bookingErr } = await supabaseAdmin
         .from('bookings')
-        .select('id, status, amount_paid, confirmed_at, package:package_id(id, name, price, image_urls, duration)')
+        .select('id, status, amount_paid, confirmed_at, package:package_id(id, name, price, image_urls, duration, created_by, agent_name)')
         .eq('payment_id', payment.id)
         .maybeSingle();
 
@@ -307,7 +317,7 @@ export const getStatus = async (req, res) => {
             status:         'confirmed',
             confirmed_at:   new Date().toISOString(),
           })
-          .select('id, status, amount_paid, confirmed_at, package:package_id(id, name, price, image_urls, duration)')
+          .select('id, status, amount_paid, confirmed_at, package:package_id(id, name, price, image_urls, duration, created_by, agent_name)')
           .maybeSingle();
 
         if (createErr) {
@@ -316,10 +326,26 @@ export const getStatus = async (req, res) => {
           booking = newBooking;
           console.info(`[M-Pesa status] Recovered missing booking ${booking?.id}`);
           
-          // Create automated booking message
+          // ─────────────────────────────────────────────────────────────────────
+          // SEND AUTOMATED MESSAGE TO CLIENT AND AGENT (Status polling path)
+          // ─────────────────────────────────────────────────────────────────────
           if (booking?.id) {
-            const pkgName = booking.package?.name || 'Your booked package';
-            await createBookingMessage(booking.id, payment.user_id, null, pkgName);
+            try {
+              const pkgName = booking.package?.name || 'Your booked package';
+              const agentId = booking.package?.created_by || null;
+              const agentName = booking.package?.agent_name || 'Travel Agency';
+              
+              await createBookingMessage(
+                booking.id,
+                payment.user_id,
+                agentId,
+                pkgName,
+                agentName
+              );
+              console.log(`[M-Pesa status] Auto-message sent for booking ${booking.id}`);
+            } catch (msgErr) {
+              console.error('[M-Pesa status] Failed to send auto-message:', msgErr.message);
+            }
           }
         }
       }
@@ -338,10 +364,9 @@ export const getStatus = async (req, res) => {
       const rc = darajaRes.ResultCode ?? darajaRes.resultCode;
 
       if (rc === '0' || rc === 0)
-        return res.json({ success: true, status: 'PENDING' }); // callback not yet received — keep polling
+        return res.json({ success: true, status: 'PENDING' });
 
       if (rc !== undefined && rc !== '1032' && rc !== 1032) {
-        // Non-pending result code from Daraja — update DB and return FAILED
         await supabaseAdmin
           .from('payments')
           .update({ status: 'FAILED', result_code: String(rc), result_desc: darajaRes.ResultDesc ?? darajaRes.resultDesc })
