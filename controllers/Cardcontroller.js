@@ -126,7 +126,7 @@ export const initiate = async (req, res) => {
     // ── 1. Fetch package price from DB — NEVER trust frontend ────────────────
     const { data: pkg, error: pkgErr } = await supabaseAdmin
       .from('packages')
-      .select('id, name, price, status')
+      .select('id, name, price, status, created_by, agent_name')
       .eq('id', packageId)
       .maybeSingle();
 
@@ -205,15 +205,10 @@ export const initiate = async (req, res) => {
     }
 
     // ── 5. Generate unique merchant order reference ───────────────────────────
-    // Must be unique per transaction — tied to userId + packageId + timestamp
     const merchantRef = `UMR-${userId.slice(-6).toUpperCase()}-${Date.now()}`;
     const _callbackBase = process.env.PESAPAL_CALLBACK_URL;
     if (!_callbackBase) throw new Error('PESAPAL_CALLBACK_URL not set');
 
-    // FIX: Embed packageId in the URL PATH, not as a query param.
-    // Pesapal replaces the entire query string on redirect (dropping any params
-    // you add), but it preserves the path — so this is the only reliable way
-    // to carry packageId back to the frontend callback page.
     const callbackUrl = `${_callbackBase}/${packageId}`;
 
     // ── 6. Submit order to Pesapal ────────────────────────────────────────────
@@ -326,7 +321,7 @@ export const verify = async (req, res) => {
     if (payment.status === 'SUCCESS') {
       let { data: booking, error: bookingErr } = await supabaseAdmin
         .from('bookings')
-        .select('id, status, amount_paid, confirmed_at')
+        .select('id, status, amount_paid, confirmed_at, package:package_id(id, name, price, image_urls, duration, created_by, agent_name)')
         .eq('payment_id', payment.id)
         .maybeSingle();
 
@@ -343,7 +338,7 @@ export const verify = async (req, res) => {
             status:         'confirmed',
             confirmed_at:   new Date().toISOString(),
           })
-          .select('id, status, amount_paid, confirmed_at, package:package_id(id, name, price, image_urls, duration)')
+          .select('id, status, amount_paid, confirmed_at, package:package_id(id, name, price, image_urls, duration, created_by, agent_name)')
           .maybeSingle();
 
         if (restoreErr) {
@@ -352,10 +347,27 @@ export const verify = async (req, res) => {
           booking = restoredBooking;
           console.info(`[Card verify] Recovered missing booking ${booking?.id}`);
           
-          // Create automated booking message
+          // ─────────────────────────────────────────────────────────────
+          // SEND AUTOMATED MESSAGE TO CLIENT AND AGENT
+          // ─────────────────────────────────────────────────────────────
           if (booking?.id) {
-            const pkgName = booking.package?.name || 'Your booked package';
-            await createBookingMessage(booking.id, payment.user_id, null, pkgName);
+            try {
+              const pkgName = booking.package?.name || 'Your booked package';
+              const agentId = booking.package?.created_by || null;
+              const agentName = booking.package?.agent_name || 'Travel Agency';
+              
+              await createBookingMessage(
+                booking.id,      // bookingId
+                payment.user_id, // clientId
+                agentId,         // agentId
+                pkgName,         // packageName
+                agentName        // agentName
+              );
+              console.log(`[Card verify] Auto-message sent for booking ${booking.id}`);
+            } catch (msgErr) {
+              console.error('[Card verify] Failed to send auto-message:', msgErr.message);
+              // Don't fail the response if messaging fails
+            }
           }
         }
       }
@@ -432,7 +444,7 @@ export const verify = async (req, res) => {
         status:         'confirmed',
         confirmed_at:   new Date().toISOString(),
       })
-      .select('id, status, amount_paid, confirmed_at, package:package_id(id, name, price, image_urls, duration)')
+      .select('id, status, amount_paid, confirmed_at, package:package_id(id, name, price, image_urls, duration, created_by, agent_name)')
       .single();
 
     if (bookErr) {
@@ -441,6 +453,28 @@ export const verify = async (req, res) => {
     }
 
     console.info(`[Card] Booking ${booking.id} created | tracking: ${orderTrackingId} | ref: ${confirmationCode}`);
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // SEND AUTOMATED MESSAGE TO CLIENT AND AGENT
+    // ─────────────────────────────────────────────────────────────────────────
+    try {
+      const pkgName = booking.package?.name || 'Your booked package';
+      const agentId = booking.package?.created_by || null;
+      const agentName = booking.package?.agent_name || 'Travel Agency';
+      
+      await createBookingMessage(
+        booking.id,      // bookingId
+        payment.user_id, // clientId
+        agentId,         // agentId
+        pkgName,         // packageName
+        agentName        // agentName
+      );
+      console.log(`[Card verify] Auto-message sent for booking ${booking.id}`);
+    } catch (msgErr) {
+      console.error('[Card verify] Failed to send auto-message:', msgErr.message);
+      // Don't fail the response if messaging fails
+    }
+
     return res.json({ success: true, status: 'SUCCESS', booking });
 
   } catch (err) {
@@ -457,7 +491,6 @@ export const verify = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 export const ipn = async (req, res) => {
   try {
-    // Pesapal sends: { orderTrackingId, orderMerchantReference, orderNotificationType }
     const { orderTrackingId, orderMerchantReference } = req.body;
 
     if (!orderTrackingId) {
@@ -467,7 +500,6 @@ export const ipn = async (req, res) => {
 
     console.info(`[Card IPN] Received | tracking: ${orderTrackingId} | ref: ${orderMerchantReference}`);
 
-    // Find payment
     const { data: payment } = await supabaseAdmin
       .from('payments')
       .select('id, user_id, package_id, amount_kes, status')
@@ -478,7 +510,6 @@ export const ipn = async (req, res) => {
       return res.status(200).json({ orderNotificationType: 'IPNCHANGE', orderTrackingId, orderMerchantReference, status: '200' });
     }
 
-    // Query Pesapal to confirm — never trust IPN body alone
     let token, txStatus;
     try {
       token    = await getPesapalToken();
@@ -499,7 +530,6 @@ export const ipn = async (req, res) => {
       return res.status(200).json({ orderNotificationType: 'IPNCHANGE', orderTrackingId, orderMerchantReference, status: '200' });
     }
 
-    // Amount check
     const paidAmount = Number(txStatus.amount);
     if (!isNaN(paidAmount) && Math.abs(paidAmount - payment.amount_kes) > 1) {
       console.error(`[Card IPN] Amount mismatch — expected ${payment.amount_kes}, got ${paidAmount}`);
@@ -507,13 +537,11 @@ export const ipn = async (req, res) => {
       return res.status(200).json({ orderNotificationType: 'IPNCHANGE', orderTrackingId, orderMerchantReference, status: '200' });
     }
 
-    // Mark SUCCESS
     await supabaseAdmin.from('payments')
       .update({ status: 'SUCCESS', result_desc: 'IPN: COMPLETED', paid_at: new Date().toISOString() })
       .eq('id', payment.id);
 
-    // Create booking
-    const { error: bookErr } = await supabaseAdmin
+    const { data: booking, error: bookErr } = await supabaseAdmin
       .from('bookings')
       .insert({
         user_id:        payment.user_id,
@@ -524,12 +552,36 @@ export const ipn = async (req, res) => {
         currency:       'KES',
         status:         'confirmed',
         confirmed_at:   new Date().toISOString(),
-      });
+      })
+      .select('id, package:package_id(id, name, created_by, agent_name)')
+      .single();
 
-    if (bookErr) console.error('[Card IPN] Booking creation failed:', bookErr.message);
-    else console.info(`[Card IPN] Booking created | tracking: ${orderTrackingId}`);
+    if (bookErr) {
+      console.error('[Card IPN] Booking creation failed:', bookErr.message);
+    } else {
+      console.info(`[Card IPN] Booking ${booking.id} created | tracking: ${orderTrackingId}`);
+      
+      // ─────────────────────────────────────────────────────────────────────────
+      // SEND AUTOMATED MESSAGE TO CLIENT AND AGENT (IPN path)
+      // ─────────────────────────────────────────────────────────────────────────
+      try {
+        const pkgName = booking.package?.name || 'Your booked package';
+        const agentId = booking.package?.created_by || null;
+        const agentName = booking.package?.agent_name || 'Travel Agency';
+        
+        await createBookingMessage(
+          booking.id,
+          payment.user_id,
+          agentId,
+          pkgName,
+          agentName
+        );
+        console.log(`[Card IPN] Auto-message sent for booking ${booking.id}`);
+      } catch (msgErr) {
+        console.error('[Card IPN] Failed to send auto-message:', msgErr.message);
+      }
+    }
 
-    // Pesapal requires this exact response format
     return res.status(200).json({ orderNotificationType: 'IPNCHANGE', orderTrackingId, orderMerchantReference, status: '200' });
 
   } catch (err) {

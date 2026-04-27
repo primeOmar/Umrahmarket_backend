@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import rateLimit from 'express-rate-limit';
 import config, { validateConfig } from './config/security.config.js';
 import logger from './config/logger.js';
 import { verifySupabaseConnection } from './config/supabase.js';
@@ -173,7 +174,25 @@ app.use('/api/favourites', favouritesRoutes);
 app.use('/api/payments/mpesa', mpesaRoutes);
 app.use('/api/payments/card',  cardRoutes);
 app.use('/api/bookings', bookingsRouter);
+
+// ═══════════════════════════════════════════════════════════════════════
+// MESSAGES ROUTES WITH RATE LIMITING
+// ═══════════════════════════════════════════════════════════════════════
+// Messages get a generous limit — reads are now Realtime (not polled),
+// but sends and initial fetches still go through here.
+const messagesRateLimit = rateLimit({
+  windowMs: 60 * 1000,       // 1 minute window
+  max: 120,                   // 120 requests/min per IP (2/sec burst)
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.method === 'GET', // GET /messages/:id is cheap — skip limiting
+  message: { success: false, message: 'Too many messages, slow down.' },
+});
+
+// Apply rate limiting to messages routes (POST only, GET skipped)
+app.use('/api/messages', messagesRateLimit);
 app.use('/api/messages', messagesRoutes);
+
 // ===========================================
 // ROOT ENDPOINT
 // ===========================================
