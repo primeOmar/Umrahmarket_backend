@@ -32,7 +32,6 @@ const generateAgentNumber = async () => {
   const year = new Date().getFullYear();
   const prefix = `UMRH${year}`;
 
-  // Find the highest existing agent_number for this year
   const { data, error } = await supabaseAdmin
     .from('profiles')
     .select('agent_number')
@@ -51,15 +50,9 @@ const generateAgentNumber = async () => {
     if (!isNaN(lastSeq)) nextSeq = lastSeq + 1;
   }
 
-  // Zero-pad to 3 digits minimum (UMRH2026001, ..., UMRH2026999, UMRH20261000)
   const seq = String(nextSeq).padStart(3, '0');
   return `${prefix}${seq}`;
 };
-
-/**
- * Authentication Routes
- * Secure endpoints for user registration, login, and session management
- */
 
 // ===========================================
 // Account Lockout Tracking
@@ -69,7 +62,6 @@ const loginAttempts = new Map(); // In production, use Redis
 const checkAccountLockout = async (email) => {
   const attempts = loginAttempts.get(email) || { count: 0, lockedUntil: null };
   
-  // Check if account is locked
   if (attempts.lockedUntil && Date.now() < attempts.lockedUntil) {
     const remainingTime = Math.ceil((attempts.lockedUntil - Date.now()) / 60000);
     return {
@@ -78,7 +70,6 @@ const checkAccountLockout = async (email) => {
     };
   }
   
-  // Reset if lockout expired
   if (attempts.lockedUntil && Date.now() >= attempts.lockedUntil) {
     loginAttempts.delete(email);
     return { locked: false };
@@ -114,7 +105,6 @@ router.post(
     try {
       const { email, password, firstName, lastName, phone } = req.body;
       
-      // Check if user already exists
       const { data: existingUser } = await supabase
         .from('profiles')
         .select('id')
@@ -128,42 +118,26 @@ router.post(
         });
       }
       
-      // Create user in Supabase Auth
-      /* const { data: authData, error: authError } = await supabase.auth.signUp({
+      const signUpOptions = {
+        data: {
+          firstName,
+          lastName,
+          phone,
+          role: 'client',
+          approved: true,
+          createdAt: new Date().toISOString(),
+        },
+      };
+
+      if (process.env.NODE_ENV !== 'development') {
+        signUpOptions.emailRedirectTo = `${config.cors.allowedOrigins[0]}/verify-email`;
+      }
+
+      const { data: authData, error: authError } = await supabase.auth.signUp({
         email,
         password,
-        options: {
-          data: {
-            firstName,
-            lastName,
-            phone,
-            role: 'client',
-            approved: true, // Clients are auto-approved
-            createdAt: new Date().toISOString(),
-          },
-          emailRedirectTo: `${config.cors.allowedOrigins[0]}/verify-email`,
-        },
-      }); */
-    const signUpOptions = {
-  data: {
-    firstName,
-    lastName,
-    phone,
-    role: 'client',
-    approved: true,
-    createdAt: new Date().toISOString(),
-  },
-};
-
-if (process.env.NODE_ENV !== 'development') {
-  signUpOptions.emailRedirectTo = `${config.cors.allowedOrigins[0]}/verify-email`;
-}
-
-const { data: authData, error: authError } = await supabase.auth.signUp({
-  email,
-  password,
-  options: signUpOptions,
-});
+        options: signUpOptions,
+      });
       
       if (authError) {
         logger.error('Client registration failed', {
@@ -178,7 +152,6 @@ const { data: authData, error: authError } = await supabase.auth.signUp({
         });
       }
       
-      // Create profile in database
       if (supabaseAdmin) {
         const { error: profileError } = await supabaseAdmin
           .from('profiles')
@@ -262,7 +235,6 @@ router.post(
         licenseNumber 
       } = req.body;
       
-      // Check if user already exists
       const { data: existingUser } = await supabase
         .from('profiles')
         .select('id')
@@ -276,38 +248,21 @@ router.post(
         });
       }
       
-      // Create user in Supabase Auth
-      /* const { data: authData, error: authError } = await supabase.auth.signUp({
+      const { data: authData, error: authError } = await supabase.auth.signUp({
         email,
         password,
         options: {
           data: {
-            firstName,
-            lastName,
-            phone,
-            companyName,
-            licenseNumber,
-            role: 'agent',
-            approved: false, // Agents need manual approval
+            firstName, lastName, phone, companyName, licenseNumber,
+            role: 'agent', approved: false,
             createdAt: new Date().toISOString(),
           },
-          emailRedirectTo: `${config.cors.allowedOrigins[0]}/verify-email`,
+          emailRedirectTo: process.env.NODE_ENV === 'development' 
+            ? undefined 
+            : `${config.cors.allowedOrigins[0]}/verify-email`,
         },
-      }); */
-      const { data: authData, error: authError } = await supabase.auth.signUp({
-  email,
-  password,
-  options: {
-    data: {
-      firstName, lastName, phone, companyName, licenseNumber,
-      role: 'agent', approved: false,
-      createdAt: new Date().toISOString(),
-    },
-    emailRedirectTo: process.env.NODE_ENV === 'development' 
-      ? undefined 
-      : `${config.cors.allowedOrigins[0]}/verify-email`,
-  },
-});
+      });
+
       if (authError) {
         logger.error('Agent registration failed', {
           error: authError.message,
@@ -321,7 +276,6 @@ router.post(
         });
       }
       
-      // Generate unique agent number
       let agentNumber = null;
       if (supabaseAdmin) {
         try {
@@ -331,7 +285,6 @@ router.post(
         }
       }
 
-      // Create profile in database
       if (supabaseAdmin) {
         const { error: profileError } = await supabaseAdmin
           .from('profiles')
@@ -369,8 +322,6 @@ router.post(
         agentNumber,
         ip: req.ip,
       });
-      
-      // TODO: Send notification to admin for approval
       
       res.status(201).json({
         success: true,
@@ -414,7 +365,6 @@ router.post(
     try {
       const { email, password } = req.body;
       
-      // Check account lockout
       const lockoutStatus = await checkAccountLockout(email);
       if (lockoutStatus.locked) {
         return res.status(423).json({
@@ -424,7 +374,6 @@ router.post(
         });
       }
       
-      // Authenticate with Supabase
       const { data, error } = await supabase.auth.signInWithPassword({
         email,
         password,
@@ -439,24 +388,20 @@ router.post(
           error: error.message,
         });
         
-        // Generic error message for security
         return res.status(401).json({
           success: false,
           error: 'Invalid email or password',
         });
       }
       
-      // Reset login attempts on successful login
       resetLoginAttempts(email);
       
-      // Generate custom JWT tokens
       const accessToken = generateAccessToken(
         data.user.id,
         data.user.user_metadata.role
       );
       const refreshToken = generateRefreshToken(data.user.id);
       
-      // Set cookies
       res.cookie('access_token', accessToken, {
         httpOnly: config.cookie.httpOnly,
         secure: config.cookie.secure,
@@ -464,12 +409,12 @@ router.post(
         maxAge: 15 * 60 * 1000, // 15 minutes
       });
       
+      // ← Removed path restriction so cookie is sent on all requests
       res.cookie('refresh_token', refreshToken, {
         httpOnly: true,
         secure: config.cookie.secure,
         sameSite: config.cookie.sameSite,
         maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-        path: '/api/auth/refresh',
       });
       
       logAuthAttempt(true, data.user.id, req.ip, req.get('user-agent'), {
@@ -477,8 +422,6 @@ router.post(
         role: data.user.user_metadata.role,
       });
       
-      // For agents, fetch agentNumber and companyName from profiles table
-      // Uses supabaseAdmin to bypass RLS (anon key would be blocked at this point)
       let agentNumber = null;
       let agentName = null;
       if (data.user.user_metadata.role === 'agent') {
@@ -510,7 +453,7 @@ router.post(
             ...(data.user.user_metadata.role === 'agent' && { agentNumber, agentName }),
           },
           accessToken,
-          refreshToken,
+          refreshToken, // ← returned in body so frontend can store in localStorage
         },
       });
     } catch (error) {
@@ -542,7 +485,6 @@ router.post('/google', authRateLimiter, async (req, res) => {
       });
     }
 
-    // DEBUG — log to Render so you can see exactly what Supabase returns
     console.log('[Google Auth] Received idToken, length:', idToken.length);
 
     const { data, error } = await supabase.auth.signInWithIdToken({
@@ -550,7 +492,6 @@ router.post('/google', authRateLimiter, async (req, res) => {
       token: idToken,
     });
 
-    // DEBUG — log the full Supabase response
     console.log('[Google Auth] Supabase error:', error);
     console.log('[Google Auth] Supabase data:', data?.user?.id);
 
@@ -559,7 +500,6 @@ router.post('/google', authRateLimiter, async (req, res) => {
       return res.status(400).json({ success: false, error: error.message });
     }
 
-    // Upsert into profiles table so the user exists there
     if (supabaseAdmin && data.user) {
       const meta      = data.user.user_metadata || {};
       const fullName  = meta.full_name || meta.name || '';
@@ -597,7 +537,7 @@ router.post('/google', authRateLimiter, async (req, res) => {
           role:      data.user.user_metadata?.role || 'client',
         },
         accessToken,
-        refreshToken,
+        refreshToken, // ← returned in body so frontend can store in localStorage
       },
     });
 
@@ -613,17 +553,17 @@ router.post('/google', authRateLimiter, async (req, res) => {
 // ===========================================
 router.post('/refresh', async (req, res) => {
   try {
-    const refreshToken = req.cookies.refresh_token || req.body.refreshToken;
+    // ← Accept from cookie (httpOnly) OR request body (localStorage fallback)
+    const token = req.cookies.refresh_token || req.body.refreshToken;
     
-    if (!refreshToken) {
+    if (!token) {
       return res.status(401).json({
         success: false,
         error: 'Refresh token is required',
       });
     }
     
-    // Verify refresh token
-    const decoded = verifyRefreshToken(refreshToken);
+    const decoded = verifyRefreshToken(token);
     
     if (!decoded) {
       return res.status(401).json({
@@ -632,7 +572,6 @@ router.post('/refresh', async (req, res) => {
       });
     }
     
-    // Generate new access token
     const accessToken = generateAccessToken(decoded.userId, decoded.role);
     
     res.json({
@@ -659,10 +598,8 @@ router.post('/refresh', async (req, res) => {
 // ===========================================
 router.post('/logout', verifyToken, async (req, res) => {
   try {
-    // Sign out from Supabase
     await supabase.auth.signOut();
     
-    // Clear cookies
     res.clearCookie('access_token');
     res.clearCookie('refresh_token');
     
@@ -699,7 +636,6 @@ router.post(
     try {
       const { email } = req.body;
       
-      // Send password reset email
       const { error } = await supabase.auth.resetPasswordForEmail(email, {
         redirectTo: `${config.cors.allowedOrigins[0]}/reset-password`,
       });
@@ -711,7 +647,6 @@ router.post(
         });
       }
       
-      // Always return success to prevent email enumeration
       res.json({
         success: true,
         message: 'If an account exists with this email, a password reset link has been sent.',
@@ -741,7 +676,6 @@ router.post(
     try {
       const { token, password } = req.body;
       
-      // Update password
       const { error } = await supabase.auth.updateUser({
         password,
       });
@@ -782,7 +716,6 @@ router.post('/verify-email', async (req, res) => {
   try {
     const { token } = req.body;
     
-    // Verify email with token
     const { error } = await supabase.auth.verifyOtp({
       token_hash: token,
       type: 'email',
