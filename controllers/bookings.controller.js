@@ -93,6 +93,71 @@ const recoverMissingBookings = async (userId) => {
   }
 };
 
+export const getAgentClients = async (req, res) => {
+  try {
+    const agentId = req.user?.id;
+    if (!agentId) return res.status(401).json({ success: false, message: 'Unauthorised' });
+    if (req.user.role !== 'agent') return res.status(403).json({ success: false, message: 'Forbidden' });
+
+    const { data: agentPackages, error: pkgErr } = await supabaseAdmin
+      .from('packages')
+      .select('id')
+      .eq('created_by', agentId);
+
+    if (pkgErr) return res.status(500).json({ success: false, message: pkgErr.message });
+    if (!agentPackages?.length) return res.json({ success: true, clients: [] });
+
+    const packageIds = agentPackages.map(p => p.id);
+
+    const { data: bookings, error: bookErr } = await supabaseAdmin
+      .from('bookings')
+      .select('id, status, amount_paid, currency, notes, created_at, user_id, packages(id, name, type, duration, available_from, available_to)')
+      .in('package_id', packageIds)
+      .order('created_at', { ascending: false });
+
+    if (bookErr) return res.status(500).json({ success: false, message: bookErr.message });
+    if (!bookings?.length) return res.json({ success: true, clients: [] });
+
+    const userIds = [...new Set(bookings.map(b => b.user_id).filter(Boolean))];
+
+    const { data: profiles, error: profErr } = await supabaseAdmin
+      .from('profiles')
+      .select('id, first_name, last_name, email, phone')
+      .in('id', userIds);
+
+    if (profErr) return res.status(500).json({ success: false, message: profErr.message });
+
+    const profileMap = Object.fromEntries((profiles || []).map(p => [p.id, p]));
+
+    const clients = bookings.map(b => {
+      const profile = profileMap[b.user_id] || {};
+      return {
+        bookingId:     b.id,
+        userId:        b.user_id,
+        name:          [profile.first_name, profile.last_name].filter(Boolean).join(' ') || 'Unknown',
+        email:         profile.email || '—',
+        phone:         profile.phone || '—',
+        package:       b.packages,
+        packageName:   b.packages?.name || '—',
+        packageType:   b.packages?.type || 'umrah',
+        duration:      b.packages?.duration,
+        availableFrom: b.packages?.available_from,
+        availableTo:   b.packages?.available_to,
+        status:        b.status,
+        amountPaid:    b.amount_paid,
+        currency:      b.currency || 'KES',
+        notes:         b.notes,
+        bookedAt:      b.created_at,
+      };
+    });
+
+    return res.json({ success: true, clients });
+  } catch (err) {
+    console.error('[getAgentClients] Unexpected error:', err.message);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+};
+
 export const getMyBookings = async (req, res) => {
   try {
     const userId = req.user?.id;
