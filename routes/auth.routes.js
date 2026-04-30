@@ -155,7 +155,7 @@ router.post(
       if (supabaseAdmin) {
         const { error: profileError } = await supabaseAdmin
           .from('profiles')
-          .insert({
+          .upsert({
             id: authData.user.id,
             email,
             first_name: firstName,
@@ -164,8 +164,8 @@ router.post(
             role: 'client',
             approved: true,
             created_at: new Date().toISOString(),
-          });
-        
+          }, { onConflict: 'id' });
+
         if (profileError) {
           logger.error('Failed to create profile', {
             error: profileError.message,
@@ -288,7 +288,7 @@ router.post(
       if (supabaseAdmin) {
         const { error: profileError } = await supabaseAdmin
           .from('profiles')
-          .insert({
+          .upsert({
             id: authData.user.id,
             email,
             first_name: firstName,
@@ -300,8 +300,8 @@ router.post(
             role: 'agent',
             approved: false,
             created_at: new Date().toISOString(),
-          });
-        
+          }, { onConflict: 'id' });
+
         if (profileError) {
           logger.error('Failed to create agent profile', {
             error: profileError.message,
