@@ -105,11 +105,12 @@ router.post(
     try {
       const { email, password, firstName, lastName, phone } = req.body;
       
-      const { data: existingUser } = await supabase
+      // FIX Bug 2: use supabaseAdmin so RLS never silently blocks the duplicate check
+      const { data: existingUser } = await supabaseAdmin
         .from('profiles')
         .select('id')
         .eq('email', email)
-        .single();
+        .maybeSingle();
       
       if (existingUser) {
         return res.status(409).json({
@@ -151,27 +152,31 @@ router.post(
           error: authError.message,
         });
       }
-      
-      if (supabaseAdmin) {
-        const { error: profileError } = await supabaseAdmin
-          .from('profiles')
-          .upsert({
-            id: authData.user.id,
-            email,
-            first_name: firstName,
-            last_name: lastName,
-            phone,
-            role: 'client',
-            approved: true,
-            created_at: new Date().toISOString(),
-          }, { onConflict: 'id' });
 
-        if (profileError) {
-          logger.error('Failed to create profile', {
-            error: profileError.message,
-            userId: authData.user.id,
-          });
-        }
+      // FIX Bug 3: treat profile write failure as a hard error — roll back auth user
+      const { error: profileError } = await supabaseAdmin
+        .from('profiles')
+        .upsert({
+          id: authData.user.id,
+          email,
+          first_name: firstName,
+          last_name: lastName,
+          phone,
+          role: 'client',
+          approved: true,
+          created_at: new Date().toISOString(),
+        }, { onConflict: 'id' });
+
+      if (profileError) {
+        logger.error('Failed to create client profile — rolling back auth user', {
+          error: profileError.message,
+          userId: authData.user.id,
+        });
+        await supabaseAdmin.auth.admin.deleteUser(authData.user.id);
+        return res.status(500).json({
+          success: false,
+          error: 'Registration failed. Please try again later.',
+        });
       }
       
       logAuthAttempt(true, authData.user.id, req.ip, req.get('user-agent'), {
@@ -235,11 +240,12 @@ router.post(
         licenseNumber 
       } = req.body;
       
-      const { data: existingUser } = await supabase
+      // FIX Bug 2: use supabaseAdmin so RLS never silently blocks the duplicate check
+      const { data: existingUser } = await supabaseAdmin
         .from('profiles')
         .select('id')
         .eq('email', email)
-        .single();
+        .maybeSingle();
       
       if (existingUser) {
         return res.status(409).json({
@@ -277,37 +283,39 @@ router.post(
       }
       
       let agentNumber = null;
-      if (supabaseAdmin) {
-        try {
-          agentNumber = await generateAgentNumber();
-        } catch (err) {
-          logger.error('Agent number generation failed', { error: err.message });
-        }
+      try {
+        agentNumber = await generateAgentNumber();
+      } catch (err) {
+        logger.error('Agent number generation failed', { error: err.message });
       }
 
-      if (supabaseAdmin) {
-        const { error: profileError } = await supabaseAdmin
-          .from('profiles')
-          .upsert({
-            id: authData.user.id,
-            email,
-            first_name: firstName,
-            last_name: lastName,
-            phone,
-            company_name: companyName,
-            license_number: licenseNumber,
-            agent_number: agentNumber,
-            role: 'agent',
-            approved: false,
-            created_at: new Date().toISOString(),
-          }, { onConflict: 'id' });
+      // FIX Bug 3: treat profile write failure as a hard error — roll back auth user
+      const { error: profileError } = await supabaseAdmin
+        .from('profiles')
+        .upsert({
+          id: authData.user.id,
+          email,
+          first_name: firstName,
+          last_name: lastName,
+          phone,
+          company_name: companyName,
+          license_number: licenseNumber,
+          agent_number: agentNumber,
+          role: 'agent',
+          approved: false,
+          created_at: new Date().toISOString(),
+        }, { onConflict: 'id' });
 
-        if (profileError) {
-          logger.error('Failed to create agent profile', {
-            error: profileError.message,
-            userId: authData.user.id,
-          });
-        }
+      if (profileError) {
+        logger.error('Failed to create agent profile — rolling back auth user', {
+          error: profileError.message,
+          userId: authData.user.id,
+        });
+        await supabaseAdmin.auth.admin.deleteUser(authData.user.id);
+        return res.status(500).json({
+          success: false,
+          error: 'Registration failed. Please try again later.',
+        });
       }
       
       logAuthAttempt(true, authData.user.id, req.ip, req.get('user-agent'), {
@@ -395,12 +403,22 @@ router.post(
       }
       
       resetLoginAttempts(email);
-      
-      const userRole = data.user.user_metadata.role;
-      const accessToken = generateAccessToken(
-        data.user.id,
-        userRole
-      );
+
+      // FIX Bug 1: always fetch role from DB — user_metadata.role can be undefined
+      // at login time (Supabase sync lag) and causes the dummy-user bug
+      const { data: dbProfile, error: dbProfileError } = await supabaseAdmin
+        .from('profiles')
+        .select('role, agent_number, company_name, first_name, last_name, approved')
+        .eq('id', data.user.id)
+        .single();
+
+      if (dbProfileError || !dbProfile) {
+        logger.error('Profile not found at login', { userId: data.user.id, error: dbProfileError?.message });
+        return res.status(500).json({ success: false, error: 'Login failed. Please try again later.' });
+      }
+
+      const userRole = dbProfile.role;
+      const accessToken = generateAccessToken(data.user.id, userRole);
       const refreshToken = generateRefreshToken(data.user.id, userRole);
       
       res.cookie('access_token', accessToken, {
@@ -410,7 +428,6 @@ router.post(
         maxAge: 15 * 60 * 1000, // 15 minutes
       });
       
-      // ← Removed path restriction so cookie is sent on all requests
       res.cookie('refresh_token', refreshToken, {
         httpOnly: true,
         secure: config.cookie.secure,
@@ -422,23 +439,6 @@ router.post(
         type: 'login',
         role: userRole,
       });
-      
-      let agentNumber = null;
-      let agentName = null;
-      if (userRole === 'agent') {
-        const { data: profile, error: profileFetchError } = await supabaseAdmin
-          .from('profiles')
-          .select('agent_number, company_name')
-          .eq('id', data.user.id)
-          .single();
-        if (profileFetchError) {
-          logger.error('Failed to fetch agent profile on login', { error: profileFetchError.message, userId: data.user.id });
-        }
-        if (profile) {
-          agentNumber = profile.agent_number || null;
-          agentName   = profile.company_name || null;
-        }
-      }
 
       res.json({
         success: true,
@@ -448,13 +448,16 @@ router.post(
             id: data.user.id,
             email: data.user.email,
             role: userRole,
-            firstName: data.user.user_metadata.firstName,
-            lastName: data.user.user_metadata.lastName,
-            approved: data.user.user_metadata.approved,
-            ...(userRole === 'agent' && { agentNumber, agentName }),
+            firstName: dbProfile.first_name,
+            lastName: dbProfile.last_name,
+            approved: dbProfile.approved,
+            ...(userRole === 'agent' && {
+              agentNumber: dbProfile.agent_number || null,
+              agentName:   dbProfile.company_name || null,
+            }),
           },
           accessToken,
-          refreshToken, // ← returned in body so frontend can store in localStorage
+          refreshToken,
         },
       });
     } catch (error) {
@@ -501,11 +504,12 @@ router.post('/google', authRateLimiter, async (req, res) => {
       return res.status(400).json({ success: false, error: error.message });
     }
 
-    if (supabaseAdmin && data.user) {
+    if (data.user) {
       const meta      = data.user.user_metadata || {};
       const fullName  = meta.full_name || meta.name || '';
       const nameParts = fullName.trim().split(' ');
-      await supabaseAdmin
+      // FIX Bug 4: check upsert error — silent failure here causes dummy-user sessions
+      const { error: googleProfileError } = await supabaseAdmin
         .from('profiles')
         .upsert({
           id:         data.user.id,
@@ -516,6 +520,14 @@ router.post('/google', authRateLimiter, async (req, res) => {
           approved:   true,
           created_at: new Date().toISOString(),
         }, { onConflict: 'id' });
+
+      if (googleProfileError) {
+        logger.error('Google login: failed to upsert profile', {
+          error: googleProfileError.message,
+          userId: data.user.id,
+        });
+        return res.status(500).json({ success: false, error: 'Login failed. Please try again.' });
+      }
     }
 
     const googleRole = data.user.user_metadata?.role || 'client';
