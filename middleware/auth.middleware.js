@@ -68,84 +68,56 @@ export const generateRefreshToken = (userId, userType, email) => {
 };
 
 // ─────────────────────────────────────────────
+// HELPER - Build normalised req.user object
+// Single source of truth so verifyToken, extractUser,
+// and requireUserType all agree on field names.
+// ─────────────────────────────────────────────
+const buildUserObject = (profile, decoded) => ({
+  id:          profile.id,
+  firstName:   profile.first_name,
+  lastName:    profile.last_name,
+  // role comes from DB (authoritative); userType kept in sync so
+  // requireUserType(["agent"]) and req.user.role both work.
+  role:        profile.role,
+  userType:    profile.role,          // ← FIX: was missing; caused agent→client switch
+  agentName:   profile.company_name,
+  agentNumber: profile.agent_number,
+  approved:    profile.approved,
+  email:       decoded.email,
+});
+
+// ─────────────────────────────────────────────
 // TOKEN VERIFICATION - Access Token
 // ─────────────────────────────────────────────
-
 export const verifyToken = async (req, res, next) => {
   try {
-    // ─── DEBUG 1: Log all cookies received ───────────────────────────────────
-    console.log('[verifyToken] All cookies:', req.cookies);
-    console.log('[verifyToken] Authorization header:', req.headers.authorization);
-
     const token = req.cookies.access_token || req.headers.authorization?.split(' ')[1];
 
-    // ─── DEBUG 2: Token presence check ───────────────────────────────────────
-    console.log('[verifyToken] Cookie token present:', !!req.cookies.access_token);
-    console.log('[verifyToken] Header token present:', !!req.headers.authorization);
-    console.log('[verifyToken] Token resolved:', token ? `${token.substring(0, 50)}...` : 'NONE');
-
     if (!token) {
-      console.log('[verifyToken] ❌ No token found in cookies or headers');
       return res.status(401).json({ success: false, error: 'Access token required' });
     }
 
-    // ─── DEBUG 3: Config values ───────────────────────────────────────────────
-    console.log('[verifyToken] Secret (first 10 chars):', config.jwt.accessTokenSecret?.substring(0, 10) ?? 'UNDEFINED');
-    console.log('[verifyToken] Audience:', config.jwt.audience ?? 'UNDEFINED');
-    console.log('[verifyToken] Issuer:', config.jwt.issuer ?? 'UNDEFINED');
-
-    // ─── DEBUG 4: Decode token WITHOUT verifying to inspect its payload ───────
-    const rawDecoded = jwt.decode(token);
-    console.log('[verifyToken] Token payload (unverified):', rawDecoded);
-    console.log('[verifyToken] Token aud claim:', rawDecoded?.aud);
-    console.log('[verifyToken] Token iss claim:', rawDecoded?.iss);
-    console.log('[verifyToken] Token exp:', rawDecoded?.exp ? new Date(rawDecoded.exp * 1000).toISOString() : 'NONE');
-    console.log('[verifyToken] Token expired?:', rawDecoded?.exp ? Date.now() > rawDecoded.exp * 1000 : 'NO EXP');
-
-    // ─── Actual verification ──────────────────────────────────────────────────
     const decoded = jwt.verify(token, config.jwt.accessTokenSecret, {
       audience: config.jwt.audience,
       issuer:   config.jwt.issuer,
     });
 
-    console.log('[verifyToken] ✅ Token verified successfully. userId:', decoded.userId);
-
-    // ─── DB lookup ────────────────────────────────────────────────────────────
     const { data: profile, error } = await supabaseAdmin
       .from('profiles')
       .select('id, first_name, last_name, role, company_name, agent_number, approved')
       .eq('id', decoded.userId)
       .single();
 
-    console.log('[verifyToken] Profile fetch error:', error ?? 'NONE');
-    console.log('[verifyToken] Profile found:', profile ? `id=${profile.id}, role=${profile.role}` : 'NOT FOUND');
-
     if (error || !profile) {
-      console.log('[verifyToken] ❌ User not found in DB for userId:', decoded.userId);
       return res.status(401).json({ success: false, error: 'User not found' });
     }
 
-    req.user = {
-      id:          profile.id,
-      firstName:   profile.first_name,
-      lastName:    profile.last_name,
-      role:        profile.role,
-      agentName:   profile.company_name,
-      agentNumber: profile.agent_number,
-      approved:    profile.approved,
-    };
-
+    req.user   = buildUserObject(profile, decoded);
     req.userId = profile.id;
 
-    console.log('[verifyToken] ✅ req.user set:', req.user);
     next();
 
   } catch (error) {
-    // ─── DEBUG 5: Exact error that caused failure ─────────────────────────────
-    console.log('[verifyToken] ❌ JWT verification threw an error:');
-    console.log('[verifyToken] error.name:', error.name);
-    console.log('[verifyToken] error.message:', error.message);
-
     if (error.name === 'TokenExpiredError') {
       return res.status(401).json({ success: false, error: 'Access token expired', code: 'TOKEN_EXPIRED' });
     }
@@ -155,7 +127,6 @@ export const verifyToken = async (req, res, next) => {
     if (error.name === 'NotBeforeError') {
       return res.status(401).json({ success: false, error: 'Token not yet valid' });
     }
-
     return res.status(401).json({ success: false, error: 'Invalid access token' });
   }
 };
@@ -170,45 +141,41 @@ export const verifyRefreshToken = (token) => {
       audience: config.jwt.audience,
     });
 
-    // Ensure it's a refresh token
     if (decoded.tokenType !== 'refresh') {
       throw new Error('Invalid token type');
     }
 
     return decoded;
   } catch (error) {
-    logger.warn('Refresh token verification failed', {
-      error: error.message,
-    });
+    logger.warn('Refresh token verification failed', { error: error.message });
     return null;
   }
 };
 
 // ─────────────────────────────────────────────
-// MIDDLEWARE - Verify Access Token
+// MIDDLEWARE - Verify Access Token (alias)
 // ─────────────────────────────────────────────
-// NOTE: verifyToken is an async Express middleware (req, res, next).
-// requireAuth is an alias for it — import verifyToken directly instead
-// when you need a single-call auth middleware.
 export const requireAuth = verifyToken;
 
 // ─────────────────────────────────────────────
-// MIDDLEWARE - Verify User Type
+// MIDDLEWARE - Verify User Type/Role
+// Accepts role strings: "agent", "client", "admin", etc.
 // ─────────────────────────────────────────────
 export const requireUserType = (allowedTypes) => {
   return (req, res, next) => {
     if (!req.user) {
-      return res.status(401).json({
-        success: false,
-        error: 'User not authenticated',
-      });
+      return res.status(401).json({ success: false, error: 'User not authenticated' });
     }
 
-    if (!allowedTypes.includes(req.user.userType)) {
-      logger.warn('Unauthorized user type access attempt', {
-        userId: req.user.userId,
-        userType: req.user.userType,
-        path: req.path,
+    // Check both userType and role so callers using either field are covered
+    const userRole = req.user.userType || req.user.role;
+
+    if (!allowedTypes.includes(userRole)) {
+      logger.warn('Unauthorized role access attempt', {
+        userId:   req.user.id,
+        userRole,
+        required: allowedTypes,
+        path:     req.path,
       });
       return res.status(403).json({
         success: false,
@@ -221,8 +188,8 @@ export const requireUserType = (allowedTypes) => {
 };
 
 // ─────────────────────────────────────────────
-// MIDDLEWARE - Extract User Info from Token (optional auth)
-// Sets req.user if a valid token is present, but never blocks the request.
+// MIDDLEWARE - Extract User Info (optional auth)
+// Sets req.user if a valid token is present; never blocks.
 // ─────────────────────────────────────────────
 export const extractUser = async (req, res, next) => {
   const token =
@@ -245,7 +212,7 @@ export const extractUser = async (req, res, next) => {
         .single();
 
       if (profile) {
-        req.user   = { id: profile.id, firstName: profile.first_name, lastName: profile.last_name, role: profile.role, agentName: profile.company_name, agentNumber: profile.agent_number, approved: profile.approved };
+        req.user   = buildUserObject(profile, decoded); // ← FIX: was also missing userType
         req.userId = profile.id;
       }
     }

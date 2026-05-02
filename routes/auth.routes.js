@@ -396,11 +396,12 @@ router.post(
       
       resetLoginAttempts(email);
       
+      const userRole = data.user.user_metadata.role;
       const accessToken = generateAccessToken(
         data.user.id,
-        data.user.user_metadata.role
+        userRole
       );
-      const refreshToken = generateRefreshToken(data.user.id);
+      const refreshToken = generateRefreshToken(data.user.id, userRole);
       
       res.cookie('access_token', accessToken, {
         httpOnly: config.cookie.httpOnly,
@@ -419,12 +420,12 @@ router.post(
       
       logAuthAttempt(true, data.user.id, req.ip, req.get('user-agent'), {
         type: 'login',
-        role: data.user.user_metadata.role,
+        role: userRole,
       });
       
       let agentNumber = null;
       let agentName = null;
-      if (data.user.user_metadata.role === 'agent') {
+      if (userRole === 'agent') {
         const { data: profile, error: profileFetchError } = await supabaseAdmin
           .from('profiles')
           .select('agent_number, company_name')
@@ -446,11 +447,11 @@ router.post(
           user: {
             id: data.user.id,
             email: data.user.email,
-            role: data.user.user_metadata.role,
+            role: userRole,
             firstName: data.user.user_metadata.firstName,
             lastName: data.user.user_metadata.lastName,
             approved: data.user.user_metadata.approved,
-            ...(data.user.user_metadata.role === 'agent' && { agentNumber, agentName }),
+            ...(userRole === 'agent' && { agentNumber, agentName }),
           },
           accessToken,
           refreshToken, // ← returned in body so frontend can store in localStorage
@@ -517,11 +518,12 @@ router.post('/google', authRateLimiter, async (req, res) => {
         }, { onConflict: 'id' });
     }
 
+    const googleRole = data.user.user_metadata?.role || 'client';
     const accessToken  = generateAccessToken(
       data.user.id,
-      data.user.user_metadata?.role || 'client'
+      googleRole
     );
-    const refreshToken = generateRefreshToken(data.user.id);
+    const refreshToken = generateRefreshToken(data.user.id, googleRole);
 
     logAuthAttempt(true, data.user.id, req.ip, req.get('user-agent'), { type: 'google-login' });
 
@@ -534,7 +536,7 @@ router.post('/google', authRateLimiter, async (req, res) => {
           email:     data.user.email,
           firstName: data.user.user_metadata?.full_name?.split(' ')[0] || '',
           lastName:  data.user.user_metadata?.full_name?.split(' ').slice(1).join(' ') || '',
-          role:      data.user.user_metadata?.role || 'client',
+          role:      googleRole,
         },
         accessToken,
         refreshToken, // ← returned in body so frontend can store in localStorage
@@ -571,13 +573,34 @@ router.post('/refresh', async (req, res) => {
         error: 'Invalid refresh token',
       });
     }
-    
-    const accessToken = generateAccessToken(decoded.userId, decoded.role);
-    
+
+    // ── Re-fetch role from DB so a revoked/changed role is always authoritative ──
+    const { data: profile, error: profileError } = await supabaseAdmin
+      .from('profiles')
+      .select('role')
+      .eq('id', decoded.userId)
+      .single();
+
+    if (profileError || !profile) {
+      return res.status(401).json({ success: false, error: 'User not found' });
+    }
+
+    const accessToken = generateAccessToken(decoded.userId, profile.role);
+    // Issue a fresh refresh token so the role stays current in it too
+    const newRefreshToken = generateRefreshToken(decoded.userId, profile.role);
+
+    res.cookie('refresh_token', newRefreshToken, {
+      httpOnly: true,
+      secure: config.cookie.secure,
+      sameSite: config.cookie.sameSite,
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+    });
+
     res.json({
       success: true,
       data: {
         accessToken,
+        refreshToken: newRefreshToken,
       },
     });
   } catch (error) {
