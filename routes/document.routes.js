@@ -1,69 +1,62 @@
 import express from 'express';
-import multer from 'multer';
-import { supabase } from '../config/supabase.js';
+import { S3Client, ListObjectsV2Command, GetObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { requireAuth } from '../middleware/auth.middleware.js';
+import { parseDocumentData, uploadDocumentsToR2 } from '../middleware/Uploadtocloudflare.js';
 
 const router = express.Router();
 
-const BUCKET      = 'agent-documents';
-const ALLOWED_KEYS = ['incorporation', 'tourism', 'krapin'];
-const MAX_SIZE    = 5 * 1024 * 1024; // 5 MB
+const DOCUMENT_KEYS = ['incorporation', 'tourism', 'krapin'];
 
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: MAX_SIZE },
-  fileFilter: (_req, file, cb) => {
-    const ALLOWED_MIME = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
-    if (!ALLOWED_MIME.includes(file.mimetype)) {
-      return cb(new Error(`Invalid type: ${file.mimetype}. Only JPEG, PNG, WebP, PDF allowed.`), false);
-    }
-    cb(null, true);
+// ─── R2 client (read operations — presigned URLs) ─────────────────────────────
+const R2 = new S3Client({
+  region: 'auto',
+  endpoint: `https://${process.env.CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  credentials: {
+    accessKeyId:     process.env.CLOUDFLARE_R2_ACCESS_KEY_ID,
+    secretAccessKey: process.env.CLOUDFLARE_R2_SECRET_ACCESS_KEY,
   },
 });
 
-// ─── GET /api/documents ───────────────────────────────────────────────────────
-// Returns the current upload status for each document type for the authed agent.
+const BUCKET = process.env.CLOUDFLARE_R2_BUCKET_NAME;
+
+// ─── GET /api/documents ────────────────────────────────────────────────────────
+// Returns upload status + presigned view URL (1 hr) for each document type.
 router.get('/', requireAuth, async (req, res) => {
   try {
-    const agentId = req.userId; // set by requireAuth
+    const agentId = req.userId;
+    const result  = {};
 
-    const result = {};
+    for (const docKey of DOCUMENT_KEYS) {
+      const prefix = `documents/${agentId}/${docKey}/`;
 
-    for (const key of ALLOWED_KEYS) {
-      // List files under agentId/key_* prefix
-      const { data: files, error } = await supabase.storage
-        .from(BUCKET)
-        .list(agentId, { search: `${key}_` });
+      const { Contents } = await R2.send(new ListObjectsV2Command({
+        Bucket: BUCKET,
+        Prefix: prefix,
+      }));
 
-      if (error) {
-        result[key] = { status: 'none' };
+      if (!Contents || Contents.length === 0) {
+        result[docKey] = { status: 'none' };
         continue;
       }
 
-      if (!files || files.length === 0) {
-        result[key] = { status: 'none' };
-        continue;
-      }
+      // Most recently uploaded file for this doc type
+      const latest = Contents.sort(
+        (a, b) => new Date(b.LastModified) - new Date(a.LastModified)
+      )[0];
 
-      // Most recent file
-      const latest = files
-        .filter(f => f.name.startsWith(`${key}_`))
-        .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
+      // Generate presigned URL valid for 1 hour
+      const signedUrl = await getSignedUrl(
+        R2,
+        new GetObjectCommand({ Bucket: BUCKET, Key: latest.Key }),
+        { expiresIn: 3600 }
+      );
 
-      if (!latest) { result[key] = { status: 'none' }; continue; }
-
-      const path = `${agentId}/${latest.name}`;
-
-      // Generate a short-lived signed URL (60 min) for the View button
-      const { data: urlData } = await supabase.storage
-        .from(BUCKET)
-        .createSignedUrl(path, 3600);
-
-      result[key] = {
-        status:     'uploaded',   // admin verification status can be enriched later via DB
-        path,
-        publicUrl:  urlData?.signedUrl ?? null,
-        uploadedAt: latest.created_at,
+      result[docKey] = {
+        status:     'uploaded',
+        path:       latest.Key,
+        publicUrl:  signedUrl,
+        uploadedAt: latest.LastModified,
       };
     }
 
@@ -76,57 +69,25 @@ router.get('/', requireAuth, async (req, res) => {
 });
 
 // ─── POST /api/documents ──────────────────────────────────────────────────────
-// Uploads one or more documents.  Only fields matching ALLOWED_KEYS are accepted.
-router.post('/', requireAuth, upload.fields(
-  ALLOWED_KEYS.map(k => ({ name: k, maxCount: 1 }))
-), async (req, res) => {
-  try {
-    const agentId = req.userId;
-    const files   = req.files;
+// Accepts: incorporation | tourism | krapin  (multipart/form-data)
+// Middleware chain: requireAuth → parseDocumentData → uploadDocumentsToR2 → handler
+router.post('/',
+  requireAuth,
+  parseDocumentData,
+  uploadDocumentsToR2,
+  (req, res) => {
+    const uploaded = req.documentUrls ?? {};
 
-    if (!files || Object.keys(files).length === 0) {
+    if (Object.keys(uploaded).length === 0) {
       return res.status(400).json({ success: false, error: 'No files provided.' });
-    }
-
-    // Reject any unexpected field names
-    const unknownKeys = Object.keys(files).filter(k => !ALLOWED_KEYS.includes(k));
-    if (unknownKeys.length > 0) {
-      return res.status(400).json({
-        success: false,
-        error:   `Unexpected file field(s): ${unknownKeys.join(', ')}.`,
-      });
-    }
-
-    const uploadResults = {};
-
-    for (const key of ALLOWED_KEYS) {
-      if (!files[key]) continue;
-
-      const file     = files[key][0];
-      const fileName = `${agentId}/${key}_${Date.now()}_${file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
-
-      const { data, error } = await supabase.storage
-        .from(BUCKET)
-        .upload(fileName, file.buffer, {
-          contentType: file.mimetype,
-          upsert:      true,
-        });
-
-      if (error) throw new Error(`Supabase upload failed for ${key}: ${error.message}`);
-
-      uploadResults[key] = data.path;
     }
 
     return res.json({
       success: true,
       message: 'Documents uploaded successfully.',
-      data:    uploadResults,
+      data:    uploaded,
     });
-
-  } catch (error) {
-    console.error('POST /api/documents error:', error);
-    return res.status(500).json({ success: false, error: 'Upload failed: ' + error.message });
   }
-});
+);
 
 export default router;
