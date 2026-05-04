@@ -145,15 +145,20 @@ const documentUpload = multer({
   },
   limits: {
     fileSize: DOCUMENT_MAX_SIZE,
-    files:    DOCUMENT_KEYS.length, // max 5 (one per doc type)
+    files:    DOCUMENT_KEYS.length + 4, // +4 for up to 5 office_photo slots
     fields:   10,
-    parts:    DOCUMENT_KEYS.length + 10,
+    parts:    DOCUMENT_KEYS.length + 4 + 10,
   },
 });
 
-// Step 1 — parse multipart (accepts fields: incorporation | tourism | krapin)
+// Step 1 — parse multipart (accepts fields: incorporation | tourism | krapin | director_id | office_photo)
+// office_photo accepts up to 5 images
 export const parseDocumentData = (req, res, next) => {
-  documentUpload.fields(DOCUMENT_KEYS.map(k => ({ name: k, maxCount: 1 })))(req, res, (err) => {
+  const fieldConfig = DOCUMENT_KEYS.map(k => ({
+    name: k,
+    maxCount: k === 'office_photo' ? 5 : 1,
+  }));
+  documentUpload.fields(fieldConfig)(req, res, (err) => {
     if (err instanceof multer.MulterError) {
       const msgs = {
         LIMIT_FILE_SIZE:       `File too large. Max ${DOCUMENT_MAX_SIZE / 1024 / 1024} MB per document.`,
@@ -191,7 +196,11 @@ export const uploadDocumentsToR2 = async (req, res, next) => {
     for (const docKey of DOCUMENT_KEYS) {
       if (!files[docKey]) continue;
 
-      const file   = files[docKey][0];
+      // office_photo supports multiple files; all others use only the first file
+      const fileList = files[docKey];
+      const uploadedUrls = [];
+
+      for (const file of fileList) {
       const buffer = file.buffer;
 
       // ── Deep MIME check ────────────────────────────────────────────────
@@ -247,8 +256,12 @@ export const uploadDocumentsToR2 = async (req, res, next) => {
         },
       }));
 
-      documentUrls[docKey] = `${PUBLIC_URL}/${key}`;
-      logFileUpload(req.userId, key, detected.mime, buffer.length, true, req.ip);
+        uploadedUrls.push(`${PUBLIC_URL}/${key}`);
+        logFileUpload(req.userId, key, detected.mime, buffer.length, true, req.ip);
+      } // end inner file loop
+
+      // office_photo stores an array of URLs; all other doc types store a single URL string
+      documentUrls[docKey] = docKey === 'office_photo' ? uploadedUrls : uploadedUrls[0];
     }
 
     req.documentUrls = documentUrls;

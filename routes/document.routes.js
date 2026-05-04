@@ -48,29 +48,56 @@ router.get('/', requireAuth, async (req, res) => {
         result[docKey] = {
           status: 'none',
           ...(docKey === 'office_photo' && savedMapsUrl ? { mapsUrl: savedMapsUrl } : {}),
+          ...(docKey === 'office_photo' ? { photos: [] } : {}),
         };
         continue;
       }
 
-      // Most recently uploaded file for this doc type
-      const latest = Contents.sort(
+      // Sort newest-first
+      const sorted = Contents.sort(
         (a, b) => new Date(b.LastModified) - new Date(a.LastModified)
-      )[0];
-
-      // Generate presigned URL valid for 1 hour
-      const signedUrl = await getSignedUrl(
-        R2,
-        new GetObjectCommand({ Bucket: BUCKET, Key: latest.Key }),
-        { expiresIn: 3600 }
       );
 
-      result[docKey] = {
-        status:     'uploaded',
-        path:       latest.Key,
-        publicUrl:  signedUrl,
-        uploadedAt: latest.LastModified,
-        ...(docKey === 'office_photo' && savedMapsUrl ? { mapsUrl: savedMapsUrl } : {}),
-      };
+      if (docKey === 'office_photo') {
+        // Return ALL office photos as an array
+        const photos = await Promise.all(
+          sorted.map(async (obj) => {
+            const signedUrl = await getSignedUrl(
+              R2,
+              new GetObjectCommand({ Bucket: BUCKET, Key: obj.Key }),
+              { expiresIn: 3600 }
+            );
+            return { path: obj.Key, publicUrl: signedUrl, uploadedAt: obj.LastModified };
+          })
+        );
+
+        result[docKey] = {
+          status:     'uploaded',
+          photos,
+          // Convenience: most recent photo as top-level publicUrl for backward compat
+          path:       photos[0].path,
+          publicUrl:  photos[0].publicUrl,
+          uploadedAt: photos[0].uploadedAt,
+          ...(savedMapsUrl ? { mapsUrl: savedMapsUrl } : {}),
+        };
+      } else {
+        // Most recently uploaded file for this doc type
+        const latest = sorted[0];
+
+        // Generate presigned URL valid for 1 hour
+        const signedUrl = await getSignedUrl(
+          R2,
+          new GetObjectCommand({ Bucket: BUCKET, Key: latest.Key }),
+          { expiresIn: 3600 }
+        );
+
+        result[docKey] = {
+          status:     'uploaded',
+          path:       latest.Key,
+          publicUrl:  signedUrl,
+          uploadedAt: latest.LastModified,
+        };
+      }
     }
 
     return res.json({ success: true, data: result });
