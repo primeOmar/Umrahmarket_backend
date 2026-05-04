@@ -421,18 +421,21 @@ router.post(
       const accessToken = generateAccessToken(data.user.id, userRole);
       const refreshToken = generateRefreshToken(data.user.id, userRole);
       
+      const isProd = process.env.NODE_ENV === 'production';
+      const cookieOpts = {
+        httpOnly: true,
+        secure:   isProd,
+        sameSite: isProd ? 'none' : 'lax',
+      };
+
       res.cookie('access_token', accessToken, {
-        httpOnly: config.cookie.httpOnly,
-        secure: config.cookie.secure,
-        sameSite: config.cookie.sameSite,
-        maxAge: 15 * 60 * 1000, // 15 minutes
+        ...cookieOpts,
+        maxAge: 15 * 60 * 1000,
       });
       
       res.cookie('refresh_token', refreshToken, {
-        httpOnly: true,
-        secure: config.cookie.secure,
-        sameSite: config.cookie.sameSite,
-        maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+        ...cookieOpts,
+        maxAge: 7 * 24 * 60 * 60 * 1000,
       });
       
       logAuthAttempt(true, data.user.id, req.ip, req.get('user-agent'), {
@@ -601,10 +604,11 @@ router.post('/refresh', async (req, res) => {
     // Issue a fresh refresh token so the role stays current in it too
     const newRefreshToken = generateRefreshToken(decoded.userId, profile.role);
 
+    const isProd = process.env.NODE_ENV === 'production';
     res.cookie('refresh_token', newRefreshToken, {
       httpOnly: true,
-      secure: config.cookie.secure,
-      sameSite: config.cookie.sameSite,
+      secure:   isProd,
+      sameSite: isProd ? 'none' : 'lax',
       maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
@@ -635,8 +639,10 @@ router.post('/logout', verifyToken, async (req, res) => {
   try {
     await supabase.auth.signOut();
     
-    res.clearCookie('access_token');
-    res.clearCookie('refresh_token');
+    const isProd = process.env.NODE_ENV === 'production';
+    const clearOpts = { httpOnly: true, secure: isProd, sameSite: isProd ? 'none' : 'lax' };
+    res.clearCookie('access_token', clearOpts);
+    res.clearCookie('refresh_token', clearOpts);
     
     logSecurityEvent('User logged out', {
       userId: req.userId,
