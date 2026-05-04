@@ -3,10 +3,11 @@ import { S3Client, ListObjectsV2Command, GetObjectCommand } from '@aws-sdk/clien
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { requireAuth } from '../middleware/auth.middleware.js';
 import { parseDocumentData, uploadDocumentsToR2 } from '../middleware/uploads/Uploadtocloudflare.js';
+import { supabaseAdmin } from '../config/supabase.js';
 
 const router = express.Router();
 
-const DOCUMENT_KEYS = ['incorporation', 'tourism', 'krapin'];
+const DOCUMENT_KEYS = ['incorporation', 'tourism', 'krapin', 'director_id', 'office_photo'];
 
 // ─── R2 client (read operations — presigned URLs) ─────────────────────────────
 const R2 = new S3Client({
@@ -27,6 +28,14 @@ router.get('/', requireAuth, async (req, res) => {
     const agentId = req.userId;
     const result  = {};
 
+    // Fetch saved Maps URL from profile
+    const { data: profile } = await supabaseAdmin
+      .from('profiles')
+      .select('office_maps_url')
+      .eq('id', agentId)
+      .single();
+    const savedMapsUrl = profile?.office_maps_url || null;
+
     for (const docKey of DOCUMENT_KEYS) {
       const prefix = `documents/${agentId}/${docKey}/`;
 
@@ -36,7 +45,10 @@ router.get('/', requireAuth, async (req, res) => {
       }));
 
       if (!Contents || Contents.length === 0) {
-        result[docKey] = { status: 'none' };
+        result[docKey] = {
+          status: 'none',
+          ...(docKey === 'office_photo' && savedMapsUrl ? { mapsUrl: savedMapsUrl } : {}),
+        };
         continue;
       }
 
@@ -57,6 +69,7 @@ router.get('/', requireAuth, async (req, res) => {
         path:       latest.Key,
         publicUrl:  signedUrl,
         uploadedAt: latest.LastModified,
+        ...(docKey === 'office_photo' && savedMapsUrl ? { mapsUrl: savedMapsUrl } : {}),
       };
     }
 
@@ -89,5 +102,36 @@ router.post('/',
     });
   }
 );
+
+// ─── PATCH /api/documents/office-location ─────────────────────────────────────
+// Saves agent's Google Maps URL to profiles table
+
+router.patch('/office-location', requireAuth, async (req, res) => {
+  try {
+    const { mapsUrl } = req.body;
+    if (!mapsUrl) return res.status(400).json({ success: false, error: 'mapsUrl is required.' });
+
+    // Basic validation
+    const isGoogleMaps =
+      mapsUrl.includes('google.com/maps') ||
+      mapsUrl.includes('maps.app.goo.gl') ||
+      mapsUrl.includes('goo.gl/maps');
+    if (!isGoogleMaps) {
+      return res.status(400).json({ success: false, error: 'Please provide a valid Google Maps URL.' });
+    }
+
+    const { error } = await supabaseAdmin
+      .from('profiles')
+      .update({ office_maps_url: mapsUrl, updated_at: new Date().toISOString() })
+      .eq('id', req.userId);
+
+    if (error) throw error;
+
+    return res.json({ success: true, message: 'Office location saved.' });
+  } catch (error) {
+    console.error('PATCH /api/documents/office-location error:', error);
+    return res.status(500).json({ success: false, error: 'Failed to save office location.' });
+  }
+});
 
 export default router;

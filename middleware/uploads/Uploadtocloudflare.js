@@ -34,7 +34,7 @@ const IMAGE_MIMES    = ['image/jpeg', 'image/png', 'image/webp'];
 const DOCUMENT_MIMES = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
 
 // Valid document field names (must match document_routes.js)
-const DOCUMENT_KEYS  = ['incorporation', 'tourism', 'krapin'];
+const DOCUMENT_KEYS  = ['incorporation', 'tourism', 'krapin', 'director_id', 'office_photo'];
 
 // ─── Size limits ──────────────────────────────────────────────────────────────
 const IMAGE_MAX_SIZE    = 10 * 1024 * 1024; // 10 MB
@@ -145,7 +145,7 @@ const documentUpload = multer({
   },
   limits: {
     fileSize: DOCUMENT_MAX_SIZE,
-    files:    DOCUMENT_KEYS.length, // max 3 (one per doc type)
+    files:    DOCUMENT_KEYS.length, // max 5 (one per doc type)
     fields:   10,
     parts:    DOCUMENT_KEYS.length + 10,
   },
@@ -158,7 +158,7 @@ export const parseDocumentData = (req, res, next) => {
       const msgs = {
         LIMIT_FILE_SIZE:       `File too large. Max ${DOCUMENT_MAX_SIZE / 1024 / 1024} MB per document.`,
         LIMIT_FILE_COUNT:      `Too many files. Max ${DOCUMENT_KEYS.length} documents at once.`,
-        LIMIT_UNEXPECTED_FILE: 'Unexpected field name. Allowed: incorporation, tourism, krapin.',
+        LIMIT_UNEXPECTED_FILE: 'Unexpected field name. Allowed: incorporation, tourism, krapin, director_id, office_photo.',
       };
       return res.status(400).json({ success: false, error: msgs[err.code] || err.message });
     }
