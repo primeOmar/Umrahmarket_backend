@@ -2,6 +2,7 @@ import express from 'express';
 import { parseFormData, uploadImagesToR2 } from '../../middleware/uploads/Uploadtocloudflare.js';
 import { getAgentPackages, getAllActivePackages } from '../../controllers/packages/getpackages.controller.js';
 import { createPackage } from '../../controllers/packages/createpackages.controller.js';
+import { getItinerary, saveItinerary } from '../../controllers/packages/itinerary.controller.js';
 import { verifyToken } from '../../middleware/auth.middleware.js';
 import { validatePackage } from '../../middleware/uploads/Validatepackage.js';
 
@@ -29,5 +30,11 @@ router.post(
 
 // GET /api/packages/getagentpackages
 router.get('/getagentpackages', verifyToken, getAgentPackages);
+
+// GET  /api/packages/:id/itinerary  — public
+router.get('/:id/itinerary', getItinerary);
+
+// POST /api/packages/:id/itinerary  — agent only
+router.post('/:id/itinerary', verifyToken, saveItinerary);
 
 export default router;
