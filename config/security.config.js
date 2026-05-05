@@ -22,12 +22,12 @@ const config = {
   jwt: {
     accessTokenSecret: process.env.JWT_SECRET,
     refreshTokenSecret: process.env.JWT_REFRESH_SECRET,
-    accessTokenExpiry: process.env.JWT_EXPIRES_IN || '15m',
-    refreshTokenExpiry: process.env.JWT_REFRESH_EXPIRES_IN || '7d',
+    accessTokenExpiry: process.env.JWT_EXPIRES_IN || '30m', // rotated silently by api.js interceptor,
+    refreshTokenExpiry: process.env.JWT_REFRESH_EXPIRES_IN || '10h', // full day's session,
     secret: process.env.JWT_SECRET, // Keep for backward compatibility
-    expiresIn: process.env.JWT_EXPIRES_IN || '15m',
+    expiresIn: process.env.JWT_EXPIRES_IN || '30m',
     refreshSecret: process.env.JWT_REFRESH_SECRET,
-    refreshExpiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d',
+    refreshExpiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '10h',
     issuer: 'secure-auth-backend',
     audience: 'web-app',
   },
@@ -75,7 +75,7 @@ const config = {
   security: {
     maxLoginAttempts: parseInt(process.env.MAX_LOGIN_ATTEMPTS) || 5,
     lockoutDuration: parseInt(process.env.LOCKOUT_DURATION_MS) || 30 * 60 * 1000, // 30 minutes
-    sessionTimeout: parseInt(process.env.SESSION_TIMEOUT_MS) || 60 * 60 * 1000, // 1 hour
+    sessionTimeout: parseInt(process.env.SESSION_TIMEOUT_MS) || 60 * 60 * 1000, // 60 min inactivity timeout (matches frontend)
     enable2FA: process.env.ENABLE_2FA === 'true',
     
     password: {

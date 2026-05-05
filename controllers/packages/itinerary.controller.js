@@ -10,7 +10,7 @@ export const getItinerary = async (req, res) => {
     .eq('id', id)
     .single();
 
-  if (error) return res.status(404).json({ success: false, message: 'Package not found.' });
+  if (error || !data) return res.json({ success: true, days: [] });
 
   return res.json({ success: true, days: data.itinerary ?? [] });
 };
