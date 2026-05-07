@@ -59,8 +59,8 @@ export const createBookingMessage = async (bookingId, clientId, agentId, package
       .from('messages')
       .insert({
         booking_id: bookingId,
-        sender_id: agentId,           // use agentId not 'system' — constraint forbids it
-        sender_type: 'agent',
+        sender_id: agentId,
+        sender_type: 'agent_only',    // never visible to clients
         client_id: clientId,
         agent_id: agentId,
         message: agentNotification,
@@ -206,11 +206,15 @@ export const getMessages = async (req, res) => {
       return res.status(403).json({ success: false, message: 'Unauthorized' });
     }
 
-    const { data: messages, error } = await supabaseAdmin
+    let query = supabaseAdmin
       .from('messages')
       .select('*')
       .eq('booking_id', bookingId)
       .order('created_at', { ascending: true });
+
+    if (isClient) query = query.neq('sender_type', 'agent_only');
+
+    const { data: messages, error } = await query;
 
     if (error) throw error;
 
@@ -239,6 +243,7 @@ export const getUnreadCount = async (req, res) => {
       .from('messages')
       .select('*', { count: 'exact', head: true })
       .neq('sender_id', userId)
+      .neq('sender_type', 'agent_only')
       .eq('is_read', false)
       .or(`client_id.eq.${userId},agent_id.eq.${userId}`);
 
