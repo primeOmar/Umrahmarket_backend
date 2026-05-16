@@ -17,6 +17,7 @@ import mpesaRoutes from './routes/mpesa.routes.js';
 import cardRoutes  from './routes/Card.routes.js';
 import bookingsRouter from './routes/bookings.routes.js';
 import messagesRoutes from './routes/messagesRoutes.js';
+import superadminRoutes from './routes/superadmin_routes.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -174,6 +175,7 @@ app.use('/api/favourites', favouritesRoutes);
 app.use('/api/payments/mpesa', mpesaRoutes);
 app.use('/api/payments/card',  cardRoutes);
 app.use('/api/bookings', bookingsRouter);
+app.use('/api/superadmin', superadminRoutes);
 
 // ═══════════════════════════════════════════════════════════════════════
 // MESSAGES ROUTES WITH RATE LIMITING
