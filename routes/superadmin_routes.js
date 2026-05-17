@@ -6,7 +6,7 @@
 
 import express from 'express';
 import jwt from 'jsonwebtoken';
-import { supabase } from '../config/supabaseClient.js';
+import { supabase } from '../config/supabase.js';
 import {
   hashPassword, verifyPassword, generateToken, hashToken,
   loginRateLimiter, validateEmail, sanitizeInput, AUDIT_ACTIONS
