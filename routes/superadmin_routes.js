@@ -89,7 +89,102 @@ const logAuditAction = async (superadminId, action, resourceType, resourceId, re
 };
 
 // ==================== AUTHENTICATION ENDPOINTS ====================
-
+router.post('/register', async (req, res) => {
+  try {
+    const { username, email, fullName, password, confirmPassword, registerSecret } = req.body;
+ 
+    // ── 1. Verify registration secret ──────────────────────────────────────
+    const expectedSecret = process.env.SUPERADMIN_REGISTER_SECRET;
+    if (!expectedSecret) {
+      return res.status(503).json({ success: false, message: 'Registration is disabled' });
+    }
+    if (!registerSecret || registerSecret !== expectedSecret) {
+      return res.status(403).json({ success: false, message: 'Invalid registration secret' });
+    }
+ 
+    // ── 2. Validate inputs ─────────────────────────────────────────────────
+    if (!validateEmail(email)) {
+      return res.status(422).json({ success: false, message: 'Invalid email address' });
+    }
+    if (!username || username.trim().length < 3) {
+      return res.status(422).json({ success: false, message: 'Username must be at least 3 characters' });
+    }
+    if (!password || password.length < 8) {
+      return res.status(422).json({ success: false, message: 'Password must be at least 8 characters' });
+    }
+    if (password !== confirmPassword) {
+      return res.status(422).json({ success: false, message: 'Passwords do not match' });
+    }
+    // Basic strength check
+    const strongPassword = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&]).{8,}$/.test(password);
+    if (!strongPassword) {
+      return res.status(422).json({
+        success: false,
+        message: 'Password must contain uppercase, lowercase, number and special character',
+      });
+    }
+ 
+    // ── 3. Check uniqueness ────────────────────────────────────────────────
+    const { data: existing } = await supabase
+      .from('superadmin_credentials')
+      .select('id')
+      .or(`email.eq.${email.toLowerCase()},username.eq.${username.trim()}`)
+      .maybeSingle();
+ 
+    if (existing) {
+      return res.status(409).json({ success: false, message: 'Email or username already registered' });
+    }
+ 
+    // ── 4. Hash password & insert ──────────────────────────────────────────
+    const passwordHash = hashPassword(password);
+ 
+    const { data: newAdmin, error } = await supabase
+      .from('superadmin_credentials')
+      .insert({
+        username:   sanitizeInput(username.trim()),
+        email:      email.trim().toLowerCase(),
+        full_name:  sanitizeInput(fullName?.trim() || ''),
+        password_hash: passwordHash,
+        status:     'active',
+        two_factor_enabled: false,
+      })
+      .select('id, username, email, full_name')
+      .single();
+ 
+    if (error) throw error;
+ 
+    // ── 5. Grant all default permissions ──────────────────────────────────
+    const defaultPermissions = [
+      'view_agents', 'manage_agents',
+      'view_clients', 'manage_clients',
+      'view_chats', 'close_chats',
+      'view_documents', 'verify_documents',
+      'view_packages', 'delete_packages',
+      'view_audit_logs', 'export_data',
+    ];
+    await supabase.from('superadmin_permissions').insert(
+      defaultPermissions.map(key => ({ superadmin_id: newAdmin.id, permission_key: key }))
+    );
+ 
+    // ── 6. Audit log ───────────────────────────────────────────────────────
+    await logAuditAction(newAdmin.id, 'REGISTER', 'superadmin', newAdmin.id, 'Initial registration', 'success');
+ 
+    res.status(201).json({
+      success: true,
+      message: 'Superadmin account created successfully',
+      user: {
+        id:       newAdmin.id,
+        username: newAdmin.username,
+        email:    newAdmin.email,
+        fullName: newAdmin.full_name,
+      },
+    });
+ 
+  } catch (err) {
+    console.error('Register error:', err);
+    res.status(500).json({ success: false, message: 'Registration failed' });
+  }
+});
 /**
  * POST /api/superadmin/login
  */
