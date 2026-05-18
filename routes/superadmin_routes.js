@@ -12,17 +12,12 @@ const router = express.Router();
 // HELPERS
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Extract the real client IP, respecting Render's reverse proxy */
 const getClientIp = (req) =>
   (req.headers['x-forwarded-for'] || '').split(',')[0].trim() ||
   req.socket?.remoteAddress ||
   req.ip ||
   'unknown';
 
-/**
- * Audit log helper.
- * Accepts the full request object so real IP/UA are recorded.
- */
 const logAuditAction = async (
   superadminId, action, resourceType, resourceId,
   reason = '', status = 'success', errorMsg = '', req = null,
@@ -45,7 +40,7 @@ const logAuditAction = async (
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MIDDLEWARE — authenticateSuperadmin
+// MIDDLEWARE – authenticateSuperadmin
 // ─────────────────────────────────────────────────────────────────────────────
 
 const authenticateSuperadmin = async (req, res, next) => {
@@ -55,7 +50,6 @@ const authenticateSuperadmin = async (req, res, next) => {
       return res.status(401).json({ success: false, message: 'No token provided' });
     }
 
-    // Verify JWT signature & expiry
     let decoded;
     try {
       decoded = jwt.verify(token, process.env.JWT_SECRET);
@@ -63,7 +57,6 @@ const authenticateSuperadmin = async (req, res, next) => {
       return res.status(401).json({ success: false, message: 'Invalid or expired token' });
     }
 
-    // Load superadmin record
     const { data: superadmin, error } = await supabase
       .from('superadmin_credentials')
       .select('*')
@@ -74,7 +67,6 @@ const authenticateSuperadmin = async (req, res, next) => {
       return res.status(403).json({ success: false, message: 'Unauthorized' });
     }
 
-    // Validate session in DB (covers manual revocation & logout)
     const { data: session } = await supabase
       .from('superadmin_sessions')
       .select('*')
@@ -86,7 +78,6 @@ const authenticateSuperadmin = async (req, res, next) => {
       return res.status(401).json({ success: false, message: 'Session expired' });
     }
 
-    // Touch last_activity (fire-and-forget)
     supabase
       .from('superadmin_sessions')
       .update({ last_activity: new Date().toISOString() })
@@ -103,14 +94,13 @@ const authenticateSuperadmin = async (req, res, next) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AUTH — REGISTER
+// AUTH – REGISTER
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.post('/register', async (req, res) => {
   try {
     const { username, email, fullName, password, confirmPassword, registerSecret } = req.body;
 
-    // 1. Verify registration secret
     const expectedSecret = process.env.SUPERADMIN_REGISTER_SECRET;
     if (!expectedSecret) {
       return res.status(503).json({ success: false, message: 'Registration is disabled' });
@@ -119,7 +109,6 @@ router.post('/register', async (req, res) => {
       return res.status(403).json({ success: false, message: 'Invalid registration secret' });
     }
 
-    // 2. Validate inputs
     if (!validateEmail(email)) {
       return res.status(422).json({ success: false, message: 'Invalid email address' });
     }
@@ -140,7 +129,6 @@ router.post('/register', async (req, res) => {
       });
     }
 
-    // 3. Check uniqueness
     const { data: existing } = await supabase
       .from('superadmin_credentials')
       .select('id')
@@ -151,7 +139,6 @@ router.post('/register', async (req, res) => {
       return res.status(409).json({ success: false, message: 'Email or username already registered' });
     }
 
-    // 4. Hash password & insert
     const passwordHash = hashPassword(password);
     const { data: newAdmin, error } = await supabase
       .from('superadmin_credentials')
@@ -168,7 +155,6 @@ router.post('/register', async (req, res) => {
 
     if (error) throw error;
 
-    // 5. Grant default permissions
     const defaultPermissions = [
       'view_agents', 'manage_agents',
       'view_clients', 'manage_clients',
@@ -181,7 +167,6 @@ router.post('/register', async (req, res) => {
       defaultPermissions.map(key => ({ superadmin_id: newAdmin.id, permission_key: key })),
     );
 
-    // 6. Audit log
     await logAuditAction(newAdmin.id, 'REGISTER', 'superadmin', newAdmin.id, 'Initial registration', 'success', '', req);
 
     res.status(201).json({
@@ -201,7 +186,7 @@ router.post('/register', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AUTH — LOGIN
+// AUTH – LOGIN
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.post('/login', async (req, res) => {
@@ -210,7 +195,6 @@ router.post('/login', async (req, res) => {
     const clientIp  = getClientIp(req);
     const userAgent = req.get('user-agent') || 'unknown';
 
-    // Input validation
     if (!validateEmail(email)) {
       return res.status(422).json({ success: false, message: 'Invalid email' });
     }
@@ -218,7 +202,6 @@ router.post('/login', async (req, res) => {
       return res.status(422).json({ success: false, message: 'Invalid password' });
     }
 
-    // Rate limiting
     if (loginRateLimiter.isLimited(email)) {
       await logAuditAction(null, AUDIT_ACTIONS.LOGIN, 'superadmin', email, '', 'failed', 'Rate limit exceeded', req);
 
@@ -238,7 +221,6 @@ router.post('/login', async (req, res) => {
       }
     }
 
-    // Fetch superadmin
     const { data: superadmin, error } = await supabase
       .from('superadmin_credentials')
       .select('*')
@@ -250,7 +232,6 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
 
-    // Account status
     if (superadmin.status === 'suspended') {
       return res.status(403).json({ success: false, message: 'Account suspended' });
     }
@@ -258,7 +239,6 @@ router.post('/login', async (req, res) => {
       return res.status(403).json({ success: false, message: 'Account inactive' });
     }
 
-    // Lockout check
     if (superadmin.locked_until && new Date(superadmin.locked_until) > new Date()) {
       return res.status(429).json({
         success: false,
@@ -267,7 +247,6 @@ router.post('/login', async (req, res) => {
       });
     }
 
-    // Verify password
     const passwordMatch = verifyPassword(password, superadmin.password_hash);
     if (!passwordMatch) {
       const newFailedAttempts = (superadmin.failed_login_attempts || 0) + 1;
@@ -280,12 +259,11 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
 
-    // ── 2FA path ──────────────────────────────────────────────────────────────
+    // 2FA path
     if (superadmin.two_factor_enabled) {
       const tempToken = generateToken();
-      const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 min
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
-      // Store hashed temp token so the verify-2fa endpoint can look it up
       await supabase.from('superadmin_2fa_pending').insert({
         superadmin_id: superadmin.id,
         token_hash:    hashToken(tempToken),
@@ -299,7 +277,7 @@ router.post('/login', async (req, res) => {
       });
     }
 
-    // ── Full login ────────────────────────────────────────────────────────────
+    // Full login
     const accessToken  = jwt.sign({ superadminId: superadmin.id }, process.env.JWT_SECRET, { expiresIn: '24h' });
     const refreshToken = generateToken();
     const sessionExpiry = new Date(Date.now() + 24 * 60 * 60 * 1000);
@@ -313,7 +291,6 @@ router.post('/login', async (req, res) => {
       expires_at:          sessionExpiry,
     });
 
-    // Reset failed attempts + record last login
     await supabase
       .from('superadmin_credentials')
       .update({
@@ -324,7 +301,6 @@ router.post('/login', async (req, res) => {
       })
       .eq('id', superadmin.id);
 
-    // Load permissions
     const { data: permissions } = await supabase
       .from('superadmin_permissions')
       .select('permission_key')
@@ -352,7 +328,7 @@ router.post('/login', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AUTH — VERIFY 2FA
+// AUTH – VERIFY 2FA
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.post('/verify-2fa', async (req, res) => {
@@ -368,7 +344,6 @@ router.post('/verify-2fa', async (req, res) => {
       return res.status(422).json({ success: false, message: 'Invalid code format' });
     }
 
-    // Look up the pending 2FA record
     const { data: pending, error: pendingErr } = await supabase
       .from('superadmin_2fa_pending')
       .select('*, superadmin_credentials(*)')
@@ -385,20 +360,7 @@ router.post('/verify-2fa', async (req, res) => {
 
     const superadmin = pending.superadmin_credentials;
 
-    // TOTP verification — requires speakeasy (npm i speakeasy)
-    // Uncomment once speakeasy is installed:
-    // import speakeasy from 'speakeasy';
-    // const verified = speakeasy.totp.verify({
-    //   secret:   superadmin.two_factor_secret,
-    //   encoding: 'base32',
-    //   token:    code,
-    //   window:   2,
-    // });
-    // if (!verified) {
-    //   return res.status(401).json({ success: false, message: 'Invalid 2FA code' });
-    // }
 
-    // ── Issue tokens ──────────────────────────────────────────────────────────
     const accessToken   = jwt.sign({ superadminId: superadmin.id }, process.env.JWT_SECRET, { expiresIn: '24h' });
     const refreshToken  = generateToken();
     const sessionExpiry = new Date(Date.now() + 24 * 60 * 60 * 1000);
@@ -412,10 +374,8 @@ router.post('/verify-2fa', async (req, res) => {
       expires_at:         sessionExpiry,
     });
 
-    // Clean up pending record
     await supabase.from('superadmin_2fa_pending').delete().eq('id', pending.id);
 
-    // Reset failed attempts
     await supabase
       .from('superadmin_credentials')
       .update({
@@ -426,7 +386,6 @@ router.post('/verify-2fa', async (req, res) => {
       })
       .eq('id', superadmin.id);
 
-    // Load permissions
     const { data: permissions } = await supabase
       .from('superadmin_permissions')
       .select('permission_key')
@@ -453,7 +412,7 @@ router.post('/verify-2fa', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AUTH — REFRESH TOKEN
+// AUTH – REFRESH TOKEN
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.post('/refresh', async (req, res) => {
@@ -463,7 +422,6 @@ router.post('/refresh', async (req, res) => {
       return res.status(401).json({ success: false, message: 'No refresh token provided' });
     }
 
-    // Find session by refresh token hash
     const { data: session, error } = await supabase
       .from('superadmin_sessions')
       .select('*, superadmin_credentials(*)')
@@ -475,7 +433,6 @@ router.post('/refresh', async (req, res) => {
       return res.status(401).json({ success: false, message: 'Invalid refresh token' });
     }
     if (new Date(session.expires_at) < new Date()) {
-      // Revoke expired session
       await supabase.from('superadmin_sessions').update({ revoked_at: new Date().toISOString() }).eq('id', session.id);
       return res.status(401).json({ success: false, message: 'Refresh token expired, please log in again' });
     }
@@ -485,10 +442,8 @@ router.post('/refresh', async (req, res) => {
       return res.status(403).json({ success: false, message: 'Account inactive or suspended' });
     }
 
-    // Issue new access token
     const newAccessToken = jwt.sign({ superadminId: superadmin.id }, process.env.JWT_SECRET, { expiresIn: '24h' });
 
-    // Rotate: update session with new access token hash (keep same refresh token)
     await supabase
       .from('superadmin_sessions')
       .update({
@@ -505,7 +460,7 @@ router.post('/refresh', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AUTH — LOGOUT
+// AUTH – LOGOUT
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.post('/logout', authenticateSuperadmin, async (req, res) => {
@@ -538,7 +493,7 @@ router.get('/stats', authenticateSuperadmin, async (req, res) => {
     ]);
 
     res.json({
-      success:          true,
+      success: true,
       totalAgents:      agents.count   || 0,
       totalClients:     clients.count  || 0,
       activeChats:      chats.count    || 0,
@@ -592,14 +547,14 @@ router.get('/audit-logs', authenticateSuperadmin, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CLIENTS
+// CLIENTS (FIXED)
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.get('/clients', authenticateSuperadmin, async (req, res) => {
   try {
     const { data: clients, error } = await supabase
       .from('profiles')
-      .select('id, first_name, last_name, email, phone, status, created_at')
+      .select('id, first_name, last_name, email, phone, approved, verification_status, created_at')
       .eq('role', 'client')
       .order('created_at', { ascending: false });
 
@@ -607,10 +562,10 @@ router.get('/clients', authenticateSuperadmin, async (req, res) => {
 
     const normalized = (clients || []).map(c => ({
       id:        c.id,
-      name:      `${c.first_name || ''} ${c.last_name || ''}`.trim() || null,
+      name:      `${c.first_name || ''} ${c.last_name || ''}`.trim(),
       email:     c.email,
       phone:     c.phone,
-      status:    c.status,
+      status:    c.approved && c.verification_status === 'approved' ? 'active' : 'pending',
       createdAt: c.created_at,
     }));
 
@@ -622,14 +577,14 @@ router.get('/clients', authenticateSuperadmin, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AGENTS
+// AGENTS (FIXED)
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.get('/agents', authenticateSuperadmin, async (req, res) => {
   try {
     const { data: agents, error } = await supabase
       .from('profiles')
-      .select('id, first_name, last_name, email, phone, status, created_at')
+      .select('id, first_name, last_name, email, phone, approved, verification_status, created_at')
       .eq('role', 'agent')
       .order('created_at', { ascending: false });
 
@@ -637,10 +592,10 @@ router.get('/agents', authenticateSuperadmin, async (req, res) => {
 
     const normalized = (agents || []).map(a => ({
       id:        a.id,
-      name:      `${a.first_name || ''} ${a.last_name || ''}`.trim() || null,
+      name:      `${a.first_name || ''} ${a.last_name || ''}`.trim(),
       email:     a.email,
       phone:     a.phone,
-      status:    a.status,
+      status:    a.approved && a.verification_status === 'approved' ? 'active' : 'pending',
       createdAt: a.created_at,
     }));
 
@@ -657,14 +612,12 @@ router.get('/agents', authenticateSuperadmin, async (req, res) => {
 
 router.get('/chats', authenticateSuperadmin, async (req, res) => {
   try {
-    // Attempt RPC first; fall back to a direct query
     let chats = [];
     const { data: rpcRows, error: rpcErr } = await supabase.rpc('get_superadmin_chats');
 
     if (!rpcErr && rpcRows) {
       chats = rpcRows;
     } else {
-      // Fallback: grab latest message per booking
       const { data: rows } = await supabase
         .from('messages')
         .select('id, booking_id, body, is_closed, closed_at, created_at')
@@ -739,7 +692,7 @@ router.post('/chats/:chatId/close', authenticateSuperadmin, async (req, res) => 
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DOCUMENTS
+// DOCUMENTS 
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.get('/documents', authenticateSuperadmin, async (req, res) => {
@@ -747,8 +700,13 @@ router.get('/documents', authenticateSuperadmin, async (req, res) => {
     const status = req.query.status;
     let query = supabase
       .from('agent_documents')
-      .select('*, profiles(first_name, last_name, email)')
-      .order('created_at', { ascending: false });
+      .select(`
+        id, user_id, incorporation_doc, tourism_doc, krapin_doc, status, review_notes,
+        submitted_at, reviewed_at, reviewed_by,
+        agent:profiles!agent_documents_user_id_fkey (first_name, last_name, email),
+        reviewer:profiles!agent_documents_reviewed_by_fkey (first_name, last_name)
+      `)
+      .order('submitted_at', { ascending: false });
 
     if (status && status !== 'all') {
       query = query.eq('status', status);
@@ -757,7 +715,23 @@ router.get('/documents', authenticateSuperadmin, async (req, res) => {
     const { data: documents, error } = await query;
     if (error) throw error;
 
-    res.json({ success: true, data: documents || [] });
+    const normalized = (documents || []).map(doc => ({
+      id:               doc.id,
+      agentId:          doc.user_id,
+      agentName:        `${doc.agent?.first_name || ''} ${doc.agent?.last_name || ''}`.trim(),
+      agentEmail:       doc.agent?.email,
+      incorporationDoc: doc.incorporation_doc,
+      tourismDoc:       doc.tourism_doc,
+      kraPin:           doc.krapin_doc,
+      status:           doc.status,
+      reviewNotes:      doc.review_notes,
+      submittedAt:      doc.submitted_at,
+      reviewedAt:       doc.reviewed_at,
+      reviewedBy:       doc.reviewed_by,
+      reviewerName:     doc.reviewer ? `${doc.reviewer.first_name || ''} ${doc.reviewer.last_name || ''}`.trim() : null,
+    }));
+
+    res.json({ success: true, data: normalized });
   } catch (err) {
     console.error('Documents error:', err);
     res.status(500).json({ success: false, message: 'Failed to fetch documents' });
@@ -806,11 +780,26 @@ router.get('/packages', authenticateSuperadmin, async (req, res) => {
   try {
     const { data: packages, error } = await supabase
       .from('packages')
-      .select('id, name, type, price, created_at, agent_id')
+      .select(`
+        id, name, type, price, created_at, created_by,
+        agent:profiles!packages_created_by_fkey (first_name, last_name, email)
+      `)
       .order('created_at', { ascending: false });
 
     if (error) throw error;
-    res.json({ success: true, data: packages || [] });
+
+    const normalized = (packages || []).map(pkg => ({
+      id:            pkg.id,
+      name:          pkg.name,
+      type:          pkg.type,
+      price:         pkg.price,
+      createdAt:     pkg.created_at,
+      agentId:       pkg.created_by,
+      agentName:     pkg.agent ? `${pkg.agent.first_name || ''} ${pkg.agent.last_name || ''}`.trim() : 'Unknown',
+      bookingCount:  0,
+    }));
+
+    res.json({ success: true, data: normalized });
   } catch (err) {
     console.error('Packages error:', err);
     res.status(500).json({ success: false, message: 'Failed to fetch packages' });
@@ -848,7 +837,7 @@ router.delete('/packages/:packageId', authenticateSuperadmin, async (req, res) =
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DASHBOARDS
+// DASHBOARD CLOSURES
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.post('/dashboards/close', authenticateSuperadmin, async (req, res) => {
@@ -877,10 +866,9 @@ router.post('/dashboards/close', authenticateSuperadmin, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DATA EXPORT — real CSV generation
+// DATA EXPORT
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Escape a CSV cell value */
 const csvCell = (v) => {
   if (v == null) return '';
   const s = String(v);
@@ -889,7 +877,6 @@ const csvCell = (v) => {
     : s;
 };
 
-/** Convert an array of objects to CSV text */
 const toCsv = (rows, columns) => {
   const header = columns.join(',');
   const body   = rows.map(row => columns.map(col => csvCell(row[col])).join(',')).join('\n');
