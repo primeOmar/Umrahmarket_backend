@@ -612,29 +612,66 @@ router.get('/agents', authenticateSuperadmin, async (req, res) => {
 
 router.get('/chats', authenticateSuperadmin, async (req, res) => {
   try {
-    let chats = [];
-    const { data: rpcRows, error: rpcErr } = await supabase.rpc('get_superadmin_chats');
+    const { data: rows, error } = await supabase
+      .from('messages')
+      .select('id, booking_id, sender_id, sender_type, agent_id, client_id, message, created_at, is_closed, closed_at')
+      .order('created_at', { ascending: false })
+      .limit(500);
 
-    if (!rpcErr && rpcRows) {
-      chats = rpcRows;
-    } else {
-      const { data: rows } = await supabase
-        .from('messages')
-        .select('id, booking_id, body, is_closed, closed_at, created_at')
-        .order('created_at', { ascending: false })
-        .limit(200);
-      chats = rows || [];
+    if (error) throw error;
+
+    const threads = {};
+    const profileIds = new Set();
+
+    for (const row of rows || []) {
+      if (!threads[row.booking_id]) {
+        threads[row.booking_id] = {
+          bookingId:    row.booking_id,
+          lastMessage:  row.message,
+          lastActivity: row.created_at,
+          isClosed:     row.is_closed,
+          closedAt:     row.closed_at,
+          messageCount: 0,
+          agentId:      row.agent_id,
+          clientId:     row.client_id,
+        };
+      }
+
+      const thread = threads[row.booking_id];
+      thread.messageCount += 1;
+      if (!thread.agentId && row.agent_id) thread.agentId = row.agent_id;
+      if (!thread.clientId && row.client_id) thread.clientId = row.client_id;
+      if (row.agent_id) profileIds.add(row.agent_id);
+      if (row.client_id) profileIds.add(row.client_id);
     }
 
-    const normalized = chats.map(r => ({
-      id:          r.message_id || r.id,
-      bookingId:   r.booking_id,
-      lastMessage: r.last_message || r.body || '',
-      clientName:  r.client_name || r.client_full_name || '',
-      agentName:   r.agent_name  || r.agent_full_name  || '',
-      status:      r.is_closed ? 'closed' : 'active',
-      createdAt:   r.created_at,
-    }));
+    const profileMap = {};
+    if (profileIds.size > 0) {
+      const { data: profiles, error: profileErr } = await supabase
+        .from('profiles')
+        .select('id, first_name, last_name, email')
+        .in('id', Array.from(profileIds));
+      if (profileErr) throw profileErr;
+      (profiles || []).forEach(p => {
+        profileMap[p.id] = p;
+      });
+    }
+
+    const normalized = Object.values(threads).map(thread => {
+      const agent = profileMap[thread.agentId];
+      const client = profileMap[thread.clientId];
+      return {
+        id:           thread.bookingId,
+        bookingId:    thread.bookingId,
+        lastMessage:  thread.lastMessage || '',
+        messageCount: thread.messageCount,
+        clientName:   client ? `${client.first_name || ''} ${client.last_name || ''}`.trim() || client.email : 'Client',
+        agentName:    agent ? `${agent.first_name || ''} ${agent.last_name || ''}`.trim() || agent.email : 'Agent',
+        status:       thread.isClosed ? 'closed' : 'active',
+        lastActivity: thread.lastActivity,
+        closedAt:     thread.closedAt,
+      };
+    });
 
     res.json({ success: true, data: normalized });
   } catch (err) {
@@ -643,28 +680,81 @@ router.get('/chats', authenticateSuperadmin, async (req, res) => {
   }
 });
 
-router.post('/chats/:chatId/close', authenticateSuperadmin, async (req, res) => {
+router.get('/chats/:bookingId/messages', authenticateSuperadmin, async (req, res) => {
   try {
-    const { chatId } = req.params;
+    const { bookingId } = req.params;
+    const { data: messages, error } = await supabase
+      .from('messages')
+      .select('id, booking_id, sender_id, sender_type, agent_id, client_id, message, created_at, is_closed')
+      .eq('booking_id', bookingId)
+      .order('created_at', { ascending: true });
+
+    if (error) throw error;
+
+    const profileIds = new Set();
+    for (const msg of messages || []) {
+      if (msg.sender_id) profileIds.add(msg.sender_id);
+      if (msg.agent_id) profileIds.add(msg.agent_id);
+      if (msg.client_id) profileIds.add(msg.client_id);
+    }
+
+    const profileMap = {};
+    if (profileIds.size > 0) {
+      const { data: profiles, error: profileErr } = await supabase
+        .from('profiles')
+        .select('id, first_name, last_name, email')
+        .in('id', Array.from(profileIds));
+      if (profileErr) throw profileErr;
+      (profiles || []).forEach(p => {
+        profileMap[p.id] = p;
+      });
+    }
+
+    const normalized = (messages || []).map(msg => {
+      const profile = profileMap[msg.sender_id];
+      return {
+        id:         msg.id,
+        bookingId:  msg.booking_id,
+        senderId:   msg.sender_id,
+        senderType: msg.sender_type,
+        senderName: profile ? `${profile.first_name || ''} ${profile.last_name || ''}`.trim() || profile.email : msg.sender_type || 'System',
+        message:    msg.message,
+        createdAt:  msg.created_at,
+        isClosed:   msg.is_closed,
+      };
+    });
+
+    res.json({ success: true, data: normalized });
+  } catch (err) {
+    console.error('Chat messages error:', err);
+    res.status(500).json({ success: false, message: 'Failed to fetch chat messages' });
+  }
+});
+
+router.post('/chats/:bookingId/close', authenticateSuperadmin, async (req, res) => {
+  try {
+    const { bookingId } = req.params;
     const { reason } = req.body;
 
     if (!reason || reason.trim().length === 0) {
       return res.status(422).json({ success: false, message: 'Reason required' });
     }
 
-    const { data: messages } = await supabase
+    const { data: messages, error: msgErr } = await supabase
       .from('messages')
-      .select('booking_id')
-      .eq('id', parseInt(chatId))
+      .select('id')
+      .eq('booking_id', bookingId)
+      .order('created_at', { ascending: false })
       .limit(1);
 
+    if (msgErr) throw msgErr;
     if (!messages || messages.length === 0) {
       return res.status(404).json({ success: false, message: 'Chat not found' });
     }
 
-    const bookingId = messages[0].booking_id;
+    const latestMessage = messages[0];
 
-    await supabase
+    const { error } = await supabase
       .from('messages')
       .update({
         is_closed:    true,
@@ -674,19 +764,21 @@ router.post('/chats/:chatId/close', authenticateSuperadmin, async (req, res) => 
       })
       .eq('booking_id', bookingId);
 
+    if (error) throw error;
+
     await supabase.from('chat_closures').insert({
-      message_id: parseInt(chatId),
+      message_id: latestMessage.id,
       booking_id: bookingId,
       closed_by:  req.superadmin.id,
       reason:     sanitizeInput(reason),
     });
 
-    await logAuditAction(req.superadmin.id, AUDIT_ACTIONS.CLOSE_CHAT, 'chat', chatId, reason, 'success', '', req);
+    await logAuditAction(req.superadmin.id, AUDIT_ACTIONS.CLOSE_CHAT, 'chat', bookingId, reason, 'success', '', req);
 
     res.json({ success: true, message: 'Chat closed' });
   } catch (err) {
     console.error('Close chat error:', err);
-    await logAuditAction(req.superadmin.id, AUDIT_ACTIONS.CLOSE_CHAT, 'chat', req.params.chatId, '', 'failed', err.message, req);
+    await logAuditAction(req.superadmin?.id || null, AUDIT_ACTIONS.CLOSE_CHAT, 'chat', req.params.bookingId, '', 'failed', err.message, req);
     res.status(500).json({ success: false, message: 'Failed to close chat' });
   }
 });
