@@ -21,6 +21,14 @@ const router = express.Router();
  */
 const authenticateSuperadmin = async (req, res, next) => {
   try {
+    // DEV MODE: Bypass auth for testing (REMOVE IN PRODUCTION)
+    if (process.env.NODE_ENV === 'development' && req.headers['x-dev-bypass'] === 'true') {
+      console.warn('⚠️  DEV MODE: Auth bypassed. Remove in production!');
+      req.superadmin = { id: 'dev-admin-123', username: 'dev-admin', email: 'dev@test.com' };
+      req.session = { id: 'dev-session-123' };
+      return next();
+    }
+
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) {
       return res.status(401).json({ success: false, message: 'No token provided' });
