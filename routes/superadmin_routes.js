@@ -442,18 +442,78 @@ router.get('/audit-logs', authenticateSuperadmin, async (req, res) => {
       .order('created_at', { ascending: false })
       .range(offset, offset + limit - 1);
 
-    res.json({
-      logs: logs.map(log => ({
-        ...log,
-        superadminUsername: log.superadmin_credentials?.username,
-      })),
-      total: count,
-      limit,
-      offset,
-    });
+    // Return an array directly (frontend expects an array) and normalize keys to camelCase
+    const normalized = (logs || []).map(log => ({
+      id: log.id,
+      action: log.action,
+      resourceType: log.resource_type,
+      resourceId: log.resource_id,
+      reason: log.reason,
+      status: log.status,
+      errorMessage: log.error_message,
+      createdAt: log.created_at,
+      superadminUsername: log.superadmin_credentials?.username,
+    }));
+
+    res.json(normalized);
   } catch (err) {
     console.error('Audit logs error:', err);
     res.status(500).json({ success: false, message: 'Failed to fetch audit logs' });
+  }
+});
+
+/**
+ * GET /api/superadmin/clients
+ */
+router.get('/clients', authenticateSuperadmin, async (req, res) => {
+  try {
+    const { data: clients } = await supabase
+      .from('profiles')
+      .select('id, first_name, last_name, email, phone, status, created_at')
+      .eq('user_type', 'client');
+
+    const normalized = (clients || []).map(c => ({
+      id: c.id,
+      name: `${c.first_name || ''} ${c.last_name || ''}`.trim() || undefined,
+      email: c.email,
+      phone: c.phone,
+      status: c.status,
+      createdAt: c.created_at,
+    }));
+
+    res.json(normalized);
+  } catch (err) {
+    console.error('Clients error:', err);
+    res.status(500).json({ success: false, message: 'Failed to fetch clients' });
+  }
+});
+
+/**
+ * GET /api/superadmin/chats
+ * Returns list of recent/chat threads (one per booking) with basic meta
+ */
+router.get('/chats', authenticateSuperadmin, async (req, res) => {
+  try {
+    // Fetch latest message per booking where not closed
+    const { data: rows } = await supabase.rpc('get_superadmin_chats');
+    // If rpc not available, fallback to simple query
+    let chats = rows || [];
+
+    // Normalize
+    const normalized = (chats || []).map(r => ({
+      id: r.message_id || r.id,
+      bookingId: r.booking_id,
+      lastMessage: r.last_message || r.body || '',
+      clientName: r.client_name || r.client_full_name || '',
+      agentName: r.agent_name || r.agent_full_name || '',
+      status: r.is_closed ? 'closed' : 'active',
+      createdAt: r.created_at || r.created_at,
+    }));
+
+    res.json(normalized);
+  } catch (err) {
+    console.error('Chats error:', err);
+    res.status(500).json({ success: false, message: 'Failed to fetch chats' });
   }
 });
 
