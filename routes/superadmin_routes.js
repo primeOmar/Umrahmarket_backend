@@ -831,36 +831,79 @@ router.get('/documents', authenticateSuperadmin, async (req, res) => {
 });
 
 router.post('/documents/:docId/verify', authenticateSuperadmin, async (req, res) => {
-  try {
-    const { docId } = req.params;
-    const { status, notes } = req.body;
+  const { docId } = req.params;
+  const { status, notes } = req.body;
+  const allowedStatuses = ['approved', 'rejected'];
+  const safeStatus = sanitizeInput((status || '').toString()).toLowerCase();
+  const auditAction = allowedStatuses.includes(safeStatus)
+    ? (safeStatus === 'approved' ? AUDIT_ACTIONS.VERIFY_DOCUMENT : AUDIT_ACTIONS.REJECT_DOCUMENT)
+    : AUDIT_ACTIONS.VERIFY_DOCUMENT;
+  const auditResourceId = docId || 'unknown';
 
-    if (!['approved', 'rejected'].includes(status)) {
-      return res.status(422).json({ success: false, message: 'Invalid status' });
+  if (!docId || typeof docId !== 'string' || !docId.trim()) {
+    await logAuditAction(req.superadmin.id, auditAction, 'document', auditResourceId, 'Invalid document id', 'failed', 'Missing or invalid document id', req);
+    return res.status(422).json({ success: false, message: 'Invalid document id' });
+  }
+
+  if (!allowedStatuses.includes(safeStatus)) {
+    await logAuditAction(req.superadmin.id, AUDIT_ACTIONS.VERIFY_DOCUMENT, 'document', auditResourceId, 'Invalid status', 'failed', `Invalid status: ${status}`, req);
+    return res.status(422).json({ success: false, message: 'Invalid status' });
+  }
+
+  try {
+    const updatePayload = {
+      status: safeStatus,
+      review_notes: sanitizeInput(notes || ''),
+      reviewed_by: req.superadmin.id,
+      reviewed_at: new Date().toISOString(),
+    };
+
+    const { data: updatedDoc, error: docError } = await supabase
+      .from('agent_documents')
+      .update(updatePayload)
+      .eq('id', docId)
+      .select('user_id')
+      .single();
+
+    if (docError) {
+      await logAuditAction(req.superadmin.id, auditAction, 'document', auditResourceId, 'Document update failed', 'failed', docError.message || 'Unexpected Supabase error', req);
+      throw docError;
     }
 
-    const { error } = await supabase
-      .from('agent_documents')
-      .update({
-        status,
-        review_notes: sanitizeInput(notes || ''),
-        reviewed_by:  req.superadmin.id,
-        reviewed_at:  new Date().toISOString(),
-      })
-      .eq('id', docId);
+    if (!updatedDoc || !updatedDoc.user_id) {
+      await logAuditAction(req.superadmin.id, auditAction, 'document', auditResourceId, 'Document not found', 'failed', 'No matching document row', req);
+      return res.status(404).json({ success: false, message: 'Document not found' });
+    }
 
-    if (error) throw error;
+    const profilePayload = {
+      approved: safeStatus === 'approved',
+      verification_status: safeStatus,
+      updated_at: new Date().toISOString(),
+    };
 
-    await logAuditAction(
-      req.superadmin.id,
-      status === 'approved' ? AUDIT_ACTIONS.VERIFY_DOCUMENT : AUDIT_ACTIONS.REJECT_DOCUMENT,
-      'document', docId, notes || '', 'success', '', req,
-    );
+    const { data: profileData, error: profileError } = await supabase
+      .from('profiles')
+      .update(profilePayload)
+      .eq('id', updatedDoc.user_id)
+      .select('id')
+      .single();
 
-    res.json({ success: true, message: `Document ${status}` });
+    if (profileError) {
+      await logAuditAction(req.superadmin.id, auditAction, 'document', auditResourceId, 'Profile update failed', 'failed', profileError.message || 'Unexpected Supabase error', req);
+      throw profileError;
+    }
+
+    if (!profileData) {
+      await logAuditAction(req.superadmin.id, auditAction, 'document', auditResourceId, 'Profile not found', 'failed', `Profile not found for user ${updatedDoc.user_id}`, req);
+      return res.status(404).json({ success: false, message: 'Associated agent profile not found' });
+    }
+
+    await logAuditAction(req.superadmin.id, auditAction, 'document', auditResourceId, notes || '', 'success', '', req);
+    return res.json({ success: true, message: `Document ${safeStatus}` });
   } catch (err) {
     console.error('Document verify error:', err);
-    res.status(500).json({ success: false, message: 'Failed to verify document' });
+    await logAuditAction(req.superadmin.id, auditAction, 'document', auditResourceId, 'Document verification failed', 'failed', err.message || 'Unknown error', req);
+    return res.status(500).json({ success: false, message: err?.message || 'Failed to verify document' });
   }
 });
 
