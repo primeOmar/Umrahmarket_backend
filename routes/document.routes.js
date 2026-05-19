@@ -108,6 +108,75 @@ router.get('/', requireAuth, async (req, res) => {
   }
 });
 
+router.get('/debug/status', async (req, res) => {
+  try {
+    console.log('[DEBUG] Checking agent_documents table...');
+
+    // Check table existence
+    const { data: tableInfo, error: tableError } = await supabaseAdmin
+      .from('agent_documents')
+      .select('*')
+      .limit(0);
+
+    if (tableError) {
+      return res.json({
+        success: false,
+        table: 'not found',
+        error: tableError.message,
+      });
+    }
+
+    // Check record count
+    const { count, error: countError } = await supabaseAdmin
+      .from('agent_documents')
+      .select('*', { count: 'exact', head: true });
+
+    // Check RLS status
+    const { data: rlsCheck, error: rlsError } = await supabaseAdmin
+      .rpc('pg_class', {}, { count: 'exact' })
+      .catch(() => ({ data: null, error: 'RLS check unavailable' }));
+
+    // Try a test insert
+    const testId = `test-${Date.now()}`;
+    const testUserId = 'test-user-id';
+    const { data: testData, error: testError } = await supabaseAdmin
+      .from('agent_documents')
+      .insert({
+        user_id: testUserId,
+        status: 'pending',
+      })
+      .select('id,user_id')
+      .single()
+      .catch(err => ({ data: null, error: err.message }));
+
+    // Clean up test record if insert succeeded
+    if (testData) {
+      await supabaseAdmin
+        .from('agent_documents')
+        .delete()
+        .eq('user_id', testUserId)
+        .catch(() => {});
+    }
+
+    res.json({
+      success: true,
+      status: 'ok',
+      table: 'agent_documents exists',
+      recordCount: count || 0,
+      testInsert: {
+        success: !!testData,
+        error: testError || null,
+      },
+    });
+  } catch (error) {
+    console.error('[DEBUG] Error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
 // ─── POST /api/documents ──────────────────────────────────────────────────────
 // Accepts: incorporation | tourism | krapin  (multipart/form-data)
 // Middleware chain: requireAuth → parseDocumentData → uploadDocumentsToR2 → handler
@@ -123,28 +192,80 @@ router.post('/',
     }
 
     try {
+      const userId = req.userId;
+      console.log(`[POST /api/documents] Starting upload for user: ${userId}`);
+      console.log(`[POST /api/documents] Uploaded files:`, Object.keys(uploaded));
+
       const documentPayload = {
-        user_id:        req.userId,
+        user_id:        userId,
         incorporation_doc: uploaded.incorporation || null,
         tourism_doc:       uploaded.tourism || null,
         krapin_doc:        uploaded.krapin || null,
         director_id_doc:   uploaded.director_id || null,
-        office_photo:      uploaded.office_photo || null,
+        office_photo:      Array.isArray(uploaded.office_photo) ? uploaded.office_photo : (uploaded.office_photo ? [uploaded.office_photo] : null),
         status:            'pending',
         submitted_at:      new Date().toISOString(),
       };
 
-      const { data: savedDoc, error: saveError } = await supabaseAdmin
-        .from('agent_documents')
-        .insert(documentPayload)
-        .select('id,user_id,status,submitted_at')
-        .single();
+      console.log(`[POST /api/documents] Payload:`, JSON.stringify(documentPayload, null, 2));
 
-      if (saveError) {
-        console.error('Failed to persist agent_documents record:', saveError);
-        return res.status(500).json({ success: false, error: 'Uploaded to Cloudflare, but failed to save document metadata.' });
+      // Check if record exists
+      const { data: existing, error: selectError } = await supabaseAdmin
+        .from('agent_documents')
+        .select('id')
+        .eq('user_id', userId)
+        .maybeSingle();
+
+      if (selectError) {
+        console.error(`[POST /api/documents] SELECT error:`, selectError);
+        throw new Error(`Database select failed: ${selectError.message}`);
       }
 
+      console.log(`[POST /api/documents] Existing record:`, existing ? 'Found' : 'Not found');
+
+      let savedDoc;
+
+      if (existing) {
+        console.log(`[POST /api/documents] Updating existing record (id: ${existing.id})`);
+        const { data, error } = await supabaseAdmin
+          .from('agent_documents')
+          .update({
+            incorporation_doc: uploaded.incorporation || null,
+            tourism_doc:       uploaded.tourism || null,
+            krapin_doc:        uploaded.krapin || null,
+            director_id_doc:   uploaded.director_id || null,
+            office_photo:      Array.isArray(uploaded.office_photo) ? uploaded.office_photo : (uploaded.office_photo ? [uploaded.office_photo] : null),
+            status:            'pending',
+            submitted_at:      new Date().toISOString(),
+            updated_at:        new Date().toISOString(),
+          })
+          .eq('user_id', userId)
+          .select('id,user_id,status,submitted_at')
+          .single();
+
+        if (error) {
+          console.error(`[POST /api/documents] UPDATE error:`, error);
+          throw new Error(`Database update failed: ${error.message}`);
+        }
+        console.log(`[POST /api/documents] Update successful:`, data);
+        savedDoc = data;
+      } else {
+        console.log(`[POST /api/documents] Inserting new record`);
+        const { data, error } = await supabaseAdmin
+          .from('agent_documents')
+          .insert(documentPayload)
+          .select('id,user_id,status,submitted_at')
+          .single();
+
+        if (error) {
+          console.error(`[POST /api/documents] INSERT error:`, error);
+          throw new Error(`Database insert failed: ${error.message}`);
+        }
+        console.log(`[POST /api/documents] Insert successful:`, data);
+        savedDoc = data;
+      }
+
+      console.log(`[POST /api/documents] Completed successfully`);
       return res.json({
         success: true,
         message: 'Documents uploaded successfully.',
@@ -154,8 +275,8 @@ router.post('/',
         },
       });
     } catch (error) {
-      console.error('POST /api/documents persistence error:', error);
-      return res.status(500).json({ success: false, error: 'Failed to save document metadata.' });
+      console.error('[POST /api/documents] Fatal error:', error);
+      return res.status(500).json({ success: false, error: error.message || 'Failed to save documents.' });
     }
   }
 );

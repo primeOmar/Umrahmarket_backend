@@ -104,7 +104,7 @@ const getAgentDocumentUrls = async (agentId) => {
 
     return result;
   } catch (err) {
-    console.error('Failed to fetch agent document URLs from R2:', err);
+    console.error(`Failed to fetch R2 documents for agent ${agentId}:`, err);
     return {};
   }
 };
@@ -429,7 +429,6 @@ router.post('/verify-2fa', async (req, res) => {
     }
 
     const superadmin = pending.superadmin_credentials;
-
 
     const accessToken   = jwt.sign({ superadminId: superadmin.id }, process.env.JWT_SECRET, { expiresIn: '24h' });
     const refreshToken  = generateToken();
@@ -854,6 +853,48 @@ router.post('/chats/:bookingId/close', authenticateSuperadmin, async (req, res) 
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// DEBUG – Check R2 connectivity and agent documents status
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/debug/documents-status', authenticateSuperadmin, async (req, res) => {
+  try {
+    const checks = {
+      r2Connected: false,
+      r2Bucket: R2_BUCKET ? 'configured' : 'missing',
+      agentDocumentsRecords: 0,
+      r2DocumentsCount: 0,
+      errors: [],
+    };
+
+    // Check R2 connectivity
+    try {
+      const allDocs = await R2.send(new ListObjectsV2Command({
+        Bucket: R2_BUCKET,
+        Prefix: 'documents/',
+      }));
+      checks.r2Connected = true;
+      checks.r2DocumentsCount = (allDocs.Contents || []).length;
+    } catch (r2Err) {
+      checks.errors.push(`R2 connection failed: ${r2Err.message}`);
+    }
+
+    // Check DB records
+    try {
+      const { count } = await supabase
+        .from('agent_documents')
+        .select('id', { count: 'exact', head: true });
+      checks.agentDocumentsRecords = count || 0;
+    } catch (dbErr) {
+      checks.errors.push(`DB query failed: ${dbErr.message}`);
+    }
+
+    res.json({ success: true, data: checks });
+  } catch (err) {
+    console.error('Debug status error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // DOCUMENTS 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -865,8 +906,8 @@ router.get('/documents', authenticateSuperadmin, async (req, res) => {
       .select(`
         id, user_id, incorporation_doc, tourism_doc, krapin_doc, status, review_notes,
         submitted_at, reviewed_at, reviewed_by,
-        agent:profiles!agent_documents_user_id_fkey (first_name, last_name, email),
-        reviewer:profiles!agent_documents_reviewed_by_fkey (first_name, last_name)
+        agent:profiles!user_id (first_name, last_name, email),
+        reviewer:profiles!reviewed_by (first_name, last_name)
       `)
       .order('submitted_at', { ascending: false });
 
@@ -905,7 +946,7 @@ router.get('/documents', authenticateSuperadmin, async (req, res) => {
     res.json({ success: true, data: normalized });
   } catch (err) {
     console.error('Documents error:', err);
-    res.status(500).json({ success: false, message: 'Failed to fetch documents' });
+    res.status(500).json({ success: false, message: err.message || 'Failed to fetch documents' });
   }
 });
 
