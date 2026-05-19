@@ -1,10 +1,25 @@
 import express from 'express';
 import jwt from 'jsonwebtoken';
+import { S3Client, ListObjectsV2Command, GetObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { supabaseAdmin as supabase } from '../config/supabase.js';
 import {
   hashPassword, verifyPassword, generateToken, hashToken,
   loginRateLimiter, validateEmail, sanitizeInput, AUDIT_ACTIONS,
 } from '../utils/securityUtils.js';
+
+const R2 = new S3Client({
+  region: 'auto',
+  endpoint: `https://${process.env.CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  credentials: {
+    accessKeyId:     process.env.CLOUDFLARE_R2_ACCESS_KEY_ID,
+    secretAccessKey: process.env.CLOUDFLARE_R2_SECRET_ACCESS_KEY,
+  },
+});
+
+const R2_BUCKET = process.env.CLOUDFLARE_R2_BUCKET_NAME;
+const DOCUMENT_KEYS = ['incorporation', 'tourism', 'krapin', 'director_id', 'office_photo'];
+const R2_SIGNED_URL_EXPIRES = 3600;
 
 const router = express.Router();
 
@@ -36,6 +51,61 @@ const logAuditAction = async (
     });
   } catch (err) {
     console.error('Failed to log audit action:', err);
+  }
+};
+
+const getAgentDocumentUrls = async (agentId) => {
+  if (!agentId || !R2_BUCKET) return {};
+
+  try {
+    const { Contents } = await R2.send(new ListObjectsV2Command({
+      Bucket: R2_BUCKET,
+      Prefix: `documents/${agentId}/`,
+    }));
+
+    if (!Contents || Contents.length === 0) return {};
+
+    const grouped = Contents.reduce((acc, item) => {
+      const parts = item.Key.split('/');
+      if (parts.length < 3) return acc;
+      const key = parts[2];
+      if (!DOCUMENT_KEYS.includes(key)) return acc;
+      acc[key] = acc[key] || [];
+      acc[key].push(item);
+      return acc;
+    }, {});
+
+    const result = {};
+
+    for (const [key, objects] of Object.entries(grouped)) {
+      const sorted = objects.sort((a, b) => new Date(b.LastModified) - new Date(a.LastModified));
+      if (key === 'office_photo') {
+        result.office_photo = await Promise.all(sorted.map(async (item) => ({
+          path: item.Key,
+          publicUrl: await getSignedUrl(
+            R2,
+            new GetObjectCommand({ Bucket: R2_BUCKET, Key: item.Key }),
+            { expiresIn: R2_SIGNED_URL_EXPIRES }
+          ),
+          uploadedAt: item.LastModified,
+        })));
+      } else {
+        result[key] = {
+          path: sorted[0].Key,
+          publicUrl: await getSignedUrl(
+            R2,
+            new GetObjectCommand({ Bucket: R2_BUCKET, Key: sorted[0].Key }),
+            { expiresIn: R2_SIGNED_URL_EXPIRES }
+          ),
+          uploadedAt: sorted[0].LastModified,
+        };
+      }
+    }
+
+    return result;
+  } catch (err) {
+    console.error('Failed to fetch agent document URLs from R2:', err);
+    return {};
   }
 };
 
@@ -807,21 +877,30 @@ router.get('/documents', authenticateSuperadmin, async (req, res) => {
     const { data: documents, error } = await query;
     if (error) throw error;
 
-    const normalized = (documents || []).map(doc => ({
-      id:               doc.id,
-      agentId:          doc.user_id,
-      agentName:        `${doc.agent?.first_name || ''} ${doc.agent?.last_name || ''}`.trim(),
-      agentEmail:       doc.agent?.email,
-      incorporationDoc: doc.incorporation_doc,
-      tourismDoc:       doc.tourism_doc,
-      kraPin:           doc.krapin_doc,
-      status:           doc.status,
-      reviewNotes:      doc.review_notes,
-      submittedAt:      doc.submitted_at,
-      reviewedAt:       doc.reviewed_at,
-      reviewedBy:       doc.reviewed_by,
-      reviewerName:     doc.reviewer ? `${doc.reviewer.first_name || ''} ${doc.reviewer.last_name || ''}`.trim() : null,
-    }));
+    const r2Results = await Promise.all(
+      (documents || []).map(doc => getAgentDocumentUrls(doc.user_id))
+    );
+
+    const normalized = (documents || []).map((doc, index) => {
+      const r2 = r2Results[index] || {};
+      return {
+        id:               doc.id,
+        agentId:          doc.user_id,
+        agentName:        `${doc.agent?.first_name || ''} ${doc.agent?.last_name || ''}`.trim(),
+        agentEmail:       doc.agent?.email,
+        incorporationDoc: r2.incorporation?.publicUrl || doc.incorporation_doc,
+        tourismDoc:       r2.tourism?.publicUrl || doc.tourism_doc,
+        kraPin:           r2.krapin?.publicUrl || doc.krapin_doc,
+        directorIdDoc:    r2.director_id?.publicUrl || doc.director_id_doc,
+        officePhoto:      r2.office_photo || doc.office_photo,
+        status:           doc.status,
+        reviewNotes:      doc.review_notes,
+        submittedAt:      doc.submitted_at,
+        reviewedAt:       doc.reviewed_at,
+        reviewedBy:       doc.reviewed_by,
+        reviewerName:     doc.reviewer ? `${doc.reviewer.first_name || ''} ${doc.reviewer.last_name || ''}`.trim() : null,
+      };
+    });
 
     res.json({ success: true, data: normalized });
   } catch (err) {

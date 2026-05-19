@@ -115,18 +115,48 @@ router.post('/',
   requireAuth,
   parseDocumentData,
   uploadDocumentsToR2,
-  (req, res) => {
+  async (req, res) => {
     const uploaded = req.documentUrls ?? {};
 
     if (Object.keys(uploaded).length === 0) {
       return res.status(400).json({ success: false, error: 'No files provided.' });
     }
 
-    return res.json({
-      success: true,
-      message: 'Documents uploaded successfully.',
-      data:    uploaded,
-    });
+    try {
+      const documentPayload = {
+        user_id:        req.userId,
+        incorporation_doc: uploaded.incorporation || null,
+        tourism_doc:       uploaded.tourism || null,
+        krapin_doc:        uploaded.krapin || null,
+        director_id_doc:   uploaded.director_id || null,
+        office_photo:      uploaded.office_photo || null,
+        status:            'pending',
+        submitted_at:      new Date().toISOString(),
+      };
+
+      const { data: savedDoc, error: saveError } = await supabaseAdmin
+        .from('agent_documents')
+        .insert(documentPayload)
+        .select('id,user_id,status,submitted_at')
+        .single();
+
+      if (saveError) {
+        console.error('Failed to persist agent_documents record:', saveError);
+        return res.status(500).json({ success: false, error: 'Uploaded to Cloudflare, but failed to save document metadata.' });
+      }
+
+      return res.json({
+        success: true,
+        message: 'Documents uploaded successfully.',
+        data: {
+          uploaded,
+          document: savedDoc,
+        },
+      });
+    } catch (error) {
+      console.error('POST /api/documents persistence error:', error);
+      return res.status(500).json({ success: false, error: 'Failed to save document metadata.' });
+    }
   }
 );
 
