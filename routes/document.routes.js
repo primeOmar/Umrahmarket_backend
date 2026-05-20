@@ -26,7 +26,6 @@ const BUCKET = process.env.CLOUDFLARE_R2_BUCKET_NAME;
 router.get('/', requireAuth, async (req, res) => {
   try {
     const agentId = req.userId;
-    const result  = {};
 
     // Fetch saved Maps URL from profile
     const { data: profile } = await supabaseAdmin
@@ -36,67 +35,112 @@ router.get('/', requireAuth, async (req, res) => {
       .single();
     const savedMapsUrl = profile?.office_maps_url || null;
 
+    const { data: docRow } = await supabaseAdmin
+      .from('agent_documents')
+      .select('incorporation_doc, tourism_doc, krapin_doc, director_id_doc, office_photo')
+      .eq('user_id', agentId)
+      .maybeSingle();
+
+    const result = {};
+
     for (const docKey of DOCUMENT_KEYS) {
       const prefix = `documents/${agentId}/${docKey}/`;
+      let rowValue = null;
+      let dbStatus = 'none';
 
-      const { Contents } = await R2.send(new ListObjectsV2Command({
-        Bucket: BUCKET,
-        Prefix: prefix,
-      }));
-
-      if (!Contents || Contents.length === 0) {
-        result[docKey] = {
-          status: 'none',
-          ...(docKey === 'office_photo' && savedMapsUrl ? { mapsUrl: savedMapsUrl } : {}),
-          ...(docKey === 'office_photo' ? { photos: [] } : {}),
-        };
-        continue;
+      if (docRow) {
+        if (docKey === 'office_photo') {
+          rowValue = Array.isArray(docRow.office_photo) ? docRow.office_photo : (docRow.office_photo ? [docRow.office_photo] : []);
+          dbStatus = rowValue.length > 0 ? 'uploaded' : 'none';
+        } else {
+          const field = `${docKey === 'director_id' ? 'director_id_doc' : `${docKey}_doc`}`;
+          rowValue = docRow[field];
+          dbStatus = rowValue ? 'uploaded' : 'none';
+        }
       }
 
-      // Sort newest-first
-      const sorted = Contents.sort(
-        (a, b) => new Date(b.LastModified) - new Date(a.LastModified)
-      );
+      try {
+        const { Contents } = await R2.send(new ListObjectsV2Command({
+          Bucket: BUCKET,
+          Prefix: prefix,
+        }));
+
+        if (Contents && Contents.length > 0) {
+          const sorted = Contents.sort((a, b) => new Date(b.LastModified) - new Date(a.LastModified));
+
+          if (docKey === 'office_photo') {
+            const photos = await Promise.all(
+              sorted.map(async (obj) => {
+                const signedUrl = await getSignedUrl(
+                  R2,
+                  new GetObjectCommand({ Bucket: BUCKET, Key: obj.Key }),
+                  { expiresIn: 3600 }
+                );
+                return { path: obj.Key, publicUrl: signedUrl, uploadedAt: obj.LastModified };
+              })
+            );
+
+            result[docKey] = {
+              status:     'uploaded',
+              photos,
+              path:       photos[0].path,
+              publicUrl:  photos[0].publicUrl,
+              uploadedAt: photos[0].uploadedAt,
+              ...(savedMapsUrl ? { mapsUrl: savedMapsUrl } : {}),
+            };
+            continue;
+          }
+
+          const latest = sorted[0];
+          const signedUrl = await getSignedUrl(
+            R2,
+            new GetObjectCommand({ Bucket: BUCKET, Key: latest.Key }),
+            { expiresIn: 3600 }
+          );
+
+          result[docKey] = {
+            status:     'uploaded',
+            path:       latest.Key,
+            publicUrl:  signedUrl,
+            uploadedAt: latest.LastModified,
+          };
+          continue;
+        }
+      } catch (r2Error) {
+        console.warn(`R2 read failed for ${docKey} (${agentId}):`, r2Error.message);
+      }
 
       if (docKey === 'office_photo') {
-        // Return ALL office photos as an array
-        const photos = await Promise.all(
-          sorted.map(async (obj) => {
-            const signedUrl = await getSignedUrl(
-              R2,
-              new GetObjectCommand({ Bucket: BUCKET, Key: obj.Key }),
-              { expiresIn: 3600 }
-            );
-            return { path: obj.Key, publicUrl: signedUrl, uploadedAt: obj.LastModified };
-          })
-        );
-
-        result[docKey] = {
-          status:     'uploaded',
-          photos,
-          // Convenience: most recent photo as top-level publicUrl for backward compat
-          path:       photos[0].path,
-          publicUrl:  photos[0].publicUrl,
-          uploadedAt: photos[0].uploadedAt,
-          ...(savedMapsUrl ? { mapsUrl: savedMapsUrl } : {}),
-        };
+        if (rowValue && Array.isArray(rowValue) && rowValue.length > 0) {
+          const photos = rowValue.map((url) => ({ path: url, publicUrl: url }));
+          result[docKey] = {
+            status:     'uploaded',
+            photos,
+            path:       photos[0].path,
+            publicUrl:  photos[0].publicUrl,
+            uploadedAt: null,
+            ...(savedMapsUrl ? { mapsUrl: savedMapsUrl } : {}),
+          };
+        } else {
+          result[docKey] = {
+            status: 'none',
+            ...(savedMapsUrl ? { mapsUrl: savedMapsUrl } : {}),
+            photos: [],
+          };
+        }
       } else {
-        // Most recently uploaded file for this doc type
-        const latest = sorted[0];
-
-        // Generate presigned URL valid for 1 hour
-        const signedUrl = await getSignedUrl(
-          R2,
-          new GetObjectCommand({ Bucket: BUCKET, Key: latest.Key }),
-          { expiresIn: 3600 }
-        );
-
-        result[docKey] = {
-          status:     'uploaded',
-          path:       latest.Key,
-          publicUrl:  signedUrl,
-          uploadedAt: latest.LastModified,
-        };
+        if (rowValue) {
+          result[docKey] = {
+            status:     'uploaded',
+            path:       rowValue,
+            publicUrl:  rowValue,
+            uploadedAt: null,
+          };
+        } else {
+          result[docKey] = {
+            status: 'none',
+          };
+        }
       }
     }
 
