@@ -109,6 +109,122 @@ const getAgentDocumentUrls = async (agentId) => {
   }
 };
 
+const R2_PUBLIC_URL = process.env.CLOUDFLARE_R2_PUBLIC_URL || '';
+
+const listR2AgentIds = async () => {
+  if (!R2_BUCKET) return [];
+
+  const agentIds = new Set();
+  let nextToken;
+
+  do {
+    const response = await R2.send(new ListObjectsV2Command({
+      Bucket: R2_BUCKET,
+      Prefix: 'documents/',
+      ContinuationToken: nextToken,
+      MaxKeys: 1000,
+    }));
+
+    (response.Contents || []).forEach(item => {
+      const parts = item.Key.split('/');
+      if (parts.length >= 3 && parts[1]) {
+        agentIds.add(parts[1]);
+      }
+    });
+
+    nextToken = response.IsTruncated ? response.NextContinuationToken : undefined;
+  } while (nextToken);
+
+  return Array.from(agentIds);
+};
+
+const buildPublicUrl = (objectKey) => {
+  if (!objectKey) return null;
+  return R2_PUBLIC_URL ? `${R2_PUBLIC_URL}/${objectKey}` : null;
+};
+
+const reconcileAgentDocumentsFromR2 = async () => {
+  try {
+    const r2AgentIds = await listR2AgentIds();
+    if (!r2AgentIds.length) return 0;
+
+    const { data: existingRows, error: existingError } = await supabase
+      .from('agent_documents')
+      .select('user_id')
+      .in('user_id', r2AgentIds);
+
+    if (existingError) {
+      console.error('Failed to read existing agent_documents for reconciliation:', existingError);
+      return 0;
+    }
+
+    const existingIds = new Set((existingRows || []).map(row => row.user_id));
+    const missingIds = r2AgentIds.filter(id => !existingIds.has(id));
+    if (!missingIds.length) return 0;
+
+    const { data: profiles, error: profileError } = await supabase
+      .from('profiles')
+      .select('id')
+      .in('id', missingIds)
+      .eq('role', 'agent');
+
+    if (profileError) {
+      console.error('Failed to query agent profiles during reconciliation:', profileError);
+      return 0;
+    }
+
+    const validAgentIds = (profiles || []).map(profile => profile.id);
+    if (!validAgentIds.length) return 0;
+
+    const insertPayload = [];
+    for (const agentId of validAgentIds) {
+      const urls = await getAgentDocumentUrls(agentId);
+      if (!urls || Object.keys(urls).length === 0) continue;
+
+      const officePhotoUrls = Array.isArray(urls.office_photo)
+        ? urls.office_photo.map(photo => buildPublicUrl(photo.path) || photo.publicUrl)
+        : null;
+
+      const allUploadDates = [];
+      Object.entries(urls).forEach(([key, value]) => {
+        if (key === 'office_photo' && Array.isArray(value)) {
+          value.forEach(photo => { if (photo.uploadedAt) allUploadDates.push(new Date(photo.uploadedAt)); });
+        } else if (value?.uploadedAt) {
+          allUploadDates.push(new Date(value.uploadedAt));
+        }
+      });
+
+      const submittedAt = allUploadDates.length
+        ? new Date(Math.max(...allUploadDates.map(date => date.getTime()))).toISOString()
+        : new Date().toISOString();
+
+      insertPayload.push({
+        user_id:          agentId,
+        incorporation_doc: urls.incorporation?.path ? (buildPublicUrl(urls.incorporation.path) || urls.incorporation.publicUrl) : null,
+        tourism_doc:       urls.tourism?.path ? (buildPublicUrl(urls.tourism.path) || urls.tourism.publicUrl) : null,
+        krapin_doc:        urls.krapin?.path ? (buildPublicUrl(urls.krapin.path) || urls.krapin.publicUrl) : null,
+        director_id_doc:   urls.director_id?.path ? (buildPublicUrl(urls.director_id.path) || urls.director_id.publicUrl) : null,
+        office_photo:      officePhotoUrls,
+        status:            'pending',
+        submitted_at:      submittedAt,
+      });
+    }
+
+    if (!insertPayload.length) return 0;
+
+    const { error: insertError } = await supabase.from('agent_documents').insert(insertPayload);
+    if (insertError) {
+      console.error('Failed to insert reconciled agent_documents rows:', insertError);
+      return 0;
+    }
+
+    return insertPayload.length;
+  } catch (err) {
+    console.error('Reconciliation error:', err);
+    return 0;
+  }
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // MIDDLEWARE – authenticateSuperadmin
 // ─────────────────────────────────────────────────────────────────────────────
@@ -898,25 +1014,57 @@ router.get('/debug/documents-status', authenticateSuperadmin, async (req, res) =
 // DOCUMENTS 
 // ─────────────────────────────────────────────────────────────────────────────
 
+router.post('/documents/reconcile', authenticateSuperadmin, async (req, res) => {
+  try {
+    const reconciledCount = await reconcileAgentDocumentsFromR2();
+    res.json({
+      success: true,
+      message: `Reconciled ${reconciledCount} missing agent document record(s) from R2`,
+      reconciledCount,
+    });
+  } catch (err) {
+    console.error('Reconcile documents error:', err);
+    res.status(500).json({ success: false, message: 'Failed to reconcile documents' });
+  }
+});
+
 router.get('/documents', authenticateSuperadmin, async (req, res) => {
   try {
     const status = req.query.status;
-    let query = supabase
-      .from('agent_documents')
-      .select(`
-        id, user_id, incorporation_doc, tourism_doc, krapin_doc, status, review_notes,
-        submitted_at, reviewed_at, reviewed_by,
-        agent:profiles!user_id (first_name, last_name, email),
-        reviewer:profiles!reviewed_by (first_name, last_name)
-      `)
-      .order('submitted_at', { ascending: false });
+    const reconcile = req.query.reconcile === 'true';
+    const buildDocumentQuery = () => {
+      let q = supabase
+        .from('agent_documents')
+        .select(`
+          id, user_id, incorporation_doc, tourism_doc, krapin_doc, director_id_doc, office_photo, status, review_notes,
+          submitted_at, reviewed_at, reviewed_by,
+          agent:profiles!user_id (first_name, last_name, email),
+          reviewer:profiles!reviewed_by (first_name, last_name)
+        `)
+        .order('submitted_at', { ascending: false });
 
-    if (status && status !== 'all') {
-      query = query.eq('status', status);
+      if (status && status !== 'all') {
+        q = q.eq('status', status);
+      }
+
+      return q;
+    };
+
+    if (reconcile && R2_BUCKET) {
+      await reconcileAgentDocumentsFromR2();
     }
 
-    const { data: documents, error } = await query;
+    let { data: documents, error } = await buildDocumentQuery();
     if (error) throw error;
+
+    if ((!documents || documents.length === 0) && R2_BUCKET) {
+      const reconciledCount = await reconcileAgentDocumentsFromR2();
+      if (reconciledCount > 0) {
+        const refreshed = await buildDocumentQuery();
+        documents = refreshed.data;
+        if (refreshed.error) throw refreshed.error;
+      }
+    }
 
     const r2Results = await Promise.all(
       (documents || []).map(doc => getAgentDocumentUrls(doc.user_id))
