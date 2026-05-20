@@ -203,7 +203,6 @@ const reconcileAgentDocumentsFromR2 = async () => {
         incorporation_doc: urls.incorporation?.path ? (buildPublicUrl(urls.incorporation.path) || urls.incorporation.publicUrl) : null,
         tourism_doc:       urls.tourism?.path ? (buildPublicUrl(urls.tourism.path) || urls.tourism.publicUrl) : null,
         krapin_doc:        urls.krapin?.path ? (buildPublicUrl(urls.krapin.path) || urls.krapin.publicUrl) : null,
-        director_id_doc:   urls.director_id?.path ? (buildPublicUrl(urls.director_id.path) || urls.director_id.publicUrl) : null,
         office_photo:      officePhotoUrls,
         status:            'pending',
         submitted_at:      submittedAt,
@@ -1036,8 +1035,7 @@ router.get('/documents', authenticateSuperadmin, async (req, res) => {
       let q = supabase
         .from('agent_documents')
         .select(`
-          id, user_id, incorporation_doc, tourism_doc, krapin_doc, director_id_doc, office_photo, status, review_notes,
-          submitted_at, reviewed_at, reviewed_by,
+          *,
           agent:profiles!user_id (first_name, last_name, email),
           reviewer:profiles!reviewed_by (first_name, last_name)
         `)
@@ -1080,7 +1078,7 @@ router.get('/documents', authenticateSuperadmin, async (req, res) => {
         incorporationDoc: r2.incorporation?.publicUrl || doc.incorporation_doc,
         tourismDoc:       r2.tourism?.publicUrl || doc.tourism_doc,
         kraPin:           r2.krapin?.publicUrl || doc.krapin_doc,
-        directorIdDoc:    r2.director_id?.publicUrl || doc.director_id_doc,
+        directorIdDoc:    r2.director_id?.publicUrl || null,
         officePhoto:      r2.office_photo || doc.office_photo,
         status:           doc.status,
         reviewNotes:      doc.review_notes,
