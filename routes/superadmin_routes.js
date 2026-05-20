@@ -1,6 +1,6 @@
 import express from 'express';
 import jwt from 'jsonwebtoken';
-import { S3Client, ListObjectsV2Command, GetObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, ListObjectsV2Command, GetObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { supabaseAdmin as supabase } from '../config/supabase.js';
 import {
@@ -203,6 +203,7 @@ const reconcileAgentDocumentsFromR2 = async () => {
         incorporation_doc: urls.incorporation?.path ? (buildPublicUrl(urls.incorporation.path) || urls.incorporation.publicUrl) : null,
         tourism_doc:       urls.tourism?.path ? (buildPublicUrl(urls.tourism.path) || urls.tourism.publicUrl) : null,
         krapin_doc:        urls.krapin?.path ? (buildPublicUrl(urls.krapin.path) || urls.krapin.publicUrl) : null,
+        director_id_doc:   urls.director_id?.path ? (buildPublicUrl(urls.director_id.path) || urls.director_id.publicUrl) : null,
         office_photo:      officePhotoUrls,
         status:            'pending',
         submitted_at:      submittedAt,
@@ -1078,7 +1079,7 @@ router.get('/documents', authenticateSuperadmin, async (req, res) => {
         incorporationDoc: r2.incorporation?.publicUrl || doc.incorporation_doc,
         tourismDoc:       r2.tourism?.publicUrl || doc.tourism_doc,
         kraPin:           r2.krapin?.publicUrl || doc.krapin_doc,
-        directorIdDoc:    r2.director_id?.publicUrl || null,
+        directorIdDoc:    r2.director_id?.publicUrl || doc.director_id_doc || null,
         officePhoto:      r2.office_photo || doc.office_photo,
         status:           doc.status,
         reviewNotes:      doc.review_notes,
@@ -1170,6 +1171,148 @@ router.post('/documents/:docId/verify', authenticateSuperadmin, async (req, res)
     console.error('Document verify error:', err);
     await logAuditAction(req.superadmin.id, auditAction, 'document', auditResourceId, 'Document verification failed', 'failed', err.message || 'Unknown error', req);
     return res.status(500).json({ success: false, message: err?.message || 'Failed to verify document' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DELETE – Remove documents from R2 and/or database
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.delete('/documents/:agentId/:docType', authenticateSuperadmin, async (req, res) => {
+  try {
+    const { agentId, docType } = req.params;
+
+    // Validate inputs
+    if (!agentId || typeof agentId !== 'string' || !agentId.trim()) {
+      await logAuditAction(req.superadmin.id, 'DELETE_DOCUMENT', 'document', agentId || 'unknown', 'Invalid agent ID', 'failed', 'Missing or invalid agent ID', req);
+      return res.status(422).json({ success: false, message: 'Invalid agent ID' });
+    }
+
+    if (!docType || !DOCUMENT_KEYS.includes(docType.toLowerCase())) {
+      await logAuditAction(req.superadmin.id, 'DELETE_DOCUMENT', 'document', agentId, 'Invalid document type', 'failed', `Invalid type: ${docType}`, req);
+      return res.status(422).json({ success: false, message: `Invalid document type. Allowed: ${DOCUMENT_KEYS.join(', ')}` });
+    }
+
+    const safeDoctType = docType.toLowerCase();
+
+    // Step 1: List all documents of this type for this agent in R2
+    const { Contents } = await R2.send(new ListObjectsV2Command({
+      Bucket: R2_BUCKET,
+      Prefix: `documents/${agentId}/${safeDoctType}/`,
+    }));
+
+    const filesToDelete = (Contents || []).map(obj => obj.Key);
+
+    // Step 2: Delete from R2
+    let deletedCount = 0;
+    if (filesToDelete.length > 0) {
+      for (const key of filesToDelete) {
+        try {
+          await R2.send(new DeleteObjectCommand({
+            Bucket: R2_BUCKET,
+            Key: key,
+          }));
+          deletedCount++;
+          console.log(`[DELETE] Deleted R2 object: ${key}`);
+        } catch (r2Err) {
+          console.error(`[DELETE] Failed to delete R2 object ${key}:`, r2Err);
+        }
+      }
+    }
+
+    // Step 3: Update database to clear the reference
+    const updatePayload = {};
+    if (safeDoctType === 'office_photo') {
+      updatePayload.office_photo = null;
+    } else {
+      updatePayload[`${safeDoctType}_doc`] = null;
+    }
+
+    const { error: dbError } = await supabase
+      .from('agent_documents')
+      .update(updatePayload)
+      .eq('user_id', agentId);
+
+    if (dbError) {
+      console.error('Failed to update agent_documents after R2 delete:', dbError);
+      // Log but don't fail — R2 delete succeeded
+    }
+
+    await logAuditAction(req.superadmin.id, 'DELETE_DOCUMENT', 'document', agentId, `Deleted ${safeDoctType}: ${deletedCount} file(s)`, 'success', '', req);
+
+    res.json({
+      success: true,
+      message: `Deleted ${deletedCount} ${safeDoctType} document(s)`,
+      deletedCount,
+    });
+  } catch (err) {
+    console.error('Document delete error:', err);
+    await logAuditAction(req.superadmin.id, 'DELETE_DOCUMENT', 'document', req.params.agentId || 'unknown', 'Delete failed', 'failed', err.message, req);
+    res.status(500).json({ success: false, message: err.message || 'Failed to delete document(s)' });
+  }
+});
+
+router.delete('/documents/:agentId', authenticateSuperadmin, async (req, res) => {
+  try {
+    const { agentId } = req.params;
+
+    if (!agentId || typeof agentId !== 'string' || !agentId.trim()) {
+      await logAuditAction(req.superadmin.id, 'DELETE_DOCUMENT', 'document', agentId || 'unknown', 'Invalid agent ID', 'failed', 'Missing or invalid agent ID', req);
+      return res.status(422).json({ success: false, message: 'Invalid agent ID' });
+    }
+
+    // List all documents for this agent in R2
+    const { Contents } = await R2.send(new ListObjectsV2Command({
+      Bucket: R2_BUCKET,
+      Prefix: `documents/${agentId}/`,
+    }));
+
+    const filesToDelete = (Contents || []).map(obj => obj.Key);
+
+    // Delete all from R2
+    let deletedCount = 0;
+    if (filesToDelete.length > 0) {
+      for (const key of filesToDelete) {
+        try {
+          await R2.send(new DeleteObjectCommand({
+            Bucket: R2_BUCKET,
+            Key: key,
+          }));
+          deletedCount++;
+          console.log(`[DELETE] Deleted R2 object: ${key}`);
+        } catch (r2Err) {
+          console.error(`[DELETE] Failed to delete R2 object ${key}:`, r2Err);
+        }
+      }
+    }
+
+    // Clear all document fields in database
+    const { error: dbError } = await supabase
+      .from('agent_documents')
+      .update({
+        incorporation_doc: null,
+        tourism_doc: null,
+        krapin_doc: null,
+        director_id_doc: null,
+        office_photo: null,
+      })
+      .eq('user_id', agentId);
+
+    if (dbError) {
+      console.error('Failed to clear agent_documents after R2 delete:', dbError);
+    }
+
+    await logAuditAction(req.superadmin.id, 'DELETE_DOCUMENT', 'document', agentId, `Deleted all agent documents: ${deletedCount} file(s)`, 'success', '', req);
+
+    res.json({
+      success: true,
+      message: `Deleted all ${deletedCount} document(s) for agent ${agentId}`,
+      deletedCount,
+    });
+  } catch (err) {
+    console.error('Bulk document delete error:', err);
+    await logAuditAction(req.superadmin.id, 'DELETE_DOCUMENT', 'document', req.params.agentId || 'unknown', 'Bulk delete failed', 'failed', err.message, req);
+    res.status(500).json({ success: false, message: err.message || 'Failed to delete all documents' });
   }
 });
 
