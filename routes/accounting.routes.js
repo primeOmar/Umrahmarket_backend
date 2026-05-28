@@ -391,7 +391,7 @@ router.get('/transactions/:id/receipt', authenticateSuperadmin, async (req, res)
         id, amount_kes, status, paid_at, disbursed, disbursed_at, mpesa_ref,
         package:packages(id, name, type, profit_percentage,
           agent:profiles!packages_created_by_fkey(first_name, last_name, email, agent_number)),
-        client:profiles!payments_user_id_fkey(first_name, last_name, email)
+        client:profiles(first_name, last_name, email)
       `)
       .eq('id', id)
       .single();
@@ -552,7 +552,7 @@ router.post('/transactions/:id/email', authenticateSuperadmin, async (req, res) 
         id, amount_kes, status, paid_at, disbursed, mpesa_ref,
         package:packages(name, profit_percentage,
           agent:profiles!packages_created_by_fkey(first_name, last_name, email)),
-        client:profiles!payments_user_id_fkey(first_name, last_name, email)
+        client:profiles(first_name, last_name, email)
       `)
       .eq('id', id)
       .single();
@@ -646,7 +646,7 @@ router.get('/export', authenticateSuperadmin, async (req, res) => {
         id, amount_kes, status, paid_at, disbursed, disbursed_at, mpesa_ref,
         package:packages(name, profit_percentage,
           agent:profiles!packages_created_by_fkey(first_name, last_name, email, agent_number)),
-        client:profiles!payments_user_id_fkey(first_name, last_name, email)
+        client:profiles(first_name, last_name, email)
       `)
       .eq('status', 'SUCCESS')
       .order('paid_at', { ascending: false });

@@ -9,7 +9,7 @@ import {
 } from '../utils/securityUtils.js';
 
 import PDFDocument from 'pdfkit';
-
+import accountingRouter from './accounting_routes.js';
 const R2 = new S3Client({
   region: 'auto',
   endpoint: `https://${process.env.CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com`,
@@ -1767,4 +1767,5 @@ router.get('/export/:dataType', authenticateSuperadmin, async (req, res) => {
   }
 });
 
+router.use('/accounting', accountingRouter);
 export default router;
