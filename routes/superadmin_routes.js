@@ -1422,23 +1422,13 @@ router.get('/accounting/transactions', authenticateSuperadmin, async (req, res) 
     const status = req.query.status ?? 'all';
     const from   = req.query.from;
     const to     = req.query.to;
+    const DEFAULT_PROFIT_PERCENTAGE = Number(process.env.PLATFORM_PROFIT_PERCENTAGE ?? 10);
 
     let query = supabase
       .from('payments')
       .select(`
-        id,
-        user_id,
-        package_id,
-        amount_kes,
-        status,
-        phone,
-        mpesa_ref,
-        paid_at,
-        created_at,
-        disbursed,
-        disbursed_at,
-        disbursed_by,
-        receipt_generated,
+        id, user_id, package_id, amount_kes, status, phone, mpesa_ref,
+        paid_at, created_at, disbursed, disbursed_at, disbursed_by, receipt_generated,
         package:packages(id, name, price, profit_percentage, created_by,
           agent:profiles!packages_created_by_fkey(id, first_name, last_name, email, agent_number)),
         client:profiles!payments_user_id_fkey(id, first_name, last_name, email)
@@ -1455,8 +1445,6 @@ router.get('/accounting/transactions', authenticateSuperadmin, async (req, res) 
     const { data: payments, error } = await query;
     if (error) throw error;
 
-    const DEFAULT_PROFIT_PERCENTAGE = Number(process.env.PLATFORM_PROFIT_PERCENTAGE ?? 10);
-
     const results = (payments ?? []).map(p => {
       const amount     = Number(p.amount_kes ?? 0);
       const pct        = Number(p.package?.profit_percentage ?? DEFAULT_PROFIT_PERCENTAGE);
@@ -1464,11 +1452,10 @@ router.get('/accounting/transactions', authenticateSuperadmin, async (req, res) 
       const agentShare = Math.round((amount - profit) * 100) / 100;
       const agent      = p.package?.agent;
       const client     = p.client;
-
       return {
         id:               p.id,
         packageId:        p.package_id,
-        packageName:      p.package?.name ?? '—',
+        packageName:      p.package?.name ?? '\u2014',
         clientId:         p.user_id,
         clientName:       client ? `${client.first_name} ${client.last_name}`.trim() : null,
         clientEmail:      client?.email ?? null,
@@ -1476,10 +1463,7 @@ router.get('/accounting/transactions', authenticateSuperadmin, async (req, res) 
         agentName:        agent  ? `${agent.first_name} ${agent.last_name}`.trim()  : null,
         agentEmail:       agent?.email ?? null,
         agentNumber:      agent?.agent_number ?? null,
-        amount,
-        percentage:       pct,
-        profit,
-        agentShare,
+        amount, percentage: pct, profit, agentShare,
         mpesaRef:         p.mpesa_ref ?? null,
         paidAt:           p.paid_at,
         disbursed:        !!p.disbursed,
@@ -1499,30 +1483,21 @@ router.get('/accounting/transactions', authenticateSuperadmin, async (req, res) 
 
 router.post('/accounting/transactions/:id/disburse', authenticateSuperadmin, async (req, res) => {
   const { id } = req.params;
-  if (!id || typeof id !== 'string' || id.length > 100) {
-    return res.status(422).json({ success: false, message: 'Invalid transaction id' });
-  }
+  if (!id) return res.status(422).json({ success: false, message: 'Invalid transaction id' });
   try {
     const { data: payment, error: fetchErr } = await supabase
       .from('payments')
       .select('id, status, disbursed, amount_kes, package:packages(name, profit_percentage)')
       .eq('id', id)
       .single();
-
     if (fetchErr || !payment) return res.status(404).json({ success: false, message: 'Transaction not found' });
-    if (payment.status !== 'SUCCESS') return res.status(422).json({ success: false, message: 'Payment is not successful – cannot disburse' });
-    if (payment.disbursed) return res.status(409).json({ success: false, message: 'Funds already disbursed for this transaction' });
+    if (payment.status !== 'SUCCESS') return res.status(422).json({ success: false, message: 'Payment is not successful' });
+    if (payment.disbursed) return res.status(409).json({ success: false, message: 'Already disbursed' });
 
     const { error: updateErr } = await supabase
       .from('payments')
-      .update({
-        disbursed:    true,
-        disbursed_at: new Date().toISOString(),
-        disbursed_by: String(req.superadmin.id),
-      })
-      .eq('id', id)
-      .eq('disbursed', false);
-
+      .update({ disbursed: true, disbursed_at: new Date().toISOString(), disbursed_by: String(req.superadmin.id) })
+      .eq('id', id).eq('disbursed', false);
     if (updateErr) throw updateErr;
 
     const DEFAULT_PROFIT_PERCENTAGE = Number(process.env.PLATFORM_PROFIT_PERCENTAGE ?? 10);
@@ -1531,9 +1506,7 @@ router.post('/accounting/transactions/:id/disburse', authenticateSuperadmin, asy
     const agentShare = amount - (amount * pct) / 100;
 
     await logAuditAction(req.superadmin.id, 'DISBURSE_TRANSACTION', 'transaction', id,
-      `Disbursed KES ${agentShare.toLocaleString()} to agent. Package: ${payment.package?.name ?? id}`,
-      'success', '', req);
-
+      `Disbursed KES ${agentShare.toLocaleString()} to agent`, 'success', '', req);
     res.json({ success: true, message: 'Transaction marked as disbursed', data: { id, disbursedAt: new Date().toISOString(), agentShare } });
   } catch (err) {
     console.error('[accounting] Disburse error:', err);
@@ -1545,19 +1518,16 @@ router.get('/accounting/transactions/:id/receipt', authenticateSuperadmin, async
   const { id } = req.params;
   const inline  = req.query.inline === '1';
   if (!id) return res.status(422).json({ success: false, message: 'Missing transaction id' });
-
   try {
     const { data: payment, error: fetchErr } = await supabase
       .from('payments')
       .select(`
         id, amount_kes, status, paid_at, disbursed, disbursed_at, mpesa_ref,
-        package:packages(id, name, type, profit_percentage,
+        package:packages(id, name, profit_percentage,
           agent:profiles!packages_created_by_fkey(first_name, last_name, email, agent_number)),
         client:profiles!payments_user_id_fkey(first_name, last_name, email)
       `)
-      .eq('id', id)
-      .single();
-
+      .eq('id', id).single();
     if (fetchErr || !payment) return res.status(404).json({ success: false, message: 'Transaction not found' });
 
     const DEFAULT_PROFIT_PERCENTAGE = Number(process.env.PLATFORM_PROFIT_PERCENTAGE ?? 10);
@@ -1567,26 +1537,25 @@ router.get('/accounting/transactions/:id/receipt', authenticateSuperadmin, async
     const agentShare = amount - profit;
     const agentProfile  = payment.package?.agent;
     const clientProfile = payment.client;
-    const agentName     = agentProfile  ? `${agentProfile.first_name} ${agentProfile.last_name}`.trim()  : '—';
-    const clientName    = clientProfile ? `${clientProfile.first_name} ${clientProfile.last_name}`.trim() : '—';
+    const agentName     = agentProfile  ? `${agentProfile.first_name} ${agentProfile.last_name}`.trim()  : '\u2014';
+    const clientName    = clientProfile ? `${clientProfile.first_name} ${clientProfile.last_name}`.trim() : '\u2014';
 
     const doc = new PDFDocument({ size: 'A4', margin: 60, bufferPages: true });
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `${inline ? 'inline' : 'attachment'}; filename="receipt-${id}.pdf"`);
-    res.setHeader('X-Content-Type-Options', 'nosniff');
     doc.pipe(res);
 
     doc.rect(0, 0, doc.page.width, 100).fill('#0F172A');
     doc.fill('#FFFFFF').fontSize(22).font('Helvetica-Bold').text('UMRAH MARKET', 60, 30);
     doc.fontSize(9).font('Helvetica').fill('#94A3B8').text('Official Agent Disbursement Receipt', 60, 58);
     doc.fill('#FFFFFF').fontSize(9)
-      .text(`Receipt #${id.slice(0, 8).toUpperCase()}`, doc.page.width - 180, 35, { width: 120, align: 'right' })
+      .text(`Receipt #${id.slice(0,8).toUpperCase()}`, doc.page.width - 180, 35, { width: 120, align: 'right' })
       .text(new Date().toLocaleDateString('en-KE', { day: '2-digit', month: 'long', year: 'numeric' }), doc.page.width - 180, 52, { width: 120, align: 'right' });
 
     const bannerColor = payment.disbursed ? '#DCFCE7' : '#FEF3C7';
     const bannerText  = payment.disbursed
-      ? `✓  Funds Disbursed on ${payment.disbursed_at ? new Date(payment.disbursed_at).toLocaleDateString('en-KE') : '—'}`
-      : '⏳  Disbursement Pending – Agent Has NOT Yet Received Funds';
+      ? `Funds Disbursed on ${payment.disbursed_at ? new Date(payment.disbursed_at).toLocaleDateString('en-KE') : '\u2014'}`
+      : 'Disbursement Pending - Agent Has NOT Yet Received Funds';
     doc.rect(60, 115, doc.page.width - 120, 32).fill(bannerColor);
     doc.fontSize(9).font('Helvetica-Bold').fill(payment.disbursed ? '#166534' : '#92400E')
       .text(bannerText, 72, 124, { width: doc.page.width - 144 });
@@ -1595,30 +1564,30 @@ router.get('/accounting/transactions/:id/receipt', authenticateSuperadmin, async
     let y = 168;
     const field = (label, value, x, yPos) => {
       doc.fontSize(8).font('Helvetica').fill('#64748B').text(label, x, yPos);
-      doc.fontSize(9).font('Helvetica-Bold').fill('#0F172A').text(String(value ?? '—'), x, yPos + 13, { width: 185 });
+      doc.fontSize(9).font('Helvetica-Bold').fill('#0F172A').text(String(value ?? '\u2014'), x, yPos + 13, { width: 185 });
       return yPos + 32;
     };
     doc.fontSize(7).font('Helvetica-Bold').fill('#64748B').text('CLIENT DETAILS', col1, y, { characterSpacing: 0.8 });
     doc.moveTo(col1, y + 12).lineTo(col1 + 180, y + 12).stroke('#E2E8F0');
     let y1 = y + 18;
     y1 = field('Full Name', clientName, col1, y1);
-    y1 = field('Email', clientProfile?.email ?? '—', col1, y1);
-    y1 = field('Package', payment.package?.name ?? '—', col1, y1);
+    y1 = field('Email', clientProfile?.email ?? '\u2014', col1, y1);
+    y1 = field('Package', payment.package?.name ?? '\u2014', col1, y1);
 
     doc.fontSize(7).font('Helvetica-Bold').fill('#64748B').text('AGENT DETAILS', col2, y, { characterSpacing: 0.8 });
     doc.moveTo(col2, y + 12).lineTo(col2 + 180, y + 12).stroke('#E2E8F0');
     let y2 = y + 18;
     y2 = field('Full Name', agentName, col2, y2);
-    y2 = field('Email', agentProfile?.email ?? '—', col2, y2);
-    y2 = field('Agent No.', agentProfile?.agent_number ?? '—', col2, y2);
+    y2 = field('Email', agentProfile?.email ?? '\u2014', col2, y2);
+    y2 = field('Agent No.', agentProfile?.agent_number ?? '\u2014', col2, y2);
 
     const tableTop = Math.max(y1, y2) + 20;
     doc.rect(col1, tableTop, doc.page.width - 120, 22).fill('#F8FAFC');
     doc.fontSize(8).font('Helvetica-Bold').fill('#475569').text('FINANCIAL BREAKDOWN', col1 + 8, tableTop + 7);
     const rows = [
-      { label: 'Package Revenue (Client Paid)', value: `KES ${amount.toLocaleString('en-KE', { minimumFractionDigits: 2 })}`, bold: false },
-      { label: `Platform Fee (${pct}%)`,         value: `KES ${profit.toLocaleString('en-KE',  { minimumFractionDigits: 2 })}`, bold: false },
-      { label: 'Agent Disbursement',             value: `KES ${agentShare.toLocaleString('en-KE', { minimumFractionDigits: 2 })}`, bold: true },
+      { label: 'Package Revenue (Client Paid)', value: `KES ${amount.toLocaleString('en-KE', { minimumFractionDigits: 2 })}`,     bold: false },
+      { label: `Platform Fee (${pct}%)`,         value: `KES ${profit.toLocaleString('en-KE',  { minimumFractionDigits: 2 })}`,     bold: false },
+      { label: 'Agent Disbursement',             value: `KES ${agentShare.toLocaleString('en-KE', { minimumFractionDigits: 2 })}`, bold: true  },
     ];
     let ry = tableTop + 28;
     rows.forEach((row, idx) => {
@@ -1631,8 +1600,8 @@ router.get('/accounting/transactions/:id/receipt', authenticateSuperadmin, async
 
     ry += 16;
     doc.fontSize(7).font('Helvetica').fill('#94A3B8')
-      .text(`Payment Date: ${payment.paid_at ? new Date(payment.paid_at).toLocaleString('en-KE') : '—'}`, col1, ry)
-      .text(`M-Pesa Ref: ${payment.mpesa_ref ?? '—'}`, col1, ry + 14)
+      .text(`Payment Date: ${payment.paid_at ? new Date(payment.paid_at).toLocaleString('en-KE') : '\u2014'}`, col1, ry)
+      .text(`M-Pesa Ref: ${payment.mpesa_ref ?? '\u2014'}`, col1, ry + 14)
       .text(`Transaction ID: ${id}`, col1, ry + 28);
 
     const footerY = doc.page.height - 70;
@@ -1640,7 +1609,6 @@ router.get('/accounting/transactions/:id/receipt', authenticateSuperadmin, async
     doc.fontSize(7.5).font('Helvetica').fill('#94A3B8')
       .text('This receipt is system-generated by Umrah Market and does not require a signature.', 60, footerY + 8, { align: 'center', width: doc.page.width - 120 })
       .text(`Generated by Superadmin on ${new Date().toLocaleString('en-KE')}`, 60, footerY + 22, { align: 'center', width: doc.page.width - 120 });
-
     doc.end();
 
     supabase.from('payments').update({ receipt_generated: true }).eq('id', id).then(() => {}).catch(() => {});
@@ -1654,11 +1622,8 @@ router.get('/accounting/transactions/:id/receipt', authenticateSuperadmin, async
 router.post('/accounting/transactions/:id/email', authenticateSuperadmin, async (req, res) => {
   const { id } = req.params;
   if (!id) return res.status(422).json({ success: false, message: 'Missing transaction id' });
-
-  if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
-    return res.status(501).json({ success: false, message: 'Email service is not configured on this server' });
-  }
-
+  if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS)
+    return res.status(501).json({ success: false, message: 'Email service not configured on this server' });
   try {
     const { data: payment, error: fetchErr } = await supabase
       .from('payments')
@@ -1668,63 +1633,56 @@ router.post('/accounting/transactions/:id/email', authenticateSuperadmin, async 
           agent:profiles!packages_created_by_fkey(first_name, last_name, email)),
         client:profiles!payments_user_id_fkey(first_name, last_name, email)
       `)
-      .eq('id', id)
-      .single();
-
+      .eq('id', id).single();
     if (fetchErr || !payment) return res.status(404).json({ success: false, message: 'Transaction not found' });
 
     const recipient = (req.body.email || payment.package?.agent?.email || payment.client?.email || '').trim();
-    if (!recipient || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipient)) {
+    if (!recipient || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipient))
       return res.status(422).json({ success: false, message: 'No valid recipient email provided' });
-    }
 
     const DEFAULT_PROFIT_PERCENTAGE = Number(process.env.PLATFORM_PROFIT_PERCENTAGE ?? 10);
     const pdfBuffer = await new Promise((resolve, reject) => {
-      const doc    = new PDFDocument({ size: 'A4', margin: 60 });
+      const doc = new PDFDocument({ size: 'A4', margin: 60 });
       const chunks = [];
-      doc.on('data',  c  => chunks.push(c));
-      doc.on('end',   () => resolve(Buffer.concat(chunks)));
+      doc.on('data', c => chunks.push(c));
+      doc.on('end',  () => resolve(Buffer.concat(chunks)));
       doc.on('error', reject);
-
       const amount     = Number(payment.amount_kes ?? 0);
       const pct        = Number(payment.package?.profit_percentage ?? DEFAULT_PROFIT_PERCENTAGE);
       const profit     = (amount * pct) / 100;
       const agentShare = amount - profit;
-      const clientName = payment.client  ? `${payment.client.first_name} ${payment.client.last_name}`.trim()           : '—';
-      const agentName  = payment.package?.agent ? `${payment.package.agent.first_name} ${payment.package.agent.last_name}`.trim() : '—';
-
+      const clientName = payment.client       ? `${payment.client.first_name} ${payment.client.last_name}`.trim()               : '\u2014';
+      const agentName  = payment.package?.agent ? `${payment.package.agent.first_name} ${payment.package.agent.last_name}`.trim() : '\u2014';
       doc.rect(0, 0, doc.page.width, 100).fill('#0F172A');
       doc.fill('#FFFFFF').fontSize(22).font('Helvetica-Bold').text('UMRAH MARKET', 60, 30);
       doc.fontSize(9).font('Helvetica').fill('#94A3B8').text('Agent Disbursement Receipt', 60, 58);
       doc.fill('#000000').fontSize(11).font('Helvetica').moveDown(6);
-      doc.text(`Receipt ID:   ${id.slice(0, 8).toUpperCase()}`, 60, 120);
-      doc.text(`Package:      ${payment.package?.name ?? '—'}`, 60, 140);
+      doc.text(`Receipt ID:   ${id.slice(0,8).toUpperCase()}`, 60, 120);
+      doc.text(`Package:      ${payment.package?.name ?? '\u2014'}`, 60, 140);
       doc.text(`Client:       ${clientName}`, 60, 160);
       doc.text(`Agent:        ${agentName}`, 60, 180);
-      doc.text(`Payment Date: ${payment.paid_at ? new Date(payment.paid_at).toLocaleDateString('en-KE') : '—'}`, 60, 200);
+      doc.text(`Payment Date: ${payment.paid_at ? new Date(payment.paid_at).toLocaleDateString('en-KE') : '\u2014'}`, 60, 200);
       doc.moveTo(60, 230).lineTo(535, 230).stroke('#E2E8F0');
-      doc.text(`Revenue (Client Paid): KES ${amount.toLocaleString('en-KE', { minimumFractionDigits: 2 })}`, 60, 245);
-      doc.text(`Platform Fee (${pct}%):  KES ${profit.toLocaleString('en-KE',  { minimumFractionDigits: 2 })}`, 60, 265);
-      doc.font('Helvetica-Bold').text(`Agent Disbursement:    KES ${agentShare.toLocaleString('en-KE', { minimumFractionDigits: 2 })}`, 60, 285);
+      doc.text(`Revenue:           KES ${amount.toLocaleString('en-KE', { minimumFractionDigits: 2 })}`, 60, 245);
+      doc.text(`Platform Fee(${pct}%): KES ${profit.toLocaleString('en-KE',  { minimumFractionDigits: 2 })}`, 60, 265);
+      doc.font('Helvetica-Bold').text(`Agent Disbursement: KES ${agentShare.toLocaleString('en-KE', { minimumFractionDigits: 2 })}`, 60, 285);
       doc.font('Helvetica').fontSize(9).fill('#64748B')
-        .text(payment.disbursed ? '✓ Funds have been disbursed to this agent.' : '⏳ Disbursement is still pending.', 60, 320);
+        .text(payment.disbursed ? 'Funds have been disbursed to this agent.' : 'Disbursement is still pending.', 60, 320);
       doc.end();
     });
 
     const nodemailer = await import('nodemailer');
     const transporter = nodemailer.default.createTransport({
-      host:   process.env.SMTP_HOST,
-      port:   Number(process.env.SMTP_PORT ?? 587),
+      host: process.env.SMTP_HOST, port: Number(process.env.SMTP_PORT ?? 587),
       secure: process.env.SMTP_SECURE === 'true',
-      auth:   { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
     });
-
     await transporter.sendMail({
-      from:        process.env.SMTP_FROM || process.env.SMTP_USER,
-      to:          recipient,
-      subject:     `Umrah Market – Receipt for Transaction ${id.slice(0, 8).toUpperCase()}`,
-      text:        `Dear ${recipient},\n\nPlease find attached your receipt for transaction ${id.slice(0, 8).toUpperCase()}.\n\nThank you for partnering with Umrah Market.`,
-      attachments: [{ filename: `receipt-${id.slice(0, 8)}.pdf`, content: pdfBuffer }],
+      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      to: recipient,
+      subject: `Umrah Market - Receipt for Transaction ${id.slice(0,8).toUpperCase()}`,
+      text: `Dear ${recipient},\n\nPlease find attached your receipt for transaction ${id.slice(0,8).toUpperCase()}.\n\nThank you for partnering with Umrah Market.`,
+      attachments: [{ filename: `receipt-${id.slice(0,8)}.pdf`, content: pdfBuffer }],
     });
 
     await supabase.from('payments').update({ receipt_generated: true }).eq('id', id);
