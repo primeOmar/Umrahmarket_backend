@@ -220,8 +220,7 @@ router.get('/transactions', authenticateSuperadmin, async (req, res) => {
         disbursed_by,
         receipt_generated,
         package:packages(id, name, price, profit_percentage, created_by,
-          agent:profiles!packages_created_by_fkey(id, first_name, last_name, email, agent_number)),
-        client:profiles!payments_user_id_fkey(id, first_name, last_name, email)
+          agent:profiles!packages_created_by_fkey(id, first_name, last_name, email, agent_number))
       `)
       .eq('status', 'SUCCESS')
       .order('paid_at', { ascending: false })
@@ -235,6 +234,19 @@ router.get('/transactions', authenticateSuperadmin, async (req, res) => {
     const { data: payments, error, count } = await query;
     if (error) throw error;
 
+    // ── Fetch client profiles separately (payments.user_id -> profiles) ────
+    const userIds = [...new Set((payments || []).map(p => p.user_id).filter(Boolean))];
+    let clientMap = new Map();
+    if (userIds.length > 0) {
+      const { data: clients, error: clientErr } = await supabase
+        .from('profiles')
+        .select('id, first_name, last_name, email')
+        .in('id', userIds);
+      if (!clientErr && clients) {
+        clientMap = new Map(clients.map(c => [c.id, c]));
+      }
+    }
+
     // ── Shape results ──────────────────────────────────────────────────────
     const results = (payments ?? [])
       .map(p => {
@@ -242,23 +254,18 @@ router.get('/transactions', authenticateSuperadmin, async (req, res) => {
         const pct        = Number(p.package?.profit_percentage ?? DEFAULT_PROFIT_PERCENTAGE);
         const profit     = Math.round((amount * pct) / 100 * 100) / 100;
         const agentShare = Math.round((amount - profit) * 100) / 100;
-
+        const client     = clientMap.get(p.user_id);
         const agentProfile  = p.package?.agent;
-        const clientProfile = p.client;
 
         return {
           id:           p.id,
           packageId:    p.package_id,
           packageName:  p.package?.name ?? '—',
           clientId:     p.user_id,
-          clientName:   clientProfile
-            ? `${clientProfile.first_name} ${clientProfile.last_name}`.trim()
-            : null,
-          clientEmail:  clientProfile?.email ?? null,
+          clientName:   client ? `${client.first_name} ${client.last_name}`.trim() : null,
+          clientEmail:  client?.email ?? null,
           agentId:      agentProfile?.id ?? null,
-          agentName:    agentProfile
-            ? `${agentProfile.first_name} ${agentProfile.last_name}`.trim()
-            : null,
+          agentName:    agentProfile ? `${agentProfile.first_name} ${agentProfile.last_name}`.trim() : null,
           agentEmail:   agentProfile?.email ?? null,
           agentNumber:  agentProfile?.agent_number ?? null,
           amount,
@@ -312,8 +319,7 @@ router.post('/transactions/:id/disburse', authenticateSuperadmin, async (req, re
       .from('payments')
       .select(`
         id, status, disbursed, amount_kes,
-        package:packages(name, profit_percentage),
-        client:profiles!payments_user_id_fkey(email)
+        package:packages(name, profit_percentage)
       `)
       .eq('id', id)
       .single();
@@ -388,10 +394,9 @@ router.get('/transactions/:id/receipt', authenticateSuperadmin, async (req, res)
     const { data: payment, error: fetchErr } = await supabase
       .from('payments')
       .select(`
-        id, amount_kes, status, paid_at, disbursed, disbursed_at, mpesa_ref,
+        id, user_id, amount_kes, status, paid_at, disbursed, disbursed_at, mpesa_ref,
         package:packages(id, name, type, profit_percentage,
-          agent:profiles!packages_created_by_fkey(first_name, last_name, email, agent_number)),
-        client:profiles(first_name, last_name, email)
+          agent:profiles!packages_created_by_fkey(first_name, last_name, email, agent_number))
       `)
       .eq('id', id)
       .single();
@@ -400,13 +405,23 @@ router.get('/transactions/:id/receipt', authenticateSuperadmin, async (req, res)
       return res.status(404).json({ success: false, message: 'Transaction not found' });
     }
 
+    // Fetch client profile manually
+    let clientProfile = null;
+    if (payment.user_id) {
+      const { data: clientData } = await supabase
+        .from('profiles')
+        .select('first_name, last_name, email')
+        .eq('id', payment.user_id)
+        .single();
+      clientProfile = clientData;
+    }
+
     const amount     = Number(payment.amount_kes ?? 0);
     const pct        = Number(payment.package?.profit_percentage ?? DEFAULT_PROFIT_PERCENTAGE);
     const profit     = Math.round((amount * pct) / 100 * 100) / 100;
     const agentShare = amount - profit;
 
     const agentProfile  = payment.package?.agent;
-    const clientProfile = payment.client;
     const agentName     = agentProfile ? `${agentProfile.first_name} ${agentProfile.last_name}`.trim() : '—';
     const clientName    = clientProfile ? `${clientProfile.first_name} ${clientProfile.last_name}`.trim() : '—';
 
@@ -549,10 +564,9 @@ router.post('/transactions/:id/email', authenticateSuperadmin, async (req, res) 
     const { data: payment, error: fetchErr } = await supabase
       .from('payments')
       .select(`
-        id, amount_kes, status, paid_at, disbursed, mpesa_ref,
+        id, user_id, amount_kes, status, paid_at, disbursed, mpesa_ref,
         package:packages(name, profit_percentage,
-          agent:profiles!packages_created_by_fkey(first_name, last_name, email)),
-        client:profiles(first_name, last_name, email)
+          agent:profiles!packages_created_by_fkey(first_name, last_name, email))
       `)
       .eq('id', id)
       .single();
@@ -561,7 +575,18 @@ router.post('/transactions/:id/email', authenticateSuperadmin, async (req, res) 
       return res.status(404).json({ success: false, message: 'Transaction not found' });
     }
 
-    const recipient = (req.body.email || payment.package?.agent?.email || payment.client?.email || '').trim();
+    // Fetch client profile manually
+    let clientProfile = null;
+    if (payment.user_id) {
+      const { data: clientData } = await supabase
+        .from('profiles')
+        .select('first_name, last_name, email')
+        .eq('id', payment.user_id)
+        .single();
+      clientProfile = clientData;
+    }
+
+    const recipient = (req.body.email || payment.package?.agent?.email || clientProfile?.email || '').trim();
     if (!recipient || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipient)) {
       return res.status(422).json({ success: false, message: 'No valid recipient email provided' });
     }
@@ -578,15 +603,14 @@ router.post('/transactions/:id/email', authenticateSuperadmin, async (req, res) 
       const pct        = Number(payment.package?.profit_percentage ?? DEFAULT_PROFIT_PERCENTAGE);
       const profit     = (amount * pct) / 100;
       const agentShare = amount - profit;
+      const clientName = clientProfile ? `${clientProfile.first_name} ${clientProfile.last_name}`.trim() : '—';
+      const agentName  = payment.package?.agent ? `${payment.package.agent.first_name} ${payment.package.agent.last_name}`.trim() : '—';
 
       doc.rect(0, 0, doc.page.width, 100).fill('#0F172A');
       doc.fill('#FFFFFF').fontSize(22).font('Helvetica-Bold').text('UMRAH MARKET', 60, 30);
       doc.fontSize(9).font('Helvetica').fill('#94A3B8').text('Agent Disbursement Receipt', 60, 58);
 
       doc.fill('#000000').fontSize(11).font('Helvetica').moveDown(6);
-      const clientName = payment.client ? `${payment.client.first_name} ${payment.client.last_name}`.trim() : '—';
-      const agentName  = payment.package?.agent ? `${payment.package.agent.first_name} ${payment.package.agent.last_name}`.trim() : '—';
-
       doc.text(`Receipt ID:   ${id.slice(0, 8).toUpperCase()}`, 60, 120);
       doc.text(`Package:      ${payment.package?.name ?? '—'}`, 60, 140);
       doc.text(`Client:       ${clientName}`, 60, 160);
@@ -643,15 +667,27 @@ router.get('/export', authenticateSuperadmin, async (req, res) => {
     const { data: payments, error } = await supabase
       .from('payments')
       .select(`
-        id, amount_kes, status, paid_at, disbursed, disbursed_at, mpesa_ref,
+        id, user_id, amount_kes, status, paid_at, disbursed, disbursed_at, mpesa_ref,
         package:packages(name, profit_percentage,
-          agent:profiles!packages_created_by_fkey(first_name, last_name, email, agent_number)),
-        client:profiles(first_name, last_name, email)
+          agent:profiles!packages_created_by_fkey(first_name, last_name, email, agent_number))
       `)
       .eq('status', 'SUCCESS')
       .order('paid_at', { ascending: false });
 
     if (error) throw error;
+
+    // Fetch client profiles manually
+    const userIds = [...new Set((payments || []).map(p => p.user_id).filter(Boolean))];
+    let clientMap = new Map();
+    if (userIds.length > 0) {
+      const { data: clients, error: clientErr } = await supabase
+        .from('profiles')
+        .select('id, first_name, last_name, email')
+        .in('id', userIds);
+      if (!clientErr && clients) {
+        clientMap = new Map(clients.map(c => [c.id, c]));
+      }
+    }
 
     const csvCell = (v) => {
       if (v == null) return '';
@@ -672,7 +708,7 @@ router.get('/export', authenticateSuperadmin, async (req, res) => {
       const pct        = Number(p.package?.profit_percentage ?? DEFAULT_PROFIT_PERCENTAGE);
       const profit     = Math.round((amount * pct) / 100 * 100) / 100;
       const agentShare = amount - profit;
-      const client     = p.client;
+      const client     = clientMap.get(p.user_id);
       const agent      = p.package?.agent;
       return {
         transaction_id:  p.id,
