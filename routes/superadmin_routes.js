@@ -1431,7 +1431,7 @@ router.get('/accounting/transactions', authenticateSuperadmin, async (req, res) 
         paid_at, created_at, disbursed, disbursed_at, disbursed_by, receipt_generated,
         package:packages(id, name, price, profit_percentage, created_by,
           agent:profiles!packages_created_by_fkey(id, first_name, last_name, email, agent_number)),
-        client:profiles!payments_user_id_fkey(id, first_name, last_name, email)
+        client:profiles(first_name, last_name, email)
       `)
       .eq('status', 'SUCCESS')
       .order('paid_at', { ascending: false })
@@ -1525,7 +1525,7 @@ router.get('/accounting/transactions/:id/receipt', authenticateSuperadmin, async
         id, amount_kes, status, paid_at, disbursed, disbursed_at, mpesa_ref,
         package:packages(id, name, profit_percentage,
           agent:profiles!packages_created_by_fkey(first_name, last_name, email, agent_number)),
-        client:profiles!payments_user_id_fkey(first_name, last_name, email)
+        client:profiles(first_name, last_name, email)
       `)
       .eq('id', id).single();
     if (fetchErr || !payment) return res.status(404).json({ success: false, message: 'Transaction not found' });
@@ -1631,7 +1631,7 @@ router.post('/accounting/transactions/:id/email', authenticateSuperadmin, async 
         id, amount_kes, status, paid_at, disbursed, mpesa_ref,
         package:packages(name, profit_percentage,
           agent:profiles!packages_created_by_fkey(first_name, last_name, email)),
-        client:profiles!payments_user_id_fkey(first_name, last_name, email)
+        client:profiles(first_name, last_name, email)
       `)
       .eq('id', id).single();
     if (fetchErr || !payment) return res.status(404).json({ success: false, message: 'Transaction not found' });
