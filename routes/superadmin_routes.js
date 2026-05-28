@@ -8,6 +8,10 @@ import {
   loginRateLimiter, validateEmail, sanitizeInput, AUDIT_ACTIONS,
 } from '../utils/securityUtils.js';
 
+import Payment from '../models/Payment.js';
+import Booking from '../models/Booking.js';
+import PDFDocument from 'pdfkit';
+
 const R2 = new S3Client({
   region: 'auto',
   endpoint: `https://${process.env.CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com`,
@@ -1408,6 +1412,218 @@ router.post('/dashboards/close', authenticateSuperadmin, async (req, res) => {
     res.status(500).json({ success: false, message: 'Failed to close dashboard' });
   }
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ACCOUNTING ENDPOINTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.get('/accounting/transactions', authenticateSuperadmin, async (req, res) => {
+  try {
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 1000);
+    const offset = Math.max(parseInt(req.query.offset) || 0, 0);
+
+    // Query successful payments from Payments (Mongo)
+    const payments = await Payment.find({ status: 'SUCCESS' })
+      .sort({ paidAt: -1 })
+      .skip(offset)
+      .limit(limit)
+      .lean()
+      .exec();
+
+    const results = [];
+
+    for (const p of payments) {
+      // Find booking linked to this payment (if any)
+      const booking = await Booking.findOne({ paymentId: p._id }).lean().exec();
+
+      // Try to fetch package info from Supabase (if booking exists and packageId present)
+      let packageInfo = null;
+      let percentage = 0;
+      if (booking && booking.packageId) {
+        try {
+          const { data: pkg, error: pkgErr } = await supabase.from('packages').select('*').eq('id', String(booking.packageId)).maybeSingle();
+          if (!pkgErr && pkg) packageInfo = pkg;
+        } catch (err) { /* ignore */ }
+      }
+
+      if (packageInfo) {
+        percentage = Number(packageInfo.profit_percentage || packageInfo.agent_percentage || packageInfo.commission_percent || packageInfo.percentage || 0) || 0;
+      }
+
+      const profit = (Number(p.amountKes) || 0) * (percentage / 100);
+
+      // Fetch agent and client names from Supabase when possible
+      let agentName = null; let agentEmail = null; let clientName = null; let clientEmail = null;
+      try {
+        if (booking && booking.packageId && packageInfo && packageInfo.created_by) {
+          const { data: agentProfile } = await supabase.from('profiles').select('first_name,last_name,email').eq('id', packageInfo.created_by).maybeSingle();
+          if (agentProfile) {
+            agentName = `${agentProfile.first_name || ''} ${agentProfile.last_name || ''}`.trim() || agentProfile.email;
+            agentEmail = agentProfile.email;
+          }
+        }
+        if (booking && booking.userId) {
+          const { data: clientProfile } = await supabase.from('profiles').select('first_name,last_name,email').eq('id', String(booking.userId)).maybeSingle();
+          if (clientProfile) {
+            clientName = `${clientProfile.first_name || ''} ${clientProfile.last_name || ''}`.trim() || clientProfile.email;
+            clientEmail = clientProfile.email;
+          }
+        }
+      } catch (err) { /* ignore profile lookup failures */ }
+
+      results.push({
+        id: String(p._id),
+        packageId: booking?.packageId || p.packageId || null,
+        packageName: packageInfo?.name || p.packageName || null,
+        clientId: booking?.userId || p.userId || null,
+        clientName: clientName || p.clientName || null,
+        clientEmail: clientEmail || p.clientEmail || null,
+        agentName: agentName || p.agentName || null,
+        agentEmail: agentEmail || p.agentEmail || null,
+        amount: p.amountKes,
+        percentage,
+        profit,
+        paidAt: p.paidAt || p.createdAt || p.updatedAt || null,
+        disbursed: !!p.disbursed,
+      });
+    }
+
+    res.json({ success: true, data: results });
+  } catch (err) {
+    console.error('Accounting transactions error:', err);
+    res.status(500).json({ success: false, message: 'Failed to fetch transactions' });
+  }
+});
+
+router.post('/accounting/transactions/:id/disburse', authenticateSuperadmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!id) return res.status(422).json({ success: false, message: 'Missing transaction id' });
+
+    const payment = await Payment.findById(id).exec();
+    if (!payment) return res.status(404).json({ success: false, message: 'Transaction not found' });
+    if (payment.disbursed) return res.status(409).json({ success: false, message: 'Already disbursed' });
+    if (payment.status !== 'SUCCESS') return res.status(422).json({ success: false, message: 'Payment not successful' });
+
+    payment.disbursed = true;
+    payment.disbursedAt = new Date();
+    payment.disbursedBy = String(req.superadmin.id);
+    await payment.save();
+
+    await logAuditAction(req.superadmin.id, 'DISBURSE_TRANSACTION', 'transaction', id, `Disbursed by superadmin ${req.superadmin.id}`, 'success', '', req);
+
+    res.json({ success: true, message: 'Marked as disbursed' });
+  } catch (err) {
+    console.error('Disburse error:', err);
+    res.status(500).json({ success: false, message: 'Failed to disburse transaction' });
+  }
+});
+
+router.get('/accounting/transactions/:id/receipt', authenticateSuperadmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!id) return res.status(422).json({ success: false, message: 'Missing transaction id' });
+
+    const payment = await Payment.findById(id).lean().exec();
+    if (!payment) return res.status(404).json({ success: false, message: 'Transaction not found' });
+
+    // Minimal receipt PDF
+    const doc = new PDFDocument({ size: 'A4', margin: 50 });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="receipt-${id}.pdf"`);
+
+    doc.info.Title = `Receipt - ${id}`;
+
+    doc.fontSize(20).text('Umrah Market - Receipt', { align: 'center' });
+    doc.moveDown();
+
+    doc.fontSize(12).text(`Receipt ID: ${id}`);
+    doc.text(`Amount: KES ${Number(payment.amountKes).toLocaleString()}`);
+    doc.text(`Status: ${payment.status}`);
+    doc.text(`Paid At: ${payment.paidAt ? new Date(payment.paidAt).toISOString() : ''}`);
+    doc.moveDown();
+
+    doc.text('Thank you for using Umrah Market.', { align: 'left' });
+    doc.end();
+
+    // Pipe PDF to response
+    doc.pipe(res);
+
+    // Mark receipt as generated (async)
+    Payment.findByIdAndUpdate(id, { receiptGenerated: true }).then(() => {}).catch(() => {});
+  } catch (err) {
+    console.error('Receipt error:', err);
+    res.status(500).json({ success: false, message: 'Failed to generate receipt' });
+  }
+});
+
+
+// Email receipt endpoint
+router.post('/accounting/transactions/:id/email', authenticateSuperadmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!id) return res.status(422).json({ success: false, message: 'Missing transaction id' });
+
+    const payment = await Payment.findById(id).lean().exec();
+    if (!payment) return res.status(404).json({ success: false, message: 'Transaction not found' });
+
+    const recipient = req.body.email || payment.payerEmail || null;
+    if (!recipient) return res.status(422).json({ success: false, message: 'No recipient email available' });
+
+    // Require SMTP config
+    if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
+      return res.status(501).json({ success: false, message: 'Email service not configured on server' });
+    }
+
+    // Generate PDF in memory
+    const doc = new PDFDocument({ size: 'A4', margin: 50 });
+    const chunks = [];
+    doc.on('data', (c) => chunks.push(c));
+    doc.on('end', async () => {
+      const pdfBuffer = Buffer.concat(chunks);
+
+      // Send email using nodemailer
+      try {
+        const nodemailer = await import('nodemailer');
+        const transporter = nodemailer.createTransport({
+          host: process.env.SMTP_HOST,
+          port: Number(process.env.SMTP_PORT || 587),
+          secure: String(process.env.SMTP_SECURE || 'false') === 'true',
+          auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+        });
+
+        await transporter.sendMail({
+          from: process.env.SMTP_FROM || process.env.SMTP_USER,
+          to: recipient,
+          subject: `Receipt for transaction ${id}`,
+          text: `Please find attached the receipt for transaction ${id}.`,
+          attachments: [{ filename: `receipt-${id}.pdf`, content: pdfBuffer }],
+        });
+
+        // mark as receiptGenerated
+        await Payment.findByIdAndUpdate(id, { receiptGenerated: true }).exec();
+        await logAuditAction(req.superadmin.id, 'EMAIL_RECEIPT', 'transaction', id, `Emailed receipt to ${recipient}`, 'success', '', req);
+        return res.json({ success: true, message: 'Email sent' });
+      } catch (mailErr) {
+        console.error('Mail send failed:', mailErr);
+        return res.status(500).json({ success: false, message: 'Failed to send email' });
+      }
+    });
+
+    // Build simple receipt
+    doc.fontSize(18).text('Umrah Market Receipt', { align: 'center' });
+    doc.moveDown();
+    doc.fontSize(12).text(`Receipt ID: ${id}`);
+    doc.text(`Amount: KES ${Number(payment.amountKes).toLocaleString()}`);
+    doc.text(`Status: ${payment.status}`);
+    doc.text(`Paid At: ${payment.paidAt ? new Date(payment.paidAt).toISOString() : ''}`);
+    doc.end();
+  } catch (err) {
+    console.error('Email receipt error:', err);
+    res.status(500).json({ success: false, message: 'Failed to email receipt' });
+  }
+});
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DATA EXPORT

@@ -69,6 +69,22 @@ const PaymentSchema = new mongoose.Schema(
     paidAt: {
       type: Date,
     },
+    // Accounting/disbursement tracking
+    disbursed: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+    disbursedAt: {
+      type: Date,
+    },
+    disbursedBy: {
+      type: String,
+    },
+    receiptGenerated: {
+      type: Boolean,
+      default: false,
+    },
   },
   {
     timestamps: true,   // createdAt + updatedAt
