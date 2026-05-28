@@ -1424,14 +1424,16 @@ router.get('/accounting/transactions', authenticateSuperadmin, async (req, res) 
     const to     = req.query.to;
     const DEFAULT_PROFIT_PERCENTAGE = Number(process.env.PLATFORM_PROFIT_PERCENTAGE ?? 10);
 
+    // NOTE: payments.user_id → auth.users(id), NOT public.profiles.
+    // PostgREST cannot resolve a direct join from payments to profiles.
+    // Fetch client profiles in a separate query using the collected user_ids.
     let query = supabase
       .from('payments')
       .select(`
         id, user_id, package_id, amount_kes, status, phone, mpesa_ref,
         paid_at, created_at, disbursed, disbursed_at, disbursed_by, receipt_generated,
         package:packages(id, name, price, profit_percentage, created_by,
-          agent:profiles!packages_created_by_fkey(id, first_name, last_name, email, agent_number)),
-        client:profiles(first_name, last_name, email)
+          agent:profiles!packages_created_by_fkey(id, first_name, last_name, email, agent_number))
       `)
       .eq('status', 'SUCCESS')
       .order('paid_at', { ascending: false })
@@ -1445,13 +1447,26 @@ router.get('/accounting/transactions', authenticateSuperadmin, async (req, res) 
     const { data: payments, error } = await query;
     if (error) throw error;
 
+    // Fetch client profiles separately (no direct FK from payments → profiles)
+    const userIds = [...new Set((payments || []).map(p => p.user_id).filter(Boolean))];
+    let clientMap = new Map();
+    if (userIds.length > 0) {
+      const { data: clients, error: clientErr } = await supabase
+        .from('profiles')
+        .select('id, first_name, last_name, email')
+        .in('id', userIds);
+      if (!clientErr && clients) {
+        clientMap = new Map(clients.map(c => [c.id, c]));
+      }
+    }
+
     const results = (payments ?? []).map(p => {
       const amount     = Number(p.amount_kes ?? 0);
       const pct        = Number(p.package?.profit_percentage ?? DEFAULT_PROFIT_PERCENTAGE);
       const profit     = Math.round((amount * pct) / 100 * 100) / 100;
       const agentShare = Math.round((amount - profit) * 100) / 100;
       const agent      = p.package?.agent;
-      const client     = p.client;
+      const client     = clientMap.get(p.user_id) ?? null;
       return {
         id:               p.id,
         packageId:        p.package_id,
