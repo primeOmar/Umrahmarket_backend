@@ -14,6 +14,7 @@
  *     flagged for manual review and the user may proceed to payment.
  */
 import { supabaseAdmin } from '../config/supabase.js';
+import config from '../config/security.config.js';
 import logger from '../config/logger.js';
 import { extractPassport, compareWithInput } from '../lib/passportOcr.js';
 import { uploadPassportBuffer } from '../middleware/uploads/PassportUpload.js';
@@ -122,6 +123,11 @@ export const verifyPassportImage = async (req, res) => {
       return res.status(400).json({ success: false, error: 'Passport image is required.' });
     }
 
+    logger.info('Starting passport verification', {
+      userId, packageId, passportNumber: `${passportNumber.substring(0, 3)}***`,
+      fileSize: req.passportFile.buffer.length,
+    });
+
     // Don't re-verify an already-verified passport for this package.
     const { data: existing } = await supabaseAdmin
       .from('passport_verifications')
@@ -131,6 +137,7 @@ export const verifyPassportImage = async (req, res) => {
       .maybeSingle();
 
     if (existing?.verification_status === 'verified') {
+      logger.info('Passport already verified for this package', { userId, packageId });
       return res.json({
         success: true, status: 'verified', verified: true, canProceed: true,
         message: 'Passport already verified for this package.',
@@ -141,6 +148,9 @@ export const verifyPassportImage = async (req, res) => {
     const { travelDate, minExpiry } = await resolveTravelWindow(packageId);
     const validity = evaluateExpiry(passportExpiry, travelDate, minExpiry);
     if (!validity.valid) {
+      logger.info('Passport expiry check failed', {
+        userId, packageId, reason: validity.reason, passportExpiry,
+      });
       await upsertVerification({
         userId, packageId, status: 'expired_passport', verified: false,
         input: { passportNumber, passportCountry, passportExpiry, surname, givenNames, dateOfBirth, nationality },
@@ -154,13 +164,27 @@ export const verifyPassportImage = async (req, res) => {
     }
 
     // 2) OCR the photo and compare against the typed details.
+    logger.info('Starting OCR extraction', { userId, packageId, bufferSize: req.passportFile.buffer.length });
     const ocr = await extractPassport(req.passportFile.buffer);
     const attempts = (existing?.attempts || 0) + 1;
+
+    logger.info('OCR extraction complete', {
+      userId, packageId, ocrOk: ocr.ok, confidence: ocr.confidence,
+      mrz: ocr.mrz ? 'found' : 'not_found', reason: ocr.reason,
+    });
 
     let comparison = { score: 0, matched: false, details: {} };
     if (ocr.ok && ocr.confidence >= MIN_OCR_CONFIDENCE) {
       comparison = compareWithInput(ocr.fields, {
         passportNumber, expiry: validity.expiry, surname, givenNames, nationality,
+      });
+      logger.info('OCR comparison result', {
+        userId, packageId, score: comparison.score, matched: comparison.matched,
+        details: comparison.details,
+      });
+    } else {
+      logger.warn('OCR confidence too low or extraction failed', {
+        userId, packageId, ocrOk: ocr.ok, confidence: ocr.confidence, minRequired: MIN_OCR_CONFIDENCE,
       });
     }
 
@@ -173,6 +197,7 @@ export const verifyPassportImage = async (req, res) => {
         ext: req.passportFile.ext,
         userId, packageId, ip: req.ip,
       });
+      logger.info('Passport image uploaded to R2', { userId, packageId, key: stored.key });
     } catch (uploadError) {
       logger.warn('Passport image upload failed, continuing without stored image', {
         error: uploadError.message,
@@ -205,7 +230,7 @@ export const verifyPassportImage = async (req, res) => {
       ocr, comparison, stored, travelDate, attempts,
     });
 
-    logger.info('Passport verification attempt', {
+    logger.info('Passport verification attempt complete', {
       userId, packageId, status, attempts,
       ocrOk: ocr.ok, ocrConfidence: ocr.confidence, matchScore: comparison.score,
     });
@@ -223,6 +248,10 @@ export const verifyPassportImage = async (req, res) => {
       message,
     });
   } catch (error) {
+    const errorMessage = config.env === 'development'
+      ? error.message
+      : 'Verification failed. Please try again.';
+
     logger.error('verifyPassportImage failed', {
       error: error.message,
       stack: error.stack,
@@ -238,7 +267,7 @@ export const verifyPassportImage = async (req, res) => {
         nationality: req.body?.nationality,
       },
     });
-    return res.status(500).json({ success: false, error: 'Verification failed. Please try again.' });
+    return res.status(500).json({ success: false, error: errorMessage });
   }
 };
 

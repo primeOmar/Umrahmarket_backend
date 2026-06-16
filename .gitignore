@@ -21,6 +21,7 @@ lerna-debug.log*
 
 # Uploaded files
 temp/
+ocr-cache/
 
 # OS files
 .DS_Store
