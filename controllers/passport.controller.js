@@ -165,12 +165,22 @@ export const verifyPassportImage = async (req, res) => {
     }
 
     // 3) Always store the image (private R2) so manual reviewers have evidence.
-    const stored = await uploadPassportBuffer({
-      buffer: req.passportFile.buffer,
-      mime: req.passportFile.mime,
-      ext: req.passportFile.ext,
-      userId, packageId, ip: req.ip,
-    });
+    let stored = null;
+    try {
+      stored = await uploadPassportBuffer({
+        buffer: req.passportFile.buffer,
+        mime: req.passportFile.mime,
+        ext: req.passportFile.ext,
+        userId, packageId, ip: req.ip,
+      });
+    } catch (uploadError) {
+      logger.warn('Passport image upload failed, continuing without stored image', {
+        error: uploadError.message,
+        stack: uploadError.stack,
+        userId,
+        packageId,
+      });
+    }
 
     // 4) Decide outcome.
     const autoVerified = ocr.ok && ocr.confidence >= MIN_OCR_CONFIDENCE && comparison.matched;
@@ -213,7 +223,21 @@ export const verifyPassportImage = async (req, res) => {
       message,
     });
   } catch (error) {
-    logger.error('verifyPassportImage failed', { error: error.message, userId });
+    logger.error('verifyPassportImage failed', {
+      error: error.message,
+      stack: error.stack,
+      userId,
+      body: {
+        packageId: req.body?.packageId,
+        passportNumber: req.body?.passportNumber,
+        passportCountry: req.body?.passportCountry,
+        passportExpiry: req.body?.passportExpiry,
+        surname: req.body?.surname,
+        givenNames: req.body?.givenNames,
+        dateOfBirth: req.body?.dateOfBirth,
+        nationality: req.body?.nationality,
+      },
+    });
     return res.status(500).json({ success: false, error: 'Verification failed. Please try again.' });
   }
 };
