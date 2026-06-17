@@ -15,6 +15,7 @@ import packagesRoutes    from './routes/packages/packages.route.js';
 import favouritesRoutes from './routes/packages/favourites.route.js';
 import mpesaRoutes from './routes/mpesa.routes.js';
 import cardRoutes  from './routes/Card.routes.js';
+import accountingRoutes from './routes/agent_accounting_route.js';
 import bookingsRouter from './routes/bookings.routes.js';
 import passportRoutes from './routes/passport.routes.js';
 import messagesRoutes from './routes/messagesRoutes.js';
@@ -178,6 +179,7 @@ app.use('/api/payments/card',  cardRoutes);
 app.use('/api/bookings', bookingsRouter);
 app.use('/api/passport', passportRoutes);
 app.use('/api/superadmin', superadminRoutes);
+app.use('/api/agent_accounting', accountingRoutes);
 
 // ═══════════════════════════════════════════════════════════════════════
 // MESSAGES ROUTES WITH RATE LIMITING
