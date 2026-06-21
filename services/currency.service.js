@@ -1,11 +1,7 @@
 // services/currency.service.js
-// Fetches live USD/KES rate with 3-source fallback chain and sanity validation.
-// getUsdKesRate() returns a plain number — safe to use directly in arithmetic.
-// Source metadata available via getUsdKesRateMeta() if needed for logging.
-
-const CACHE_TTL_MS = 10 * 60 * 1000; // 10 min
-const SANITY_MIN   = 50;              // reject if below — broken API response
-const SANITY_MAX   = 300;             // reject if above — broken API response
+const CACHE_TTL_MS = 10 * 60 * 1000;
+const SANITY_MIN   = 50;
+const SANITY_MAX   = 300;
 
 let cache = { rate: null, fetchedAt: 0, source: null };
 
@@ -13,9 +9,14 @@ function isSane(rate) {
   return typeof rate === 'number' && isFinite(rate) && rate >= SANITY_MIN && rate <= SANITY_MAX;
 }
 
+function fetchWithTimeout(url, ms = 5000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  return fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer));
+}
+
 async function fetchFromOpenExchangeRates() {
-  // Free, no API key, updates hourly
-  const res  = await fetch('https://open.er-api.com/v6/latest/USD', { signal: AbortSignal.timeout(5000) });
+  const res  = await fetchWithTimeout('https://open.er-api.com/v6/latest/USD');
   const json = await res.json();
   const rate = Number(json?.rates?.KES);
   if (!isSane(rate)) throw new Error(`open.er-api bad rate: ${rate}`);
@@ -23,8 +24,7 @@ async function fetchFromOpenExchangeRates() {
 }
 
 async function fetchFromFrankfurter() {
-  // ECB data via frankfurter.app — free, no key
-  const res  = await fetch('https://api.frankfurter.app/latest?from=USD&to=KES', { signal: AbortSignal.timeout(5000) });
+  const res  = await fetchWithTimeout('https://api.frankfurter.app/latest?from=USD&to=KES');
   const json = await res.json();
   const rate = Number(json?.rates?.KES);
   if (!isSane(rate)) throw new Error(`frankfurter bad rate: ${rate}`);
@@ -32,8 +32,7 @@ async function fetchFromFrankfurter() {
 }
 
 async function fetchFromFawazahmed() {
-  // CDN-hosted currency API — free, no key, no rate limit
-  const res  = await fetch('https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json', { signal: AbortSignal.timeout(5000) });
+  const res  = await fetchWithTimeout('https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json');
   const json = await res.json();
   const rate = Number(json?.usd?.kes);
   if (!isSane(rate)) throw new Error(`fawazahmed0 bad rate: ${rate}`);
@@ -41,7 +40,6 @@ async function fetchFromFawazahmed() {
 }
 
 async function _fetchRate() {
-  // Return from cache if still fresh
   if (cache.rate && Date.now() - cache.fetchedAt < CACHE_TTL_MS) {
     return { rate: cache.rate, source: cache.source, cached: true };
   }
@@ -59,45 +57,28 @@ async function _fetchRate() {
     }
   }
 
-  // All live sources failed — use stale cache if available
   if (cache.rate) {
     const ageMin = Math.round((Date.now() - cache.fetchedAt) / 60_000);
-    console.warn(`[FX] All sources failed — using stale cache: ${cache.rate} (${ageMin}m old, source: ${cache.source})`);
+    console.warn(`[FX] All sources failed — stale cache: ${cache.rate} (${ageMin}m old)`);
     return { rate: cache.rate, source: `${cache.source}:stale`, cached: true };
   }
 
-  // No data at all
   throw new Error('USD/KES rate unavailable — all sources failed and no cache exists');
 }
 
-/**
- * Returns the live USD/KES rate as a plain number.
- * Throws if all sources fail and no cache exists.
- * Use this in controllers: const rate = await getUsdKesRate();
- */
 export async function getUsdKesRate() {
   const { rate } = await _fetchRate();
   return rate;
 }
 
-/**
- * Returns rate + metadata { rate, source, cached }.
- * Use this in the /fx/rate endpoint.
- */
 export async function getUsdKesRateMeta() {
   return _fetchRate();
 }
 
-/**
- * Convert USD amount to KES integer (what Daraja/Pesapal receives).
- */
 export function usdToKes(usdAmount, rate) {
   return Math.round(usdAmount * rate);
 }
 
-/**
- * Convert KES amount back to USD (for agent/admin display).
- */
 export function kesToUsd(kesAmount, rate) {
   return parseFloat((kesAmount / rate).toFixed(2));
 }
