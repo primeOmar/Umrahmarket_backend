@@ -1,5 +1,8 @@
 // controllers/bookings.controller.js
 import { supabaseAdmin } from '../config/supabase.js';
+import express from 'express';
+
+const router = express.Router();
 
 const recoverMissingBookings = async (userId) => {
   if (!supabaseAdmin) {
@@ -226,3 +229,9 @@ export const getMyBookings = async (req, res) => {
     return res.status(500).json({ success: false, message: 'Server error' });
   }
 };
+
+// Define routes
+router.get('/clients', getAgentClients);
+router.get('/me', getMyBookings);
+
+export default router;

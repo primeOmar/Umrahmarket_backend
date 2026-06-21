@@ -21,6 +21,7 @@ import passportRoutes from './routes/passport.routes.js';
 import messagesRoutes from './routes/messagesRoutes.js';
 import superadminRoutes from './routes/superadmin_routes.js';
 import fxRoutes from './routes/fx.routes.js';
+const router = express.Router();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
