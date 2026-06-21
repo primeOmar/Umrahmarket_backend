@@ -3,8 +3,9 @@
 import { supabaseAdmin } from '../config/supabase.js';
 import { stkPush, stkQuery } from '../services/Mpesaservice.js';
 import { createBookingMessage } from './messagesController.js';
+import { getUsdKesRate, usdToKes } from '../services/currency.service.js'; // <-- NEW
 
-const KES_RATE       = Number(process.env.KES_PER_USD) || 130;
+const KES_RATE       = Number(process.env.KES_PER_USD) || 130; // kept for backward compatibility, but now overridden by live rate
 const MPESA_PHONE_RE = /^254[17]\d{8}$/;
 function maskPhone(p) { return p ? `${p.slice(0, 6)}****${p.slice(-2)}` : '?'; }
 
@@ -12,7 +13,7 @@ function maskPhone(p) { return p ? `${p.slice(0, 6)}****${p.slice(-2)}` : '?'; }
 export const initiate = async (req, res) => {
   try {
     const userId    = req.user?.id;
-    const { packageId, phone } = req.body;
+    const { packageId, phone, currency = 'KES' } = req.body; // <-- added currency
 
     if (!userId)
       return res.status(401).json({ success: false, message: 'Unauthorised' });
@@ -49,9 +50,12 @@ export const initiate = async (req, res) => {
     }
 
     const priceUSD  = pkg.price ?? 0;
-    const amountKes = Math.ceil(Number(priceUSD) * KES_RATE);
-    if (amountKes <= 0)
+    if (priceUSD <= 0)
       return res.status(400).json({ success: false, message: 'Package has no valid price' });
+
+    // ── Get live FX rate and convert to KES ──────────────────────────────
+    const rate = await getUsdKesRate();
+    const amountKes = usdToKes(priceUSD, rate);
 
     // ── Check if user already has a confirmed booking for this package ──
     const { data: existingBooking, error: bookingErr } = await supabaseAdmin
@@ -91,7 +95,7 @@ export const initiate = async (req, res) => {
     try {
       darajaRes = await stkPush({
         phone,
-        amount:      amountKes,
+        amount:      amountKes, // <-- use converted KES amount
         accountRef:  `PKG-${packageId.slice(-6).toUpperCase()}`,
         description: 'Umrah Package',
       });
@@ -117,6 +121,9 @@ export const initiate = async (req, res) => {
         method:              'MPESA',
         status:              'PENDING',
         amount_kes:          amountKes,
+        amount_usd:          priceUSD,      // <-- store USD price for reference
+        fx_rate_used:        rate,          // <-- store the rate used
+        currency:            currency,      // <-- user's selected display currency
         phone,
         merchant_request_id: merchantRequestId ?? null,
         checkout_request_id: checkoutRequestId,
@@ -130,7 +137,7 @@ export const initiate = async (req, res) => {
       });
     }
 
-    console.info(`[M-Pesa] STK sent → ${maskPhone(phone)} | pkg: ${packageId} | checkout: ${checkoutRequestId}`);
+    console.info(`[M-Pesa] STK sent → ${maskPhone(phone)} | pkg: ${packageId} | checkout: ${checkoutRequestId} | rate: ${rate} | KES: ${amountKes}`);
     return res.json({ success: true, checkoutRequestId });
 
   } catch (err) {

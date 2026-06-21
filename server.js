@@ -20,7 +20,7 @@ import bookingsRouter from './routes/bookings.routes.js';
 import passportRoutes from './routes/passport.routes.js';
 import messagesRoutes from './routes/messagesRoutes.js';
 import superadminRoutes from './routes/superadmin_routes.js';
-
+import fxRoutes from '/routes/fx.routes.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -180,6 +180,7 @@ app.use('/api/bookings', bookingsRouter);
 app.use('/api/passport', passportRoutes);
 app.use('/api/superadmin', superadminRoutes);
 app.use('/api/agent_accounting', accountingRoutes);
+app.use('/api/fx', fxRoutes);
 
 // ═══════════════════════════════════════════════════════════════════════
 // MESSAGES ROUTES WITH RATE LIMITING

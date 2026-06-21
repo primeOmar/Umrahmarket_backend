@@ -1,7 +1,7 @@
-// controllers/cardController.js
+// controllers/Cardcontroller.js
 // ─────────────────────────────────────────────────────────────────────────────
 // Card payment via Pesapal (PCI-DSS compliant — hosted payment page).
-//
+// 
 // HOW IT WORKS (card data never touches your server):
 //   1. POST /api/payments/card/initiate  → backend gets Pesapal token,
 //      registers IPN, submits order → returns redirect_url to frontend
@@ -19,15 +19,16 @@
 //   PESAPAL_ENV               ← 'sandbox' or 'production'
 //   PESAPAL_CALLBACK_URL      ← https://umrahmarket.vercel.app/payment/callback
 //   PESAPAL_IPN_URL           ← https://umrahmarket-backend.onrender.com/api/payments/card/ipn
-//   KES_PER_USD               ← e.g. 130
+//   KES_PER_USD               ← e.g. 130  (now overridden by live rate)
 // ─────────────────────────────────────────────────────────────────────────────
 
 import axios             from 'axios';
 import crypto            from 'crypto';
 import { supabaseAdmin } from '../config/supabase.js';
 import { createBookingMessage } from './messagesController.js';
+import { getUsdKesRate, usdToKes } from '../services/currency.service.js'; // <-- NEW
 
-const KES_RATE   = Number(process.env.KES_PER_USD) || 130;
+const KES_RATE   = Number(process.env.KES_PER_USD) || 130; // kept for fallback
 const IS_SANDBOX = (process.env.PESAPAL_ENV || 'sandbox') !== 'production';
 const BASE_URL   = IS_SANDBOX
   ? 'https://cybqa.pesapal.com/pesapalv3'
@@ -59,8 +60,6 @@ async function getPesapalToken() {
 }
 
 // ── Register IPN URL once (idempotent) ───────────────────────────────────────
-// Pesapal requires you to register your IPN URL before submitting orders.
-// We cache the ipnId in memory after first registration.
 let _ipnId = null;
 
 async function getIpnId(token) {
@@ -102,14 +101,14 @@ async function queryTransaction(orderTrackingId, token) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/payments/card/initiate
-// Body: { packageId }
+// Body: { packageId, currency }
 // Auth: requireAuth
 // Returns: { redirectUrl, orderTrackingId }
 // ─────────────────────────────────────────────────────────────────────────────
 export const initiate = async (req, res) => {
   try {
     const userId     = req.user?.id;
-    const { packageId } = req.body;
+    const { packageId, currency = 'KES' } = req.body; // <-- added currency
 
     if (!userId)
       return res.status(401).json({ success: false, message: 'Unauthorised' });
@@ -142,9 +141,12 @@ export const initiate = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Package not available for booking' });
 
     const priceUSD = pkg.price ?? 0;
-    const priceKES = Math.ceil(priceUSD * KES_RATE);
-    if (priceKES <= 0)
+    if (priceUSD <= 0)
       return res.status(400).json({ success: false, message: 'Package has no valid price' });
+
+    // ── Get live FX rate and convert to KES ──────────────────────────────────
+    const rate = await getUsdKesRate();
+    const amountKes = usdToKes(priceUSD, rate);
 
     // ── Check if user already has a confirmed booking for this package ──
     const { data: existingBooking, error: bookingErr } = await supabaseAdmin
@@ -215,7 +217,7 @@ export const initiate = async (req, res) => {
     const orderPayload = {
       id:                    merchantRef,
       currency:              'KES',
-      amount:                priceKES,
+      amount:                amountKes, // <-- use converted KES amount
       description:           `Umrah Package: ${(pkg.name || '').slice(0, 100)}`,
       callback_url:          callbackUrl,
       notification_id:       ipnId,
@@ -260,7 +262,10 @@ export const initiate = async (req, res) => {
         package_id:                 packageId,
         method:                     'CARD',
         status:                     'PENDING',
-        amount_kes:                 priceKES,
+        amount_kes:                 amountKes,
+        amount_usd:                 priceUSD,        // <-- store USD price
+        fx_rate_used:               rate,            // <-- store rate used
+        currency:                   currency,        // <-- user's selected display currency
         phone:                      req.user?.phone || 'N/A',
         pesapal_merchant_ref:       merchantRef,
         pesapal_order_tracking_id:  orderRes.order_tracking_id,
@@ -272,7 +277,7 @@ export const initiate = async (req, res) => {
       return res.status(500).json({ success: false, message: 'Payment initiated but could not be recorded. Contact support.' });
     }
 
-    console.info(`[Card] Order submitted | ref: ${merchantRef} | tracking: ${orderRes.order_tracking_id}`);
+    console.info(`[Card] Order submitted | ref: ${merchantRef} | tracking: ${orderRes.order_tracking_id} | rate: ${rate} | KES: ${amountKes}`);
     return res.json({
       success:         true,
       redirectUrl:     orderRes.redirect_url,
