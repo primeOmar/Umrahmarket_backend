@@ -8,7 +8,7 @@ const router = express.Router();
 // GET /api/fx/rate
 // Returns live USD/KES rate with source + cache metadata.
 // Authenticated to prevent external hammering (frontend uses this on booking open).
-router.get('/rate', requireAuth, async (req, res) => {
+router.get('/rate', async (req, res) => {
   try {
     const { rate, source, cached } = await getUsdKesRateMeta();
     return res.json({
