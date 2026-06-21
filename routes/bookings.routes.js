@@ -1,14 +1,12 @@
-// controllers/bookings.controller.js
-import { supabaseAdmin } from '../config/supabase.js';
+// routes/bookings.routes.js
 import express from 'express';
+import { supabaseAdmin } from '../config/supabase.js';
+import { requireAuth } from '../middleware/auth.middleware.js';
 
 const router = express.Router();
 
 const recoverMissingBookings = async (userId) => {
-  if (!supabaseAdmin) {
-    console.warn('[recoverMissingBookings] Supabase admin client not configured');
-    return;
-  }
+  if (!supabaseAdmin) return;
 
   const { data: existingBookings, error: existingErr } = await supabaseAdmin
     .from('bookings')
@@ -30,7 +28,6 @@ const recoverMissingBookings = async (userId) => {
 
   let paymentsQuery = supabaseAdmin
     .from('payments')
-    // Include amount_usd and fx_rate_used so booking recovery has full data
     .select('id, user_id, package_id, amount_kes, amount_usd, fx_rate_used, method, created_at, status')
     .eq('user_id', userId)
     .eq('status', 'SUCCESS');
@@ -41,20 +38,10 @@ const recoverMissingBookings = async (userId) => {
   }
 
   const { data: successfulPayments, error: paymentsErr } = await paymentsQuery;
+  if (paymentsErr || !successfulPayments?.length) return;
 
-  if (paymentsErr) {
-    console.error('[recoverMissingBookings] Successful payments load failed:', paymentsErr.message);
-    return;
-  }
-
-  if (!successfulPayments?.length) return;
-
-  const uniquePayments = successfulPayments.filter(payment => {
-    const key = `${payment.package_id}|${payment.id}`;
-    return !existingCombinations.has(key);
-  });
-
-  if (uniquePayments.length === 0) return;
+  const uniquePayments = successfulPayments.filter(p => !existingCombinations.has(`${p.package_id}|${p.id}`));
+  if (!uniquePayments.length) return;
 
   const bookingRecords = uniquePayments.map((payment) => ({
     user_id:        payment.user_id,
@@ -70,28 +57,69 @@ const recoverMissingBookings = async (userId) => {
 
   const { error: insertErr } = await supabaseAdmin
     .from('bookings')
-    .upsert(bookingRecords, {
-      onConflict:       'payment_id',
-      ignoreDuplicates: true,
-    });
+    .upsert(bookingRecords, { onConflict: 'payment_id', ignoreDuplicates: true });
 
-  if (insertErr) {
-    console.error('[recoverMissingBookings] Booking recovery insert failed:', insertErr.message);
-  } else if (bookingRecords.length > 0) {
-    console.info(`[recoverMissingBookings] Recovered ${bookingRecords.length} booking(s) for user ${userId}`);
-  }
+  if (insertErr) console.error('[recoverMissingBookings] Insert failed:', insertErr.message);
 };
 
-export const getAgentClients = async (req, res) => {
+// GET /api/bookings/my
+router.get('/my', requireAuth, async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) return res.status(401).json({ success: false, message: 'Unauthorised' });
+
+    recoverMissingBookings(userId).catch(err =>
+      console.error('[getMyBookings] Background recovery failed:', err)
+    );
+
+    const { data: rawBookings, error: bookingsError } = await supabaseAdmin
+      .from('bookings')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+
+    if (bookingsError) return res.status(500).json({ success: false, message: bookingsError.message });
+
+    const uniqueBookings = [];
+    const seenIds = new Set();
+    for (const booking of (rawBookings || [])) {
+      if (!seenIds.has(booking.id)) { seenIds.add(booking.id); uniqueBookings.push(booking); }
+    }
+
+    const bookingsWithDetails = await Promise.all(
+      uniqueBookings.map(async (booking) => {
+        const { data: packageData } = await supabaseAdmin
+          .from('packages').select('*').eq('id', booking.package_id).single();
+
+        let paymentData = null;
+        if (booking.payment_id) {
+          const { data: payment } = await supabaseAdmin
+            .from('payments')
+            .select('id, method, status, amount_kes, amount_usd, fx_rate_used, currency, paid_at, mpesa_ref, pesapal_merchant_ref')
+            .eq('id', booking.payment_id).single();
+          paymentData = payment;
+        }
+
+        return { ...booking, package: packageData, payment: paymentData };
+      })
+    );
+
+    return res.json({ success: true, bookings: bookingsWithDetails, count: bookingsWithDetails.length });
+  } catch (err) {
+    console.error('[getMyBookings] Unexpected error:', err.message);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// GET /api/bookings/agent-clients
+router.get('/agent-clients', requireAuth, async (req, res) => {
   try {
     const agentId = req.user?.id;
     if (!agentId) return res.status(401).json({ success: false, message: 'Unauthorised' });
     if (req.user.role !== 'agent') return res.status(403).json({ success: false, message: 'Forbidden' });
 
     const { data: agentPackages, error: pkgErr } = await supabaseAdmin
-      .from('packages')
-      .select('id')
-      .eq('created_by', agentId);
+      .from('packages').select('id').eq('created_by', agentId);
 
     if (pkgErr) return res.status(500).json({ success: false, message: pkgErr.message });
     if (!agentPackages?.length) return res.json({ success: true, clients: [] });
@@ -107,23 +135,17 @@ export const getAgentClients = async (req, res) => {
     if (bookErr) return res.status(500).json({ success: false, message: bookErr.message });
     if (!bookings?.length) return res.json({ success: true, clients: [] });
 
-    // Pull fx data from payments so agent view can show USD
     const paymentIds = bookings.map(b => b.payment_id).filter(Boolean);
     let paymentFxMap = {};
     if (paymentIds.length > 0) {
       const { data: payments } = await supabaseAdmin
-        .from('payments')
-        .select('id, amount_usd, fx_rate_used')
-        .in('id', paymentIds);
+        .from('payments').select('id, amount_usd, fx_rate_used').in('id', paymentIds);
       paymentFxMap = Object.fromEntries((payments || []).map(p => [p.id, p]));
     }
 
     const userIds = [...new Set(bookings.map(b => b.user_id).filter(Boolean))];
-
     const { data: profiles, error: profErr } = await supabaseAdmin
-      .from('profiles')
-      .select('id, first_name, last_name, email, phone')
-      .in('id', userIds);
+      .from('profiles').select('id, first_name, last_name, email, phone').in('id', userIds);
 
     if (profErr) return res.status(500).json({ success: false, message: profErr.message });
 
@@ -145,9 +167,9 @@ export const getAgentClients = async (req, res) => {
         availableFrom: b.packages?.available_from,
         availableTo:   b.packages?.available_to,
         status:        b.status,
-        amountPaid:    b.amount_paid,           // KES — source of truth
-        amountUsd:     fx.amount_usd ?? null,   // USD — for agent display
-        fxRateUsed:    fx.fx_rate_used ?? null, // rate at time of payment
+        amountPaid:    b.amount_paid,
+        amountUsd:     fx.amount_usd ?? null,
+        fxRateUsed:    fx.fx_rate_used ?? null,
         currency:      b.currency || 'KES',
         notes:         b.notes,
         bookedAt:      b.created_at,
@@ -159,79 +181,6 @@ export const getAgentClients = async (req, res) => {
     console.error('[getAgentClients] Unexpected error:', err.message);
     return res.status(500).json({ success: false, message: 'Server error' });
   }
-};
-
-export const getMyBookings = async (req, res) => {
-  try {
-    const userId = req.user?.id;
-    if (!userId)
-      return res.status(401).json({ success: false, message: 'Unauthorised' });
-
-    recoverMissingBookings(userId).catch(err =>
-      console.error('[getMyBookings] Background recovery failed:', err)
-    );
-
-    const { data: rawBookings, error: bookingsError } = await supabaseAdmin
-      .from('bookings')
-      .select('*')
-      .eq('user_id', userId)
-      .order('created_at', { ascending: false });
-
-    if (bookingsError) {
-      console.error('[getMyBookings] DB error:', bookingsError);
-      return res.status(500).json({ success: false, message: bookingsError.message });
-    }
-
-    // Deduplicate defensively
-    const uniqueBookings = [];
-    const seenIds = new Set();
-    for (const booking of (rawBookings || [])) {
-      if (!seenIds.has(booking.id)) {
-        seenIds.add(booking.id);
-        uniqueBookings.push(booking);
-      }
-    }
-
-    const bookingsWithDetails = await Promise.all(
-      uniqueBookings.map(async (booking) => {
-        const { data: packageData } = await supabaseAdmin
-          .from('packages')
-          .select('*')
-          .eq('id', booking.package_id)
-          .single();
-
-        let paymentData = null;
-        if (booking.payment_id) {
-          const { data: payment } = await supabaseAdmin
-            .from('payments')
-            // Include FX columns so client receipt can show what they paid
-            .select('id, method, status, amount_kes, amount_usd, fx_rate_used, currency, paid_at, mpesa_ref, pesapal_merchant_ref')
-            .eq('id', booking.payment_id)
-            .single();
-          paymentData = payment;
-        }
-
-        return {
-          ...booking,
-          package: packageData,
-          payment: paymentData,
-        };
-      })
-    );
-
-    return res.json({
-      success:  true,
-      bookings: bookingsWithDetails,
-      count:    bookingsWithDetails.length,
-    });
-  } catch (err) {
-    console.error('[getMyBookings] Unexpected error:', err.message);
-    return res.status(500).json({ success: false, message: 'Server error' });
-  }
-};
-
-// Define routes
-router.get('/clients', getAgentClients);
-router.get('/me', getMyBookings);
+});
 
 export default router;
