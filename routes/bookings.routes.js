@@ -128,7 +128,7 @@ router.get('/agent-clients', requireAuth, async (req, res) => {
 
     const { data: bookings, error: bookErr } = await supabaseAdmin
       .from('bookings')
-      .select('id, status, amount_paid, currency, notes, created_at, user_id, payment_id, packages(id, name, type, duration, available_from, available_to)')
+      .select('id, status, amount_paid, currency, notes, created_at, user_id, package_id, payment_id, packages(id, name, type, duration, available_from, available_to)')
       .in('package_id', packageIds)
       .order('created_at', { ascending: false });
 
@@ -151,9 +151,30 @@ router.get('/agent-clients', requireAuth, async (req, res) => {
 
     const profileMap = Object.fromEntries((profiles || []).map(p => [p.id, p]));
 
+    // Passport verification status + face-crop photo for each (user, package)
+    // pair — this was previously missing entirely, which is why the agent
+    // dashboard always showed clients as "not verified" / no ID photo
+    // regardless of actual state.
+    const { data: passportRows, error: passErr } = await supabaseAdmin
+      .from('passport_verifications')
+      .select('user_id, package_id, verification_status, verified, passport_number, nationality, date_of_birth, passport_expiry, face_photo_url')
+      .in('user_id', userIds)
+      .in('package_id', packageIds);
+
+    if (passErr) {
+      // Don't fail the whole dashboard if this lookup has a problem —
+      // clients just show as unverified, same as before this fix existed.
+      console.error('[getAgentClients] passport_verifications lookup failed:', passErr.message);
+    }
+
+    const passportMap = Object.fromEntries(
+      (passportRows || []).map(p => [`${p.user_id}|${p.package_id}`, p])
+    );
+
     const clients = bookings.map(b => {
       const profile = profileMap[b.user_id] || {};
       const fx      = paymentFxMap[b.payment_id] || {};
+      const passport = passportMap[`${b.user_id}|${b.package_id}`] || null;
       return {
         bookingId:     b.id,
         userId:        b.user_id,
@@ -173,6 +194,15 @@ router.get('/agent-clients', requireAuth, async (req, res) => {
         currency:      b.currency || 'KES',
         notes:         b.notes,
         bookedAt:      b.created_at,
+        // Passport / ID-card fields — null/false when no verification row
+        // exists yet (client hasn't reached that step), not an error state.
+        passportVerified: passport?.verification_status === 'verified',
+        passportStatus:   passport?.verification_status || null,
+        passportNumber:   passport?.passport_number || null,
+        nationality:      passport?.nationality || null,
+        dateOfBirth:      passport?.date_of_birth || null,
+        passportExpiry:   passport?.passport_expiry || null,
+        facePhotoUrl:     passport?.face_photo_url || null,
       };
     });
 
