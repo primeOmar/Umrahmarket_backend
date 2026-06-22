@@ -15,6 +15,7 @@ import {
   checkPassportValidity,
   verifyPassportImage,
   getPassportStatus,
+  getFacePhotoStatus,
 } from '../controllers/passport.controller.js';
 
 const router = express.Router();
@@ -65,6 +66,16 @@ router.get(
   query('packageId').trim().notEmpty().withMessage('packageId is required'),
   handleValidationErrors,
   getPassportStatus,
+);
+
+// ── GET /api/passport/face-photo-status ──────────────────────────────────────
+// Returns which of the user's confirmed/pending bookings are missing a
+// face photo for their Umrah ID card.
+// Response: { bookingsMissingPhoto: [{ bookingId, packageId }] }
+router.get(
+  '/face-photo-status',
+  requireAuth,
+  getFacePhotoStatus,
 );
 
 export default router;

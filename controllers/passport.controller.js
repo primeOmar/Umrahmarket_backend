@@ -403,4 +403,55 @@ async function upsertVerification({ userId, packageId, status, verified, input, 
   return { facePhotoUrl: resolvedFacePhotoUrl };
 }
 
-export default { checkPassportValidity, verifyPassportImage, getPassportStatus };
+// =============================================================================
+// GET /api/passport/face-photo-status
+// =============================================================================
+// Returns every confirmed/pending booking for this user that does NOT yet
+// have a face_photo_url in passport_verifications.
+// Response: { bookingsMissingPhoto: [{ bookingId, packageId }] }
+export async function getFacePhotoStatus(req, res) {
+  const userId = req.user?.id;
+  try {
+    // 1. Fetch the user's active bookings
+    const { data: bookings, error: bErr } = await supabaseAdmin
+      .from('bookings')
+      .select('id, package_id, status')
+      .eq('user_id', userId)
+      .in('status', ['confirmed', 'pending']);
+
+    if (bErr) throw new Error(bErr.message);
+    if (!bookings?.length) {
+      return res.json({ bookingsMissingPhoto: [] });
+    }
+
+    const packageIds = bookings.map((b) => b.package_id);
+
+    // 2. Fetch existing verifications that already have a face photo
+    const { data: verifications, error: vErr } = await supabaseAdmin
+      .from('passport_verifications')
+      .select('package_id, face_photo_url')
+      .eq('user_id', userId)
+      .in('package_id', packageIds);
+
+    if (vErr) throw new Error(vErr.message);
+
+    // Build a set of package IDs that already have a photo
+    const hasPhoto = new Set(
+      (verifications ?? [])
+        .filter((v) => v.face_photo_url && !v.face_photo_url.startsWith('pending://'))
+        .map((v) => v.package_id),
+    );
+
+    // 3. Return bookings where the face photo is still missing
+    const bookingsMissingPhoto = bookings
+      .filter((b) => !hasPhoto.has(b.package_id))
+      .map((b) => ({ bookingId: b.id, packageId: b.package_id }));
+
+    return res.json({ bookingsMissingPhoto });
+  } catch (err) {
+    logger.error('getFacePhotoStatus error', { userId, error: err.message });
+    return res.status(500).json({ error: 'Could not check face photo status.' });
+  }
+}
+
+export default { checkPassportValidity, verifyPassportImage, getPassportStatus, getFacePhotoStatus };
