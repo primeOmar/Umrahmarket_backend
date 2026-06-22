@@ -16,8 +16,8 @@
 import { supabaseAdmin } from '../config/supabase.js';
 import config from '../config/security.config.js';
 import logger from '../config/logger.js';
-import { extractPassport, compareWithInput } from '../lib/passportOcr.js';
-import { uploadPassportBuffer } from '../middleware/uploads/PassportUpload.js';
+import { extractPassport, compareWithInput, extractFacePhoto } from '../lib/passportOcr.js';
+import { uploadPassportBuffer, uploadFacePhotoBuffer } from '../middleware/uploads/PassportUpload.js';
 
 const MAX_ATTEMPTS = 3;
 const MIN_VALIDITY_MONTHS = 6;
@@ -131,7 +131,7 @@ export const verifyPassportImage = async (req, res) => {
     // Don't re-verify an already-verified passport for this package.
     const { data: existing } = await supabaseAdmin
       .from('passport_verifications')
-      .select('id, attempts, verification_status')
+      .select('id, attempts, verification_status, face_photo_url')
       .eq('user_id', userId)
       .eq('package_id', packageId)
       .maybeSingle();
@@ -140,6 +140,7 @@ export const verifyPassportImage = async (req, res) => {
       logger.info('Passport already verified for this package', { userId, packageId });
       return res.json({
         success: true, status: 'verified', verified: true, canProceed: true,
+        facePhotoUrl: existing.face_photo_url || null,
         message: 'Passport already verified for this package.',
       });
     }
@@ -207,6 +208,31 @@ export const verifyPassportImage = async (req, res) => {
       });
     }
 
+    // 3b) Crop a face photo from the passport page for the agent-facing
+    // Umrah ID card. Best-effort only — never blocks or fails verification.
+    // Only attempted once the OCR has actually read something off the page
+    // (skips wasted work on completely unreadable images).
+    let facePhoto = null;
+    if (ocr.ok) {
+      try {
+        const face = await extractFacePhoto(req.passportFile.buffer);
+        if (face.ok) {
+          facePhoto = await uploadFacePhotoBuffer({
+            buffer: face.buffer, mime: face.mime, ext: face.ext, userId, packageId,
+          });
+          logger.info('Face photo cropped and uploaded', {
+            userId, packageId, key: facePhoto.key, method: face.method,
+          });
+        } else {
+          logger.info('Face photo crop skipped', { userId, packageId, reason: face.reason });
+        }
+      } catch (faceError) {
+        logger.warn('Face photo crop/upload failed, continuing without it', {
+          error: faceError.message, userId, packageId,
+        });
+      }
+    }
+
     // 4) Decide outcome.
     const autoVerified = ocr.ok && ocr.confidence >= MIN_OCR_CONFIDENCE && comparison.matched;
     let status, canProceed, message;
@@ -224,10 +250,10 @@ export const verifyPassportImage = async (req, res) => {
         : 'The photo did not match the details you entered. Please check your details and retake a clear photo.';
     }
 
-    await upsertVerification({
+    const persisted = await upsertVerification({
       userId, packageId, status, verified: autoVerified,
       input: { passportNumber, passportCountry, passportExpiry, surname, givenNames, dateOfBirth, nationality },
-      ocr, comparison, stored, travelDate, attempts,
+      ocr, comparison, stored, facePhoto, travelDate, attempts,
     });
 
     logger.info('Passport verification attempt complete', {
@@ -245,6 +271,7 @@ export const verifyPassportImage = async (req, res) => {
       ocr: { read: ocr.ok, confidence: ocr.confidence },
       // Booleans only — never echo the raw OCR text / extracted PII back to the client.
       match: { score: comparison.score, fields: comparison.details },
+      facePhotoUrl: persisted.facePhotoUrl,
       message,
     });
   } catch (error) {
@@ -281,7 +308,7 @@ export const getPassportStatus = async (req, res) => {
 
     const { data } = await supabaseAdmin
       .from('passport_verifications')
-      .select('verification_status, verified, attempts, match_score, updated_at')
+      .select('verification_status, verified, attempts, match_score, face_photo_url, updated_at')
       .eq('user_id', req.userId)
       .eq('package_id', packageId)
       .maybeSingle();
@@ -294,6 +321,7 @@ export const getPassportStatus = async (req, res) => {
       canProceed: !!data && ['verified', 'manual_review'].includes(data.verification_status),
       attemptsUsed: data?.attempts || 0,
       attemptsRemaining: Math.max(0, MAX_ATTEMPTS - (data?.attempts || 0)),
+      facePhotoUrl: data?.face_photo_url || null,
     });
   } catch (error) {
     logger.error('getPassportStatus failed', { error: error.message });
@@ -302,7 +330,7 @@ export const getPassportStatus = async (req, res) => {
 };
 
 // ── persistence helper (upsert on user_id+package_id) ────────────────────────
-async function upsertVerification({ userId, packageId, status, verified, input, ocr, comparison, stored, travelDate, attempts }) {
+async function upsertVerification({ userId, packageId, status, verified, input, ocr, comparison, stored, facePhoto, travelDate, attempts }) {
   const row = {
     user_id: userId,
     package_id: packageId,
@@ -325,6 +353,10 @@ async function upsertVerification({ userId, packageId, status, verified, input, 
     row.passport_image_url = stored.url;
     row.image_key = stored.key;
   }
+  if (facePhoto) {
+    row.face_photo_url = facePhoto.url;
+    row.face_photo_key = facePhoto.key;
+  }
   if (ocr) {
     row.mrz_raw = ocr.mrz || null;
     row.ocr_confidence = ocr.confidence ?? null;
@@ -335,16 +367,28 @@ async function upsertVerification({ userId, packageId, status, verified, input, 
   }
   // passport_image_url is NOT NULL in the schema; on the expired-passport path
   // (no upload) we only reach here when a row may not yet exist, so guard it.
-  if (!row.passport_image_url) {
+  // Also resolve face_photo_url here: if this attempt didn't produce a fresh
+  // crop (e.g. OCR failed, or the crop step itself failed) but an earlier
+  // attempt already has one stored, keep it rather than clearing it.
+  let resolvedFacePhotoUrl = facePhoto?.url || null;
+  if (!row.passport_image_url || !row.face_photo_url) {
     const { data: prev } = await supabaseAdmin
       .from('passport_verifications')
-      .select('passport_image_url, image_key')
+      .select('passport_image_url, image_key, face_photo_url, face_photo_key')
       .eq('user_id', userId).eq('package_id', packageId).maybeSingle();
-    if (prev?.passport_image_url) {
-      row.passport_image_url = prev.passport_image_url;
-      row.image_key = prev.image_key;
-    } else {
-      row.passport_image_url = 'pending://no-image';
+
+    if (!row.passport_image_url) {
+      if (prev?.passport_image_url) {
+        row.passport_image_url = prev.passport_image_url;
+        row.image_key = prev.image_key;
+      } else {
+        row.passport_image_url = 'pending://no-image';
+      }
+    }
+    if (!row.face_photo_url && prev?.face_photo_url) {
+      row.face_photo_url = prev.face_photo_url;
+      row.face_photo_key = prev.face_photo_key;
+      resolvedFacePhotoUrl = prev.face_photo_url;
     }
   }
 
@@ -355,6 +399,8 @@ async function upsertVerification({ userId, packageId, status, verified, input, 
     logger.error('passport_verifications upsert failed', { error: error.message, userId, packageId });
     throw new Error('Could not save verification record.');
   }
+
+  return { facePhotoUrl: resolvedFacePhotoUrl };
 }
 
 export default { checkPassportValidity, verifyPassportImage, getPassportStatus };

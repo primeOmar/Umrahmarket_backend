@@ -118,4 +118,30 @@ export async function uploadPassportBuffer({ buffer, mime, ext, userId, packageI
   return { key, url: `${PUBLIC_URL}/${key}` };
 }
 
-export default { parsePassportImage, validatePassportFile, uploadPassportBuffer };
+/**
+ * Store a cropped face-photo buffer in R2. Unlike the raw passport scan,
+ * this is just a headshot crop — no MRZ, no passport number, no page
+ * border — so it's stored as public-read so it can be embedded directly in
+ * the agent dashboard / ID card PDF without a signed URL.
+ * Key pattern: passport-faces/{userId}/{packageId}/{ts}-{rand}.{ext}
+ * Returns { key, url }.
+ */
+export async function uploadFacePhotoBuffer({ buffer, mime, ext, userId, packageId }) {
+  const uid = crypto.randomBytes(16).toString('hex');
+  const safeExt = (ext || 'jpg').replace(/[^a-z0-9]/gi, '');
+  const key = `passport-faces/${userId ?? 'anon'}/${packageId ?? 'na'}/${Date.now()}-${uid}.${safeExt}`;
+
+  await R2.send(new PutObjectCommand({
+    Bucket: BUCKET,
+    Key: key,
+    Body: buffer,
+    ContentType: mime,
+    ACL: 'public-read',
+    Metadata: { userId: String(userId ?? 'anon'), kind: 'passport-face-crop' },
+  }));
+
+  logFileUpload(userId, key, mime, buffer.length, true, undefined);
+  return { key, url: `${PUBLIC_URL}/${key}` };
+}
+
+export default { parsePassportImage, validatePassportFile, uploadPassportBuffer, uploadFacePhotoBuffer };
