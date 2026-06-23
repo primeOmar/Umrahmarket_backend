@@ -303,13 +303,14 @@ export const verifyPassportImage = async (req, res) => {
 // =============================================================================
 export const getPassportStatus = async (req, res) => {
   try {
+    const userId = req.user?.id ?? req.userId;
     const { packageId } = req.query;
     if (!packageId) return res.status(400).json({ success: false, error: 'packageId is required.' });
 
     const { data } = await supabaseAdmin
       .from('passport_verifications')
       .select('verification_status, verified, attempts, match_score, face_photo_url, updated_at')
-      .eq('user_id', req.userId)
+      .eq('user_id', userId)
       .eq('package_id', packageId)
       .maybeSingle();
 
@@ -410,7 +411,7 @@ async function upsertVerification({ userId, packageId, status, verified, input, 
 // have a face_photo_url in passport_verifications.
 // Response: { bookingsMissingPhoto: [{ bookingId, packageId }] }
 export async function getFacePhotoStatus(req, res) {
-  const userId = req.user?.id;
+  const userId = req.user?.id ?? req.userId;
   try {
     // 1. Fetch the user's active bookings
     const { data: bookings, error: bErr } = await supabaseAdmin
