@@ -454,4 +454,127 @@ export async function getFacePhotoStatus(req, res) {
   }
 }
 
-export default { checkPassportValidity, verifyPassportImage, getPassportStatus, getFacePhotoStatus };
+// =============================================================================
+// POST /api/passport/face-photo
+// =============================================================================
+// Saves the pilgrim's dedicated selfie (taken or uploaded in FacePhotoModal
+// after a successful payment). This photo is stored as public-read in R2 and
+// written to passport_verifications.face_photo_url so that:
+//   - the agent dashboard can embed it on the Umrah ID card PDF
+//   - getFacePhotoStatus no longer returns this booking as missing a photo
+//
+// multipart/form-data: field "face" (single image) + field "packageId"
+export async function saveFacePhoto(req, res) {
+  const userId = req.user?.id ?? req.userId;
+  try {
+    const { packageId } = req.body;
+    if (!packageId) {
+      return res.status(400).json({ success: false, error: 'packageId is required.' });
+    }
+    if (!req.file?.buffer) {
+      return res.status(400).json({ success: false, error: 'Face photo is required.' });
+    }
+
+    // Deep MIME check on the buffer (same logic as validatePassportFile).
+    const { fileTypeFromBuffer } = await import('file-type');
+    const ALLOWED_MIMES = ['image/jpeg', 'image/png', 'image/webp'];
+    const detected = await fileTypeFromBuffer(req.file.buffer);
+    if (!detected || !ALLOWED_MIMES.includes(detected.mime)) {
+      return res.status(400).json({
+        success: false,
+        error: 'File type verification failed. Only JPEG, PNG, and WebP images are allowed.',
+      });
+    }
+
+    // Confirm the user has a confirmed/pending booking for this package
+    // so random users can't write photos to arbitrary package slots.
+    const { data: booking, error: bErr } = await supabaseAdmin
+      .from('bookings')
+      .select('id, status')
+      .eq('user_id', userId)
+      .eq('package_id', packageId)
+      .in('status', ['confirmed', 'pending'])
+      .maybeSingle();
+
+    if (bErr) {
+      logger.error('saveFacePhoto booking check failed', { error: bErr.message, userId, packageId });
+      return res.status(500).json({ success: false, error: 'Could not verify booking. Please try again.' });
+    }
+    if (!booking) {
+      return res.status(403).json({
+        success: false,
+        error: 'No confirmed booking found for this package.',
+      });
+    }
+
+    // Upload to R2 (public-read, just the headshot — no PII baked in).
+    const facePhoto = await uploadFacePhotoBuffer({
+      buffer: req.file.buffer,
+      mime: detected.mime,
+      ext: detected.ext,
+      userId,
+      packageId,
+    });
+
+    logger.info('Dedicated face photo uploaded', { userId, packageId, key: facePhoto.key });
+
+    // Upsert into passport_verifications.
+    // We do a targeted patch so we don't accidentally clobber a verified
+    // passport row; if no row exists yet we create a minimal one.
+    const { data: existing } = await supabaseAdmin
+      .from('passport_verifications')
+      .select('id, passport_image_url, verification_status')
+      .eq('user_id', userId)
+      .eq('package_id', packageId)
+      .maybeSingle();
+
+    if (existing) {
+      // Row already exists — patch only the face photo fields.
+      const { error: upErr } = await supabaseAdmin
+        .from('passport_verifications')
+        .update({
+          face_photo_url: facePhoto.url,
+          face_photo_key: facePhoto.key,
+        })
+        .eq('user_id', userId)
+        .eq('package_id', packageId);
+
+      if (upErr) {
+        logger.error('saveFacePhoto update failed', { error: upErr.message, userId, packageId });
+        return res.status(500).json({ success: false, error: 'Could not save photo. Please try again.' });
+      }
+    } else {
+      // No verification row yet (passport step was skipped or not reached).
+      // Create a minimal stub so the face_photo_url is findable.
+      const { error: insErr } = await supabaseAdmin
+        .from('passport_verifications')
+        .insert({
+          user_id:              userId,
+          package_id:           packageId,
+          passport_image_url:   'pending://face-photo-only',
+          face_photo_url:       facePhoto.url,
+          face_photo_key:       facePhoto.key,
+          verification_status:  'pending',
+          verified:             false,
+          attempts:             0,
+          last_attempt_at:      new Date().toISOString(),
+        });
+
+      if (insErr) {
+        logger.error('saveFacePhoto insert failed', { error: insErr.message, userId, packageId });
+        return res.status(500).json({ success: false, error: 'Could not save photo. Please try again.' });
+      }
+    }
+
+    return res.json({
+      success: true,
+      facePhotoUrl: facePhoto.url,
+      message: 'Face photo saved successfully.',
+    });
+  } catch (err) {
+    logger.error('saveFacePhoto unexpected error', { error: err.message, userId });
+    return res.status(500).json({ success: false, error: 'Could not save photo. Please try again.' });
+  }
+}
+
+export default { checkPassportValidity, verifyPassportImage, getPassportStatus, getFacePhotoStatus, saveFacePhoto };

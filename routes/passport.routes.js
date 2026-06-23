@@ -11,11 +11,21 @@ import { requireAuth } from '../middleware/auth.middleware.js';
 import { handleValidationErrors } from '../middleware/validation.middleware.js';
 import { uploadRateLimiter } from '../middleware/security.middleware.js';
 import { parsePassportImage, validatePassportFile } from '../middleware/uploads/PassportUpload.js';
+import multer from 'multer';
+
+// Lightweight multer instance for the face-photo endpoint.
+// The controller handles its own deep MIME validation, so this just
+// enforces size + field name so we never buffer more than 8 MB.
+const faceUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 8 * 1024 * 1024, files: 1 },
+}).single('face');
 import {
   checkPassportValidity,
   verifyPassportImage,
   getPassportStatus,
   getFacePhotoStatus,
+  saveFacePhoto,
 } from '../controllers/passport.controller.js';
 
 const router = express.Router();
@@ -76,6 +86,38 @@ router.get(
   '/face-photo-status',
   requireAuth,
   getFacePhotoStatus,
+);
+
+// ── POST /api/passport/face-photo ─────────────────────────────────────────────
+// Saves the pilgrim's dedicated selfie submitted via FacePhotoModal after a
+// successful payment. The photo is stored in R2 (public-read, headshot only)
+// and written to passport_verifications.face_photo_url so the agent can embed
+// it on the Umrah ID card PDF.
+//
+// multipart/form-data:
+//   face      — image/jpeg | image/png | image/webp, max 8 MB
+//   packageId — the package this booking belongs to
+router.post(
+  '/face-photo',
+  requireAuth,
+  uploadRateLimiter,
+  (req, res, next) => {
+    faceUpload(req, res, (err) => {
+      if (err instanceof multer.MulterError) {
+        const msgs = {
+          LIMIT_FILE_SIZE: 'Image too large. Max 8 MB.',
+          LIMIT_FILE_COUNT: 'Upload one photo at a time.',
+          LIMIT_UNEXPECTED_FILE: 'Unexpected file field. Use the field name "face".',
+        };
+        return res.status(400).json({ success: false, error: msgs[err.code] || err.message });
+      }
+      if (err) return res.status(400).json({ success: false, error: err.message });
+      next();
+    });
+  },
+  body('packageId').trim().notEmpty().withMessage('packageId is required'),
+  handleValidationErrors,
+  saveFacePhoto,
 );
 
 export default router;
