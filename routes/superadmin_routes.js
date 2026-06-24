@@ -1126,7 +1126,21 @@ const DOC_FIELD_MAP = {
   director_id:   { urlCol: 'director_id_doc',   statusCol: 'director_id_status',   notesCol: 'director_id_notes',   reviewedAtCol: 'director_id_reviewed_at' },
   office_photo:  { urlCol: 'office_photo',      statusCol: 'office_photo_status',  notesCol: 'office_photo_notes',  reviewedAtCol: 'office_photo_reviewed_at' },
 };
-const REQUIRED_DOC_KEYS = ['incorporation', 'tourism', 'krapin', 'director_id'];
+// REQUIRED_DOC_KEYS — only documents an agent can actually submit today.
+//
+// BUG FIX: director_id was previously listed as required, but no upload
+// form anywhere in the app (registration, AgentDashboard, DocumentsTab)
+// actually collects a director_id document — it only exists as a column
+// the backend tracks. Requiring it meant director_id_status was stuck at
+// the 'pending' default forever, so recomputeOverallStatus could NEVER
+// reach 'approved' for ANY agent, no matter what the admin approved. This
+// is why an admin approving every real document still left the agent
+// blocked from posting packages.
+//
+// Move director_id back to required once an actual upload field for it
+// exists in the frontend — until then, treat it like office_photo:
+// reviewable if present, but not a precondition for approval.
+const REQUIRED_DOC_KEYS = ['incorporation', 'tourism', 'krapin'];
 
 // Recomputes the bundle-level `status` from the five per-document statuses,
 // then mirrors it onto `profiles.approved` / `profiles.verification_status`

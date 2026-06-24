@@ -1,6 +1,6 @@
 /**
  * Agent-facing document verification status + review requests.
-
+ 
  * These are called by the AGENT (requireAuth / verifyToken), not the
  * superadmin. Contrast with superadmin_routes.js, which is the admin-side
  * verify/reject UI.
@@ -16,7 +16,11 @@ import { sanitizeInput } from '../utils/securityUtils.js';
 const router = express.Router();
 
 const DOC_ITEM_KEYS = ['incorporation', 'tourism', 'krapin', 'director_id', 'office_photo'];
-const REQUIRED_ITEM_KEYS = ['incorporation', 'tourism', 'krapin', 'director_id'];
+// MUST match REQUIRED_DOC_KEYS in superadmin_routes.js exactly. director_id
+// is intentionally excluded: no upload form in the app collects one yet,
+// so requiring it here would make this endpoint report "still missing
+// documents" even after the backend has fully approved the agent.
+const REQUIRED_ITEM_KEYS = ['incorporation', 'tourism', 'krapin'];
 
 // ── GET /api/agent-documents/status ──────────────────────────────────────────
 // Drives the AgentDashboard gate: tells the frontend exactly which documents
@@ -123,13 +127,13 @@ router.post(
         return res.status(409).json({ success: false, message: 'Your account is already verified.' });
       }
 
-      const hasUploadedAllRequired = [doc.incorporation_doc, doc.tourism_doc, doc.krapin_doc, doc.director_id_doc]
+      const hasUploadedAllRequired = [doc.incorporation_doc, doc.tourism_doc, doc.krapin_doc]
         .every(Boolean);
 
       if (!hasUploadedAllRequired) {
         return res.status(422).json({
           success: false,
-          message: 'Please upload all required documents (Incorporation, Tourism License, KRA PIN, Director ID) before requesting a review.',
+          message: 'Please upload all required documents (Incorporation, Tourism License, KRA PIN) before requesting a review.',
         });
       }
 
