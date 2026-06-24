@@ -37,9 +37,34 @@ router.get('/', requireAuth, async (req, res) => {
 
     const { data: docRow } = await supabaseAdmin
       .from('agent_documents')
-      .select('incorporation_doc, tourism_doc, krapin_doc, director_id_doc, office_photo')
+      .select(`
+        incorporation_doc, incorporation_status,
+        tourism_doc,       tourism_status,
+        krapin_doc,        krapin_status,
+        director_id_doc,   director_id_status,
+        office_photo,      office_photo_status
+      `)
       .eq('user_id', agentId)
       .maybeSingle();
+
+    // Map each doc key to its per-item status column name.
+    const STATUS_COL = {
+      incorporation: 'incorporation_status',
+      tourism:       'tourism_status',
+      krapin:        'krapin_status',
+      director_id:   'director_id_status',
+      office_photo:  'office_photo_status',
+    };
+
+    // Resolve the real review status for a doc key.
+    // 'approved' is returned as-is so DocumentsTab.normaliseStatus maps it
+    // to 'verified'. Anything else with a file present falls back to 'uploaded'.
+    const resolveStatus = (key, hasFile) => {
+      if (!hasFile) return 'none';
+      const s = docRow?.[STATUS_COL[key]];
+      if (s === 'approved' || s === 'rejected') return s;
+      return 'uploaded'; // pending / null → still awaiting review
+    };
 
     const result = {};
 
@@ -81,7 +106,7 @@ router.get('/', requireAuth, async (req, res) => {
             );
 
             result[docKey] = {
-              status:     'uploaded',
+              status:     resolveStatus(docKey, true),
               photos,
               path:       photos[0].path,
               publicUrl:  photos[0].publicUrl,
@@ -99,7 +124,7 @@ router.get('/', requireAuth, async (req, res) => {
           );
 
           result[docKey] = {
-            status:     'uploaded',
+            status:     resolveStatus(docKey, true),
             path:       latest.Key,
             publicUrl:  signedUrl,
             uploadedAt: latest.LastModified,
@@ -114,7 +139,7 @@ router.get('/', requireAuth, async (req, res) => {
         if (rowValue && Array.isArray(rowValue) && rowValue.length > 0) {
           const photos = rowValue.map((url) => ({ path: url, publicUrl: url }));
           result[docKey] = {
-            status:     'uploaded',
+            status:     resolveStatus(docKey, true),
             photos,
             path:       photos[0].path,
             publicUrl:  photos[0].publicUrl,
@@ -131,7 +156,7 @@ router.get('/', requireAuth, async (req, res) => {
       } else {
         if (rowValue) {
           result[docKey] = {
-            status:     'uploaded',
+            status:     resolveStatus(docKey, true),
             path:       rowValue,
             publicUrl:  rowValue,
             uploadedAt: null,
