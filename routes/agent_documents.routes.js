@@ -1,5 +1,6 @@
 /**
  * Agent-facing document verification status + review requests.
+ 
  * These are called by the AGENT (requireAuth / verifyToken), not the
  * superadmin. Contrast with superadmin_routes.js, which is the admin-side
  * verify/reject UI.
@@ -27,26 +28,46 @@ const REQUIRED_ITEM_KEYS = ['incorporation', 'tourism', 'krapin', 'director_id']
 // ("upload documents" vs "request review" vs "fix rejected item") instead
 // of a flat "you're not verified" message.
 router.get('/status', requireAuth, async (req, res) => {
+  // Prevent browsers and Render's edge cache from serving a stale
+  // "isApproved: false" after a superadmin approves the agent's documents.
+  // Without this the browser returns a 304 and the agent can never post
+  // packages even though the DB already has them approved.
+  res.set('Cache-Control', 'no-store');
+
   try {
     const agentId = req.user?.id ?? req.userId;
-    const { data: doc, error } = await supabase
-      .from('agent_documents')
-      .select('*')
-      .eq('user_id', agentId)
-      .maybeSingle();
+
+    // Fetch both tables in parallel — profiles is the authoritative source
+    // for isApproved because requireApprovedAgent middleware reads from there,
+    // and agent_documents holds the per-item detail rows.
+    const [{ data: doc, error }, { data: profile }] = await Promise.all([
+      supabase
+        .from('agent_documents')
+        .select('*')
+        .eq('user_id', agentId)
+        .maybeSingle(),
+      supabase
+        .from('profiles')
+        .select('approved, verification_status')
+        .eq('id', agentId)
+        .maybeSingle(),
+    ]);
 
     if (error) throw error;
+
+    // isApproved derived from profiles — exactly the same condition the
+    // requireApprovedAgent middleware checks, so frontend and backend can
+    // never disagree on whether the gate should open.
+    const isApproved = !!(profile?.approved && profile?.verification_status === 'approved');
 
     if (!doc) {
       return res.json({
         success: true,
-        data: {
-          hasUploadedDocuments: false,
-          isApproved: false,
-          reviewRequested: false,
-          overallStatus: 'pending',
-          items: DOC_ITEM_KEYS.reduce((acc, k) => ({ ...acc, [k]: { uploaded: false, status: 'pending', notes: null } }), {}),
-        },
+        hasUploadedDocuments: false,
+        isApproved,
+        reviewRequested: false,
+        overallStatus: profile?.verification_status || 'pending',
+        items: DOC_ITEM_KEYS.reduce((acc, k) => ({ ...acc, [k]: { uploaded: false, status: 'pending', notes: null } }), {}),
       });
     }
 
@@ -72,18 +93,25 @@ router.get('/status', requireAuth, async (req, res) => {
     const hasUploadedAllRequired = REQUIRED_ITEM_KEYS.every(k => items[k].uploaded);
     const anyRejected = REQUIRED_ITEM_KEYS.some(k => items[k].status === 'rejected');
 
+    // FLAT response — matches the convention used by GET /passport/status
+    // (see passport.controller.js / getAgentVerificationStatus's caller in
+    // AgentDashboard.jsx, which reads data.isApproved directly, the same
+    // way BookingFlow.jsx reads res?.canProceed). The previous shape wrapped
+    // everything under an extra `data` key — {success, data: {isApproved}}
+    // — which meant `data.isApproved` was always undefined on the frontend,
+    // so the verification gate fired on every click regardless of the
+    // agent's real status. Do NOT re-nest this under `data` again without
+    // also updating every caller in AgentDashboard.jsx.
     res.json({
       success: true,
-      data: {
-        hasUploadedDocuments: hasUploadedAny,
-        hasUploadedAllRequired,
-        isApproved: doc.status === 'approved',
-        anyRejected,
-        reviewRequested: !!doc.review_requested_at,
-        reviewRequestedAt: doc.review_requested_at,
-        overallStatus: doc.status || 'pending',
-        items,
-      },
+      hasUploadedDocuments: hasUploadedAny,
+      hasUploadedAllRequired,
+      isApproved,
+      anyRejected,
+      reviewRequested: !!doc.review_requested_at,
+      reviewRequestedAt: doc.review_requested_at,
+      overallStatus: doc.status || 'pending',
+      items,
     });
   } catch (err) {
     console.error('[agent-documents/status] error:', err);
@@ -163,4 +191,3 @@ router.post(
 );
 
 export default router;
-

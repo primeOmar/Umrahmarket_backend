@@ -1230,19 +1230,32 @@ router.post('/documents/:docId/verify-item', authenticateSuperadmin, async (req,
       review_requested_at: null,
     };
 
-    const { data: updated, error: updateError } = await supabase
+    const { error: updateError } = await supabase
       .from('agent_documents')
       .update(itemUpdate)
-      .eq('id', docId)
-      .select('*')
-      .single();
+      .eq('id', docId);
 
     if (updateError) {
       await logAuditAction(req.superadmin.id, auditAction, 'document', auditResourceId, `${safeDocType} update failed`, 'failed', updateError.message, req);
       throw updateError;
     }
 
-    const overall = await recomputeOverallStatus(updated, req.superadmin.id);
+    // Re-fetch the full row rather than relying on .update().select('*') —
+    // the update return can have RLS-truncated columns if any column-level
+    // policy restricts the service role, which causes recomputeOverallStatus
+    // to see null statuses and compute 'pending' even when all docs are approved.
+    const { data: freshRow, error: freshErr } = await supabase
+      .from('agent_documents')
+      .select('*')
+      .eq('id', docId)
+      .single();
+
+    if (freshErr || !freshRow) {
+      await logAuditAction(req.superadmin.id, auditAction, 'document', auditResourceId, `${safeDocType} re-fetch failed`, 'failed', freshErr?.message || 'Row disappeared after update', req);
+      throw freshErr ?? new Error('Row disappeared after update');
+    }
+
+    const overall = await recomputeOverallStatus(freshRow, req.superadmin.id);
 
     await logAuditAction(
       req.superadmin.id, auditAction, 'document', auditResourceId,
