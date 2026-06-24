@@ -5,6 +5,7 @@ import { createPackage } from '../../controllers/packages/createpackages.control
 import { getItinerary, saveItinerary } from '../../controllers/packages/itinerary.controller.js';
 import { verifyToken } from '../../middleware/auth.middleware.js';
 import { validatePackage } from '../../middleware/uploads/Validatepackage.js';
+import { requireApprovedAgent } from '../../middleware/agentVerification.middleware.js';
 
 const router = express.Router();
 
@@ -14,14 +15,18 @@ router.get('/all-active', getAllActivePackages);
 // POST /api/packages/create-packages
 //
 // Pipeline:
-//  1. verifyToken      — authenticate the agent
-//  2. parseFormData    — multer parses multipart body; req.body + req.files populated (nothing uploaded yet)
-//  3. validatePackage  — reject early if required text fields are missing or invalid
-//  4. uploadImagesToR2 — security scan + R2 upload only if validation passed
-//  5. createPackage    — insert record into Supabase with image URLs
+//  1. verifyToken          — authenticate the agent
+//  2. requireApprovedAgent — block unverified/rejected agents with a clear
+//                            reason (AGENT_NOT_VERIFIED) before we ever
+//                            parse the multipart body or touch R2
+//  3. parseFormData        — multer parses multipart body; req.body + req.files populated (nothing uploaded yet)
+//  4. validatePackage      — reject early if required text fields are missing or invalid
+//  5. uploadImagesToR2     — security scan + R2 upload only if validation passed
+//  6. createPackage        — insert record into Supabase with image URLs
 router.post(
   '/create-packages',
   verifyToken,
+  requireApprovedAgent,
   parseFormData,
   validatePackage,
   uploadImagesToR2,

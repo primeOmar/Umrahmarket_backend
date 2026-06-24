@@ -1042,6 +1042,9 @@ router.get('/documents', authenticateSuperadmin, async (req, res) => {
           agent:profiles!user_id (first_name, last_name, email),
           reviewer:profiles!reviewed_by (first_name, last_name)
         `)
+        // Agents who explicitly asked for review float to the top, so a
+        // backlog doesn't bury someone who's actively waiting.
+        .order('review_requested_at', { ascending: false, nullsFirst: false })
         .order('submitted_at', { ascending: false });
 
       if (status && status !== 'all') {
@@ -1089,6 +1092,15 @@ router.get('/documents', authenticateSuperadmin, async (req, res) => {
         reviewedAt:       doc.reviewed_at,
         reviewedBy:       doc.reviewed_by,
         reviewerName:     doc.reviewer ? `${doc.reviewer.first_name || ''} ${doc.reviewer.last_name || ''}`.trim() : null,
+        reviewRequestedAt: doc.review_requested_at,
+        // Per-document verification — each one is checked independently.
+        items: {
+          incorporation: { status: doc.incorporation_status, notes: doc.incorporation_notes, reviewedAt: doc.incorporation_reviewed_at },
+          tourism:       { status: doc.tourism_status,       notes: doc.tourism_notes,       reviewedAt: doc.tourism_reviewed_at },
+          krapin:        { status: doc.krapin_status,        notes: doc.krapin_notes,        reviewedAt: doc.krapin_reviewed_at },
+          director_id:   { status: doc.director_id_status,   notes: doc.director_id_notes,   reviewedAt: doc.director_id_reviewed_at },
+          office_photo:  { status: doc.office_photo_status,  notes: doc.office_photo_notes,   reviewedAt: doc.office_photo_reviewed_at },
+        },
       };
     });
 
@@ -1099,6 +1111,154 @@ router.get('/documents', authenticateSuperadmin, async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// PER-DOCUMENT VERIFICATION
+// ─────────────────────────────────────────────────────────────────────────────
+// Maps the public doc key (used in the API and frontend) to its DB columns.
+// office_photo is intentionally NOT in REQUIRED_DOC_KEYS — some agencies are
+// home-based and we don't want to block an otherwise-genuine agent over a
+// photo of an office that doesn't exist. It can still be reviewed/rejected
+// individually; it just doesn't gate overall approval.
+const DOC_FIELD_MAP = {
+  incorporation: { urlCol: 'incorporation_doc', statusCol: 'incorporation_status', notesCol: 'incorporation_notes', reviewedAtCol: 'incorporation_reviewed_at' },
+  tourism:       { urlCol: 'tourism_doc',       statusCol: 'tourism_status',       notesCol: 'tourism_notes',       reviewedAtCol: 'tourism_reviewed_at' },
+  krapin:        { urlCol: 'krapin_doc',        statusCol: 'krapin_status',        notesCol: 'krapin_notes',        reviewedAtCol: 'krapin_reviewed_at' },
+  director_id:   { urlCol: 'director_id_doc',   statusCol: 'director_id_status',   notesCol: 'director_id_notes',   reviewedAtCol: 'director_id_reviewed_at' },
+  office_photo:  { urlCol: 'office_photo',      statusCol: 'office_photo_status',  notesCol: 'office_photo_notes',  reviewedAtCol: 'office_photo_reviewed_at' },
+};
+const REQUIRED_DOC_KEYS = ['incorporation', 'tourism', 'krapin', 'director_id'];
+
+// Recomputes the bundle-level `status` from the five per-document statuses,
+// then mirrors it onto `profiles.approved` / `profiles.verification_status`
+// — every existing query in this codebase (agents list, package-creation
+// gate, client-facing agent display) reads from `profiles`, so this is the
+// single place that keeps them truthful after any per-document change.
+//
+//   - 'approved'  → every REQUIRED doc is 'approved' (office_photo optional)
+//   - 'rejected'  → any REQUIRED doc is 'rejected' (a single rejection blocks
+//                   the agent immediately; they must fix it, not just wait)
+//   - 'pending'   → otherwise (still missing approvals, nothing rejected yet)
+const recomputeOverallStatus = async (docRow, superadminId) => {
+  const requiredStatuses = REQUIRED_DOC_KEYS.map(key => docRow[DOC_FIELD_MAP[key].statusCol]);
+
+  let overall;
+  if (requiredStatuses.includes('rejected')) overall = 'rejected';
+  else if (requiredStatuses.every(s => s === 'approved')) overall = 'approved';
+  else overall = 'pending';
+
+  const { error: bundleError } = await supabase
+    .from('agent_documents')
+    .update({ status: overall, updated_at: new Date().toISOString() })
+    .eq('id', docRow.id);
+  if (bundleError) throw bundleError;
+
+  const { error: profileError } = await supabase
+    .from('profiles')
+    .update({
+      approved: overall === 'approved',
+      verification_status: overall,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', docRow.user_id);
+  if (profileError) throw profileError;
+
+  return overall;
+};
+
+// POST /documents/:docId/verify-item
+// Approves or rejects ONE document type within a bundle. The agent only
+// becomes "genuine" (able to post packages) once every required document
+// independently reaches 'approved' — see recomputeOverallStatus above.
+router.post('/documents/:docId/verify-item', authenticateSuperadmin, async (req, res) => {
+  const { docId } = req.params;
+  const { docType, status, notes } = req.body;
+  const allowedStatuses = ['approved', 'rejected'];
+  const safeStatus = sanitizeInput((status || '').toString()).toLowerCase();
+  const safeDocType = sanitizeInput((docType || '').toString()).toLowerCase();
+  const auditAction = safeStatus === 'approved' ? AUDIT_ACTIONS.VERIFY_DOCUMENT : AUDIT_ACTIONS.REJECT_DOCUMENT;
+  const auditResourceId = docId || 'unknown';
+
+  if (!docId || typeof docId !== 'string' || !docId.trim()) {
+    await logAuditAction(req.superadmin.id, auditAction, 'document', auditResourceId, 'Invalid document id', 'failed', 'Missing or invalid document id', req);
+    return res.status(422).json({ success: false, message: 'Invalid document id' });
+  }
+  if (!DOC_FIELD_MAP[safeDocType]) {
+    await logAuditAction(req.superadmin.id, auditAction, 'document', auditResourceId, 'Invalid document type', 'failed', `Invalid docType: ${docType}`, req);
+    return res.status(422).json({ success: false, message: `Invalid document type. Allowed: ${Object.keys(DOC_FIELD_MAP).join(', ')}` });
+  }
+  if (!allowedStatuses.includes(safeStatus)) {
+    await logAuditAction(req.superadmin.id, auditAction, 'document', auditResourceId, 'Invalid status', 'failed', `Invalid status: ${status}`, req);
+    return res.status(422).json({ success: false, message: 'Invalid status' });
+  }
+
+  const fields = DOC_FIELD_MAP[safeDocType];
+
+  try {
+    // Fetch the current row first — we need every per-document status
+    // column to recompute the overall bundle status after this update,
+    // and .update().select() only reliably returns the columns we set.
+    const { data: existing, error: fetchError } = await supabase
+      .from('agent_documents')
+      .select('*')
+      .eq('id', docId)
+      .single();
+
+    if (fetchError || !existing) {
+      await logAuditAction(req.superadmin.id, auditAction, 'document', auditResourceId, 'Document not found', 'failed', fetchError?.message || 'No matching row', req);
+      return res.status(404).json({ success: false, message: 'Document not found' });
+    }
+
+    if (!existing[fields.urlCol]) {
+      await logAuditAction(req.superadmin.id, auditAction, 'document', auditResourceId, `No ${safeDocType} file uploaded`, 'failed', 'Cannot verify a document that was not uploaded', req);
+      return res.status(422).json({ success: false, message: `Agent has not uploaded a ${safeDocType.replace('_', ' ')} document yet` });
+    }
+
+    const itemUpdate = {
+      [fields.statusCol]:     safeStatus,
+      [fields.notesCol]:      sanitizeInput(notes || ''),
+      [fields.reviewedAtCol]: new Date().toISOString(),
+      // Clear any pending review request for this bundle — the admin is
+      // actively reviewing right now, so the "waiting for review" flag
+      // is stale the moment any item gets a decision.
+      review_requested_at: null,
+    };
+
+    const { data: updated, error: updateError } = await supabase
+      .from('agent_documents')
+      .update(itemUpdate)
+      .eq('id', docId)
+      .select('*')
+      .single();
+
+    if (updateError) {
+      await logAuditAction(req.superadmin.id, auditAction, 'document', auditResourceId, `${safeDocType} update failed`, 'failed', updateError.message, req);
+      throw updateError;
+    }
+
+    const overall = await recomputeOverallStatus(updated, req.superadmin.id);
+
+    await logAuditAction(
+      req.superadmin.id, auditAction, 'document', auditResourceId,
+      `${safeDocType} → ${safeStatus}${notes ? ` (${notes})` : ''}; overall bundle now ${overall}`,
+      'success', '', req,
+    );
+
+    return res.json({
+      success: true,
+      message: `${safeDocType.replace('_', ' ')} marked ${safeStatus}`,
+      data: { docType: safeDocType, status: safeStatus, overallStatus: overall },
+    });
+  } catch (err) {
+    console.error('Per-document verify error:', err);
+    await logAuditAction(req.superadmin.id, auditAction, 'document', auditResourceId, `${safeDocType} verification failed`, 'failed', err.message || 'Unknown error', req);
+    return res.status(500).json({ success: false, message: err?.message || 'Failed to verify document' });
+  }
+});
+
+// POST /documents/:docId/verify
+// LEGACY / CONVENIENCE: approves or rejects every uploaded document in the
+// bundle at once, rather than item-by-item. Kept for bulk actions, but the
+// dashboard's primary flow is now verify-item above.
 router.post('/documents/:docId/verify', authenticateSuperadmin, async (req, res) => {
   const { docId } = req.params;
   const { status, notes } = req.body;
@@ -1120,12 +1280,37 @@ router.post('/documents/:docId/verify', authenticateSuperadmin, async (req, res)
   }
 
   try {
+    // Fetch first so we only stamp a per-document status column for
+    // documents the agent actually uploaded (an unset doc stays 'pending',
+    // it doesn't get force-approved just because the bundle action was 'approved').
+    const { data: existing, error: fetchError } = await supabase
+      .from('agent_documents')
+      .select('*')
+      .eq('id', docId)
+      .single();
+
+    if (fetchError || !existing) {
+      await logAuditAction(req.superadmin.id, auditAction, 'document', auditResourceId, 'Document not found', 'failed', fetchError?.message || 'No matching row', req);
+      return res.status(404).json({ success: false, message: 'Document not found' });
+    }
+
+    const nowIso = new Date().toISOString();
     const updatePayload = {
       status: safeStatus,
       review_notes: sanitizeInput(notes || ''),
       reviewed_by: req.superadmin.id,
-      reviewed_at: new Date().toISOString(),
+      reviewed_at: nowIso,
+      review_requested_at: null,
     };
+    // Stamp every uploaded document's individual status to match the bulk
+    // decision, so verify-item and verify never disagree on the same row.
+    for (const key of Object.keys(DOC_FIELD_MAP)) {
+      const { urlCol, statusCol, reviewedAtCol } = DOC_FIELD_MAP[key];
+      if (existing[urlCol]) {
+        updatePayload[statusCol] = safeStatus;
+        updatePayload[reviewedAtCol] = nowIso;
+      }
+    }
 
     const { data: updatedDoc, error: docError } = await supabase
       .from('agent_documents')
