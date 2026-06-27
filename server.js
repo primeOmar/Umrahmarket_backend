@@ -59,6 +59,8 @@ const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:3000',
   'https://umrahmarket.vercel.app',
+  'https://umrahmarket.net',
+    'https://www.umrahmarket.net',
   ...(process.env.ALLOWED_ORIGINS?.split(',').map(o => o.trim()) || [])
 ].filter(Boolean);
 
