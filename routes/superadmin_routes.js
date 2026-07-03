@@ -19,6 +19,54 @@ const R2 = new S3Client({
   },
 });
 
+// GET /documents/:docId/signed-url?docType=incorporation
+// Returns a signed URL (server-side) for a specific document in a bundle.
+// This is useful for authenticated clients (superadmin UI) to obtain a
+// short-lived signed URL without relying on the DB having stored the URL.
+router.get('/documents/:docId/signed-url', authenticateSuperadmin, async (req, res) => {
+  try {
+    const { docId } = req.params;
+    const docType = (req.query.docType || '').toString().toLowerCase();
+
+    if (!docId) return res.status(422).json({ success: false, message: 'Missing document id' });
+    if (!DOC_FIELD_MAP[docType]) return res.status(422).json({ success: false, message: 'Invalid docType' });
+
+    const { data: existing, error: fetchError } = await supabase
+      .from('agent_documents')
+      .select('*')
+      .eq('id', docId)
+      .single();
+
+    if (fetchError || !existing) return res.status(404).json({ success: false, message: 'Document not found' });
+
+    // First try R2-sourced URLs
+    const r2Urls = await getAgentDocumentUrls(existing.user_id);
+    let url = null;
+
+    if (docType === 'office_photo') {
+      if (Array.isArray(r2Urls.office_photo) && r2Urls.office_photo.length > 0) {
+        url = r2Urls.office_photo[0].publicUrl || (r2Urls.office_photo[0].path ? await getSignedUrl(R2, new GetObjectCommand({ Bucket: R2_BUCKET, Key: r2Urls.office_photo[0].path }), { expiresIn: R2_SIGNED_URL_EXPIRES }) : null);
+      } else if (existing.office_photo) {
+        if (Array.isArray(existing.office_photo) && existing.office_photo.length > 0) url = existing.office_photo[0];
+        else url = existing.office_photo;
+      }
+    } else {
+      if (r2Urls[docType] && (r2Urls[docType].publicUrl || r2Urls[docType].path)) {
+        url = r2Urls[docType].publicUrl || (r2Urls[docType].path ? await getSignedUrl(R2, new GetObjectCommand({ Bucket: R2_BUCKET, Key: r2Urls[docType].path }), { expiresIn: R2_SIGNED_URL_EXPIRES }) : null);
+      } else if (existing[DOC_FIELD_MAP[docType].urlCol]) {
+        url = existing[DOC_FIELD_MAP[docType].urlCol];
+      }
+    }
+
+    if (!url) return res.status(404).json({ success: false, message: 'No file URL available for this document' });
+
+    return res.json({ success: true, data: { url } });
+  } catch (err) {
+    console.error('Signed URL error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to obtain signed URL' });
+  }
+});
+
 const R2_BUCKET = process.env.CLOUDFLARE_R2_BUCKET_NAME;
 const DOCUMENT_KEYS = ['incorporation', 'tourism', 'krapin', 'director_id', 'office_photo'];
 const R2_SIGNED_URL_EXPIRES = 3600;
