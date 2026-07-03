@@ -1215,7 +1215,17 @@ router.post('/documents/:docId/verify-item', authenticateSuperadmin, async (req,
       return res.status(404).json({ success: false, message: 'Document not found' });
     }
 
-    if (!existing[fields.urlCol]) {
+    let uploaded = Boolean(existing[fields.urlCol]);
+    if (!uploaded) {
+      const r2Urls = await getAgentDocumentUrls(existing.user_id);
+      if (safeDocType === 'office_photo') {
+        uploaded = Array.isArray(r2Urls.office_photo) && r2Urls.office_photo.length > 0;
+      } else if (r2Urls[safeDocType]) {
+        uploaded = Boolean(r2Urls[safeDocType].publicUrl || r2Urls[safeDocType].path);
+      }
+    }
+
+    if (!uploaded) {
       await logAuditAction(req.superadmin.id, auditAction, 'document', auditResourceId, `No ${safeDocType} file uploaded`, 'failed', 'Cannot verify a document that was not uploaded', req);
       return res.status(422).json({ success: false, message: `Agent has not uploaded a ${safeDocType.replace('_', ' ')} document yet` });
     }
