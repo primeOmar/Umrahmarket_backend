@@ -294,6 +294,7 @@ router.post('/register', async (req, res) => {
       return res.status(503).json({ success: false, message: 'Registration is disabled' });
     }
     if (!registerSecret || registerSecret !== expectedSecret) {
+      console.warn('Register warning: invalid registration secret attempt', { ip: req.ip });
       return res.status(403).json({ success: false, message: 'Invalid registration secret' });
     }
 
@@ -317,11 +318,23 @@ router.post('/register', async (req, res) => {
       });
     }
 
-    const { data: existing } = await supabase
+    const { data: existing, error: lookupError } = await supabase
       .from('superadmin_credentials')
       .select('id')
       .or(`email.eq.${email.toLowerCase()},username.eq.${username.trim()}`)
       .maybeSingle();
+
+    if (lookupError) {
+      console.error('Register error: failed to check existing admin', {
+        message: lookupError.message,
+        details: lookupError.details,
+        hint: lookupError.hint,
+        code: lookupError.code,
+        email,
+        username,
+      });
+      return res.status(500).json({ success: false, message: 'Registration failed' });
+    }
 
     if (existing) {
       return res.status(409).json({ success: false, message: 'Email or username already registered' });
@@ -341,7 +354,17 @@ router.post('/register', async (req, res) => {
       .select('id, username, email, full_name')
       .single();
 
-    if (error) throw error;
+    if (error) {
+      console.error('Register error: failed to insert admin', {
+        message: error.message,
+        details: error.details,
+        hint: error.hint,
+        code: error.code,
+        email,
+        username,
+      });
+      throw error;
+    }
 
     const defaultPermissions = [
       'view_agents', 'manage_agents',
@@ -351,11 +374,32 @@ router.post('/register', async (req, res) => {
       'view_packages', 'delete_packages',
       'view_audit_logs', 'export_data',
     ];
-    await supabase.from('superadmin_permissions').insert(
+    const { error: permissionsError } = await supabase.from('superadmin_permissions').insert(
       defaultPermissions.map(key => ({ superadmin_id: newAdmin.id, permission_key: key })),
     );
 
-    await logAuditAction(newAdmin.id, 'REGISTER', 'superadmin', newAdmin.id, 'Initial registration', 'success', '', req);
+    if (permissionsError) {
+      console.error('Register error: failed to assign default permissions', {
+        message: permissionsError.message,
+        details: permissionsError.details,
+        hint: permissionsError.hint,
+        code: permissionsError.code,
+        superadminId: newAdmin.id,
+      });
+      // Not throwing here — admin account was created successfully;
+      // permissions can be fixed manually. Adjust if this should be fatal.
+    }
+
+    try {
+      await logAuditAction(newAdmin.id, 'REGISTER', 'superadmin', newAdmin.id, 'Initial registration', 'success', '', req);
+    } catch (auditErr) {
+      console.error('Register error: failed to write audit log', {
+        message: auditErr.message,
+        stack: auditErr.stack,
+        superadminId: newAdmin.id,
+      });
+      // Non-fatal — don't block the response for an audit log failure
+    }
 
     res.status(201).json({
       success: true,
@@ -368,7 +412,13 @@ router.post('/register', async (req, res) => {
       },
     });
   } catch (err) {
-    console.error('Register error:', err);
+    console.error('Register error:', {
+      message: err.message,
+      stack: err.stack,
+      code: err.code,
+      details: err.details,
+      hint: err.hint,
+    });
     res.status(500).json({ success: false, message: 'Registration failed' });
   }
 });
