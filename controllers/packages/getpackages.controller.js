@@ -12,8 +12,12 @@ export const getAllActivePackages = async (req, res) => {
       .select(
         `id, name, type, location, description,
          price, original_price, discount, duration,
+         available_from, available_to,
+         makkah_hotel_rating,
+         makkah_check_in_date, makkah_check_out_date,
+         madinah_check_in_date, madinah_check_out_date,
          image_urls, highlights, inclusions,
-         makkah_hotel_rating, status`
+         status`
       )
       .eq('status', 'Active')
       .order('created_at', { ascending: false });
