@@ -10,6 +10,7 @@ import {
 
 import PDFDocument from 'pdfkit';
 import accountingRouter from './accounting.routes.js';
+const router = express.Router();
 const R2 = new S3Client({
   region: 'auto',
   endpoint: `https://${process.env.CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com`,
@@ -70,8 +71,6 @@ router.get('/documents/:docId/signed-url', authenticateSuperadmin, async (req, r
 const R2_BUCKET = process.env.CLOUDFLARE_R2_BUCKET_NAME;
 const DOCUMENT_KEYS = ['incorporation', 'tourism', 'krapin', 'director_id', 'office_photo'];
 const R2_SIGNED_URL_EXPIRES = 3600;
-
-const router = express.Router();
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HELPERS
@@ -279,7 +278,7 @@ const reconcileAgentDocumentsFromR2 = async () => {
 // MIDDLEWARE – authenticateSuperadmin
 // ─────────────────────────────────────────────────────────────────────────────
 
-const authenticateSuperadmin = async (req, res, next) => {
+async function authenticateSuperadmin(req, res, next) {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '').trim();
     if (!token) {
