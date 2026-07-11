@@ -23,6 +23,7 @@ const R2 = new S3Client({
 // GET /documents/:docId/signed-url?docType=incorporation
 // Returns a signed URL (server-side) for a specific document in a bundle.
 // This is useful for authenticated clients (superadmin UI) to obtain a
+// short-lived signed URL without relying on the DB having stored the URL.
 router.get('/documents/:docId/signed-url', authenticateSuperadmin, async (req, res) => {
   try {
     const { docId } = req.params;
@@ -2039,6 +2040,7 @@ router.post('/accounting/transactions/:id/email', authenticateSuperadmin, async 
     res.status(500).json({ success: false, message: 'Failed to send receipt email' });
   }
 });
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DATA EXPORT
