@@ -3,8 +3,7 @@
  * No auth: these are public profiles, unlike agent_documents.routes.js
  * (self-service, requireAuth, scoped to req.user.id).
  *
-           image_urls[], status, location, created_by (FK -> profiles.id)
- */
+ * */
 import express from 'express';
 import { supabaseAdmin as supabase } from '../config/supabase.js';
 
@@ -17,7 +16,7 @@ router.get('/', async (req, res) => {
   try {
     const { data: agents, error } = await supabase
       .from('profiles')
-      .select('id, first_name, last_name, company_name, phone, email, verification_status, approved, agent_number, office_maps_url, created_at')
+      .select('id, first_name, last_name, company_name, verification_status, approved, agent_number, office_maps_url, created_at')
       .eq('role', 'agent');
 
     if (error) throw error;
@@ -43,8 +42,6 @@ router.get('/', async (req, res) => {
       businessName: a.company_name,
       firstName: a.first_name,
       lastName: a.last_name,
-      phone: a.phone,
-      email: a.email,
       verificationStatus: a.verification_status,
       approved: a.approved,
       agentNumber: a.agent_number,
@@ -67,7 +64,7 @@ router.get('/:id', async (req, res) => {
 
     const { data: agent, error } = await supabase
       .from('profiles')
-      .select('id, first_name, last_name, company_name, phone, email, verification_status, approved, agent_number, office_maps_url, created_at')
+      .select('id, first_name, last_name, company_name, verification_status, approved, agent_number, office_maps_url, created_at')
       .eq('id', id)
       .eq('role', 'agent')
       .maybeSingle();
@@ -92,8 +89,6 @@ router.get('/:id', async (req, res) => {
         businessName: agent.company_name,
         firstName: agent.first_name,
         lastName: agent.last_name,
-        phone: agent.phone,
-        email: agent.email,
         verificationStatus: agent.verification_status,
         approved: agent.approved,
         agentNumber: agent.agent_number,
