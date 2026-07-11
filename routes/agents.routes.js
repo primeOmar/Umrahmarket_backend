@@ -1,14 +1,9 @@
 /**
  * Public agent directory — powers AgentsPage.jsx and AgentDetailPage.jsx.
- * ASSUMPTIONS — verify against actual schema before wiring in:
- *   - profiles table has a `role` column with value 'agent'
- *   - profiles columns: business_name, first_name, last_name, avatar_url,
- *     city, country, phone, email, bio, verification_status, rating,
- *     created_at
- *   - packages table has an `agent_id` FK to profiles.id, plus
- *     title, price, image, duration, status
- * Adjust `.select(...)` field lists and table/column names to match your
- * actual Supabase schema if these are off.
+ * No auth: these are public profiles, unlike agent_documents.routes.js
+ * (self-service, requireAuth, scoped to req.user.id).
+ *
+           image_urls[], status, location, created_by (FK -> profiles.id)
  */
 import express from 'express';
 import { supabaseAdmin as supabase } from '../config/supabase.js';
@@ -22,7 +17,7 @@ router.get('/', async (req, res) => {
   try {
     const { data: agents, error } = await supabase
       .from('profiles')
-      .select('id, business_name, first_name, last_name, avatar_url, city, country, verification_status, rating, created_at')
+      .select('id, first_name, last_name, company_name, phone, email, verification_status, approved, agent_number, office_maps_url, created_at')
       .eq('role', 'agent');
 
     if (error) throw error;
@@ -33,28 +28,28 @@ router.get('/', async (req, res) => {
     if (agentIds.length > 0) {
       const { data: pkgRows, error: pkgErr } = await supabase
         .from('packages')
-        .select('agent_id')
-        .in('agent_id', agentIds);
+        .select('created_by')
+        .in('created_by', agentIds);
 
       if (pkgErr) throw pkgErr;
       countMap = pkgRows.reduce((acc, p) => {
-        acc[p.agent_id] = (acc[p.agent_id] || 0) + 1;
+        acc[p.created_by] = (acc[p.created_by] || 0) + 1;
         return acc;
       }, {});
     }
 
     const result = agents.map((a) => ({
       id: a.id,
-      businessName: a.business_name,
+      businessName: a.company_name,
       firstName: a.first_name,
       lastName: a.last_name,
-      avatar: a.avatar_url,
-      city: a.city,
-      country: a.country,
-      location: [a.city, a.country].filter(Boolean).join(', '),
+      phone: a.phone,
+      email: a.email,
       verificationStatus: a.verification_status,
+      approved: a.approved,
+      agentNumber: a.agent_number,
+      officeMapsUrl: a.office_maps_url,
       packageCount: countMap[a.id] || 0,
-      rating: a.rating || 0,
     }));
 
     res.json({ success: true, agents: result });
@@ -65,14 +60,14 @@ router.get('/', async (req, res) => {
 });
 
 // ── GET /api/agents/:id ────────────────────────────────────────────────────
-// Public agent profile + the packages they've posted.
+// Public agent profile + the packages they've posted (via packages.created_by).
 router.get('/:id', async (req, res) => {
   try {
     const { id } = req.params;
 
     const { data: agent, error } = await supabase
       .from('profiles')
-      .select('id, business_name, first_name, last_name, avatar_url, city, country, phone, email, bio, verification_status, rating, created_at')
+      .select('id, first_name, last_name, company_name, phone, email, verification_status, approved, agent_number, office_maps_url, created_at')
       .eq('id', id)
       .eq('role', 'agent')
       .maybeSingle();
@@ -84,8 +79,8 @@ router.get('/:id', async (req, res) => {
 
     const { data: packages, error: pkgErr } = await supabase
       .from('packages')
-      .select('id, title, price, image, duration, status')
-      .eq('agent_id', id)
+      .select('id, name, price, original_price, discount, duration, image_urls, status, location')
+      .eq('created_by', id)
       .order('created_at', { ascending: false });
 
     if (pkgErr) throw pkgErr;
@@ -94,20 +89,27 @@ router.get('/:id', async (req, res) => {
       success: true,
       agent: {
         id: agent.id,
-        businessName: agent.business_name,
+        businessName: agent.company_name,
         firstName: agent.first_name,
         lastName: agent.last_name,
-        avatar: agent.avatar_url,
-        city: agent.city,
-        country: agent.country,
-        location: [agent.city, agent.country].filter(Boolean).join(', '),
         phone: agent.phone,
         email: agent.email,
-        bio: agent.bio,
         verificationStatus: agent.verification_status,
-        rating: agent.rating || 0,
+        approved: agent.approved,
+        agentNumber: agent.agent_number,
+        officeMapsUrl: agent.office_maps_url,
         memberSince: agent.created_at ? new Date(agent.created_at).getFullYear() : null,
-        packages: packages || [],
+        packages: (packages || []).map((p) => ({
+          id: p.id,
+          title: p.name,
+          price: p.price,
+          originalPrice: p.original_price,
+          discount: p.discount,
+          duration: p.duration,
+          image: Array.isArray(p.image_urls) ? p.image_urls[0] : null,
+          status: p.status,
+          location: p.location,
+        })),
       },
     });
   } catch (err) {
