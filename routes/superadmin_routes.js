@@ -1136,7 +1136,7 @@ router.get('/documents', authenticateSuperadmin, async (req, res) => {
         .from('agent_documents')
         .select(`
           *,
-          agent:profiles!user_id (first_name, last_name, email),
+          agent:profiles!user_id (first_name, last_name, email, office_maps_url),
           reviewer:profiles!reviewed_by (first_name, last_name)
         `)
         // Agents who explicitly asked for review float to the top, so a
@@ -1183,6 +1183,7 @@ router.get('/documents', authenticateSuperadmin, async (req, res) => {
         kraPin:           r2.krapin?.publicUrl || doc.krapin_doc,
         directorIdDoc:    r2.director_id?.publicUrl || doc.director_id_doc || null,
         officePhoto:      r2.office_photo || doc.office_photo,
+        officeMapsUrl:    doc.agent?.office_maps_url || null,
         status:           doc.status,
         reviewNotes:      doc.review_notes,
         submittedAt:      doc.submitted_at,
@@ -1325,6 +1326,25 @@ router.post('/documents/:docId/verify-item', authenticateSuperadmin, async (req,
     if (!uploaded) {
       await logAuditAction(req.superadmin.id, auditAction, 'document', auditResourceId, `No ${safeDocType} file uploaded`, 'failed', 'Cannot verify a document that was not uploaded', req);
       return res.status(422).json({ success: false, message: `Agent has not uploaded a ${safeDocType.replace('_', ' ')} document yet` });
+    }
+
+    // office_photo can't be approved on the photo alone — the admin also
+    // needs the agent's Google Maps location link to confirm the office is
+    // real and where the agent claims. Rejecting is still always allowed
+    // (an admin may reject specifically because the location is missing).
+    if (safeDocType === 'office_photo' && safeStatus === 'approved') {
+      const { data: profileRow, error: profileFetchErr } = await supabase
+        .from('profiles')
+        .select('office_maps_url')
+        .eq('id', existing.user_id)
+        .maybeSingle();
+
+      if (profileFetchErr) throw profileFetchErr;
+
+      if (!profileRow?.office_maps_url) {
+        await logAuditAction(req.superadmin.id, auditAction, 'document', auditResourceId, 'Missing office location link', 'failed', 'Cannot approve office photo without a Google Maps location link', req);
+        return res.status(422).json({ success: false, message: 'Agent has not shared a Google Maps location link for their office yet — cannot approve without it.' });
+      }
     }
 
     const itemUpdate = {
