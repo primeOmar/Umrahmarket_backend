@@ -13,10 +13,11 @@ export const getAllActivePackages = async (req, res) => {
         `id, name, type, location, description,
          price, original_price, discount, duration,
          available_from, available_to,
-         makkah_hotel_rating,
+         makkah_hotel_rating, makkah_hotel_distance,
          makkah_check_in_date, makkah_check_out_date,
          madinah_check_in_date, madinah_check_out_date,
          image_urls, highlights, inclusions,
+         agent_name, agent_number,
          status`
       )
       .eq('status', 'Active')
