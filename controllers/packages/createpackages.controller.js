@@ -28,6 +28,19 @@ function sanitizeDate(value = '') {
   return /^\d{4}-\d{2}-\d{2}$/.test(String(value).trim()) ? value.trim() : null;
 }
 
+// DB has check_dates_makkah / check_dates_madinah constraints requiring each
+// pair to be either both null or a valid range (check_out after check_in).
+// A lone date (only one of the pair set) or an inverted range would violate
+// that constraint and fail the whole write — so instead of letting the DB
+// reject the entire update, silently drop an invalid/incomplete pair here.
+function sanitizeDatePair(inRaw, outRaw) {
+  const inD  = sanitizeDate(inRaw);
+  const outD = sanitizeDate(outRaw);
+  if (!inD || !outD) return { in: null, out: null };
+  if (new Date(outD) <= new Date(inD)) return { in: null, out: null };
+  return { in: inD, out: outD };
+}
+
 function sanitizeTags(arr, maxLen = 80, maxCount = 30) {
   if (!Array.isArray(arr)) return [];
   return arr.slice(0, maxCount).map((t) => sanitizeText(t, maxLen)).filter(Boolean);
@@ -90,15 +103,15 @@ export const createPackage = async (req, res) => {
   const makkah_hotel_rating   = sanitizeNumber(req.body.makkah_hotel_rating)?.toString();
   const makkah_hotel_distance = sanitizeText(req.body.makkah_hotel_distance, 30);
   const makkah_hotel_address  = sanitizeText(req.body.makkah_hotel_address, 120);
-  const makkah_check_in_date  = sanitizeDate(req.body.makkah_check_in_date);
-  const makkah_check_out_date = sanitizeDate(req.body.makkah_check_out_date);
+  const { in: makkah_check_in_date, out: makkah_check_out_date } =
+    sanitizeDatePair(req.body.makkah_check_in_date, req.body.makkah_check_out_date);
 
  const madinah_hotel_name     = sanitizeText(req.body.madinah_hotel_name, 120)     || null;
   const madinah_hotel_rating   = sanitizeNumber(req.body.madinah_hotel_rating)?.toString();
 const madinah_hotel_distance = sanitizeText(req.body.madinah_hotel_distance, 30)  || null;
   const madinah_hotel_address  = sanitizeText(req.body.madinah_hotel_address, 120)  || null;
-  const madinah_check_in_date  = sanitizeDate(req.body.madinah_check_in_date);
-  const madinah_check_out_date = sanitizeDate(req.body.madinah_check_out_date);
+  const { in: madinah_check_in_date, out: madinah_check_out_date } =
+    sanitizeDatePair(req.body.madinah_check_in_date, req.body.madinah_check_out_date);
 
   const highlights = sanitizeTags(parseArray('highlights'));
   const inclusions = sanitizeTags(parseArray('inclusions'));
@@ -273,15 +286,15 @@ export const updatePackage = async (req, res) => {
   const makkah_hotel_rating   = sanitizeNumber(req.body.makkah_hotel_rating)?.toString();
   const makkah_hotel_distance = sanitizeText(req.body.makkah_hotel_distance, 30);
   const makkah_hotel_address  = sanitizeText(req.body.makkah_hotel_address, 120);
-  const makkah_check_in_date  = sanitizeDate(req.body.makkah_check_in_date);
-  const makkah_check_out_date = sanitizeDate(req.body.makkah_check_out_date);
+  const { in: makkah_check_in_date, out: makkah_check_out_date } =
+    sanitizeDatePair(req.body.makkah_check_in_date, req.body.makkah_check_out_date);
 
   const madinah_hotel_name     = sanitizeText(req.body.madinah_hotel_name, 120)     || null;
   const madinah_hotel_rating   = sanitizeNumber(req.body.madinah_hotel_rating)?.toString();
   const madinah_hotel_distance = sanitizeText(req.body.madinah_hotel_distance, 30)  || null;
   const madinah_hotel_address  = sanitizeText(req.body.madinah_hotel_address, 120)  || null;
-  const madinah_check_in_date  = sanitizeDate(req.body.madinah_check_in_date);
-  const madinah_check_out_date = sanitizeDate(req.body.madinah_check_out_date);
+  const { in: madinah_check_in_date, out: madinah_check_out_date } =
+    sanitizeDatePair(req.body.madinah_check_in_date, req.body.madinah_check_out_date);
 
   const highlights = sanitizeTags(parseArray('highlights'));
   const inclusions = sanitizeTags(parseArray('inclusions'));
