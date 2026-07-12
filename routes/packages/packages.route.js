@@ -1,7 +1,7 @@
 import express from 'express';
 import { parseFormData, uploadImagesToR2 } from '../../middleware/uploads/Uploadtocloudflare.js';
 import { getAgentPackages, getAllActivePackages } from '../../controllers/packages/getpackages.controller.js';
-import { createPackage } from '../../controllers/packages/createpackages.controller.js';
+import { createPackage, updatePackage } from '../../controllers/packages/createpackages.controller.js';
 import { getItinerary, saveItinerary } from '../../controllers/packages/itinerary.controller.js';
 import { verifyToken } from '../../middleware/auth.middleware.js';
 import { validatePackage } from '../../middleware/uploads/Validatepackage.js';
@@ -35,6 +35,20 @@ router.post(
 
 // GET /api/packages/getagentpackages
 router.get('/getagentpackages', verifyToken, getAgentPackages);
+
+// PUT /api/packages/:id — agent edits their own package (all fields + images)
+// Same pipeline as create: auth → approved-agent gate → parse multipart →
+// validate → upload any new images to R2 → update the record. Ownership is
+// re-checked inside updatePackage itself, not just inferred from the token.
+router.put(
+  '/:id',
+  verifyToken,
+  requireApprovedAgent,
+  parseFormData,
+  validatePackage,
+  uploadImagesToR2,
+  updatePackage
+);
 
 // GET  /api/packages/:id/itinerary  — public
 router.get('/:id/itinerary', getItinerary);
