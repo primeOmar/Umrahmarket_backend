@@ -9,7 +9,7 @@
  * document.routes.js does for GET /api/documents.
  * */
 import express from 'express';
-import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, GetObjectCommand, ListObjectsV2Command } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { supabaseAdmin as supabase } from '../config/supabase.js';
 
@@ -31,37 +31,57 @@ const BUCKET = process.env.CLOUDFLARE_R2_BUCKET_NAME;
 // once it isn't rejected. Treat missing/pending status as "still show it"
 // (matches the rest of this file's "not gated by verification" approach);
 // flip to `=== 'approved'` only if you want it hidden until reviewed.
+//
+// Mirrors document.routes.js's GET / exactly: the DB column doesn't
+// reliably hold a signable R2 key, so we list what's actually in the
+// bucket under the agent's office_photo prefix and sign THOSE keys.
+// Only if that listing comes up empty do we fall back to the raw stored
+// value, used as-is (it's already a usable URL in that case, not a key —
+// signing it again is what broke the images last time).
 const getOfficePhotoUrls = async (agentId) => {
+  let docRow = null;
   try {
-    const { data: docRow } = await supabase
+    const { data } = await supabase
       .from('agent_documents')
       .select('office_photo, office_photo_status')
       .eq('user_id', agentId)
       .maybeSingle();
-
-    if (!docRow || docRow.office_photo_status === 'rejected') return [];
-
-    const keys = Array.isArray(docRow.office_photo)
-      ? docRow.office_photo
-      : (docRow.office_photo ? [docRow.office_photo] : []);
-
-    if (keys.length === 0) return [];
-
-    const urls = await Promise.all(
-      keys.map((key) =>
-        getSignedUrl(R2, new GetObjectCommand({ Bucket: BUCKET, Key: key }), { expiresIn: 3600 })
-          .catch((err) => {
-            console.warn(`[agents] office photo signed URL failed for ${key}:`, err.message);
-            return null;
-          })
-      )
-    );
-
-    return urls.filter(Boolean);
+    docRow = data;
   } catch (err) {
     console.warn(`[agents] office photo lookup failed for ${agentId}:`, err.message);
     return [];
   }
+
+  if (!docRow || docRow.office_photo_status === 'rejected') return [];
+
+  const prefix = `documents/${agentId}/office_photo/`;
+  try {
+    const { Contents } = await R2.send(new ListObjectsV2Command({ Bucket: BUCKET, Prefix: prefix }));
+    if (Contents && Contents.length > 0) {
+      const sorted = Contents.sort((a, b) => new Date(b.LastModified) - new Date(a.LastModified));
+      const signed = (
+        await Promise.all(
+          sorted.map((obj) =>
+            getSignedUrl(R2, new GetObjectCommand({ Bucket: BUCKET, Key: obj.Key }), { expiresIn: 3600 })
+              .catch((err) => {
+                console.warn(`[agents] signed URL failed for ${obj.Key}:`, err.message);
+                return null;
+              })
+          )
+        )
+      ).filter(Boolean);
+      if (signed.length > 0) return signed;
+    }
+  } catch (err) {
+    console.warn(`[agents] office photo R2 listing failed for ${agentId}:`, err.message);
+  }
+
+  // Fallback — nothing found under the R2 prefix; use the stored value(s)
+  // directly, unsigned (same as document.routes.js's fallback branch).
+  const stored = Array.isArray(docRow.office_photo)
+    ? docRow.office_photo
+    : (docRow.office_photo ? [docRow.office_photo] : []);
+  return stored.filter(Boolean);
 };
 
 // ── GET /api/agents ───────────────────────────────────────────────────────
