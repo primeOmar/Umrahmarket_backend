@@ -16,7 +16,7 @@ router.get('/', async (req, res) => {
   try {
     const { data: agents, error } = await supabase
       .from('profiles')
-      .select('id, first_name, last_name, company_name, verification_status, approved, agent_number, office_maps_url, created_at')
+      .select('id, first_name, last_name, company_name, verification_status, approved, agent_number, office_maps_url, created_at, bio, logo_url, years_experience, specialties, website_url')
       .eq('role', 'agent');
 
     if (error) throw error;
@@ -46,6 +46,11 @@ router.get('/', async (req, res) => {
       approved: a.approved,
       agentNumber: a.agent_number,
       officeMapsUrl: a.office_maps_url,
+      bio: a.bio,
+      logoUrl: a.logo_url,
+      yearsExperience: a.years_experience,
+      specialties: a.specialties || [],
+      websiteUrl: a.website_url,
       packageCount: countMap[a.id] || 0,
     }));
 
@@ -64,7 +69,7 @@ router.get('/:id', async (req, res) => {
 
     const { data: agent, error } = await supabase
       .from('profiles')
-      .select('id, first_name, last_name, company_name, verification_status, approved, agent_number, office_maps_url, created_at')
+      .select('id, first_name, last_name, company_name, verification_status, approved, agent_number, office_maps_url, created_at, bio, logo_url, years_experience, specialties, website_url')
       .eq('id', id)
       .eq('role', 'agent')
       .maybeSingle();
@@ -93,6 +98,11 @@ router.get('/:id', async (req, res) => {
         approved: agent.approved,
         agentNumber: agent.agent_number,
         officeMapsUrl: agent.office_maps_url,
+        bio: agent.bio,
+        logoUrl: agent.logo_url,
+        yearsExperience: agent.years_experience,
+        specialties: agent.specialties || [],
+        websiteUrl: agent.website_url,
         memberSince: agent.created_at ? new Date(agent.created_at).getFullYear() : null,
         packages: (packages || []).map((p) => ({
           id: p.id,
