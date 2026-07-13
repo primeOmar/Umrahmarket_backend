@@ -7,15 +7,14 @@
  * requireAuth, and every query is scoped to req.user.id — an agent can only
  * ever read/write their own row, never another agent's.
  *
- * NOTE: adjust the `requireAuth` import path below to match wherever your
- * existing auth middleware lives (it's referenced but not included in the
- * files you shared) — this mirrors the convention agents.routes.js's
- * docblock describes for agent_documents.routes.js.
+ * NOTE: matches agent_documents.routes.js's auth pattern — requireAuth from
+ * ../middleware/auth.middleware.js sets req.user (with req.user.id) after
+ * verifying the Bearer access token against the profiles table.
  * */
 import express from 'express';
 import multer from 'multer';
 import { supabaseAdmin as supabase } from '../config/supabase.js';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth } from '../middleware/auth.middleware.js';
 
 const router = express.Router();
 
