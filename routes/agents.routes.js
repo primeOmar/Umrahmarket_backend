@@ -3,11 +3,66 @@
  * No auth: these are public profiles, unlike agent_documents.routes.js
  * (self-service, requireAuth, scoped to req.user.id).
  *
+ * Office photo is the one exception to "everything lives on profiles" —
+ * it's uploaded via document.routes.js into the agent_documents table as
+ * R2 object keys, not public URLs, so it needs the same signed-URL dance
+ * document.routes.js does for GET /api/documents.
  * */
 import express from 'express';
+import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { supabaseAdmin as supabase } from '../config/supabase.js';
 
 const router = express.Router();
+
+// ─── R2 client (read-only — presigned URLs), same config as document.routes.js ─
+const R2 = new S3Client({
+  region: 'auto',
+  endpoint: `https://${process.env.CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  credentials: {
+    accessKeyId:     process.env.CLOUDFLARE_R2_ACCESS_KEY_ID,
+    secretAccessKey: process.env.CLOUDFLARE_R2_SECRET_ACCESS_KEY,
+  },
+});
+const BUCKET = process.env.CLOUDFLARE_R2_BUCKET_NAME;
+
+// Office photo is agent-submitted KYC material, not something re-uploaded
+// through the profile editor — so unlike bio/logo, only show it publicly
+// once it isn't rejected. Treat missing/pending status as "still show it"
+// (matches the rest of this file's "not gated by verification" approach);
+// flip to `=== 'approved'` only if you want it hidden until reviewed.
+const getOfficePhotoUrls = async (agentId) => {
+  try {
+    const { data: docRow } = await supabase
+      .from('agent_documents')
+      .select('office_photo, office_photo_status')
+      .eq('user_id', agentId)
+      .maybeSingle();
+
+    if (!docRow || docRow.office_photo_status === 'rejected') return [];
+
+    const keys = Array.isArray(docRow.office_photo)
+      ? docRow.office_photo
+      : (docRow.office_photo ? [docRow.office_photo] : []);
+
+    if (keys.length === 0) return [];
+
+    const urls = await Promise.all(
+      keys.map((key) =>
+        getSignedUrl(R2, new GetObjectCommand({ Bucket: BUCKET, Key: key }), { expiresIn: 3600 })
+          .catch((err) => {
+            console.warn(`[agents] office photo signed URL failed for ${key}:`, err.message);
+            return null;
+          })
+      )
+    );
+
+    return urls.filter(Boolean);
+  } catch (err) {
+    console.warn(`[agents] office photo lookup failed for ${agentId}:`, err.message);
+    return [];
+  }
+};
 
 // ── GET /api/agents ───────────────────────────────────────────────────────
 // Public list of all agents. Not gated by verification status — the
@@ -87,6 +142,8 @@ router.get('/:id', async (req, res) => {
 
     if (pkgErr) throw pkgErr;
 
+    const officePhotos = await getOfficePhotoUrls(id);
+
     res.json({
       success: true,
       agent: {
@@ -103,6 +160,7 @@ router.get('/:id', async (req, res) => {
         yearsExperience: agent.years_experience,
         specialties: agent.specialties || [],
         websiteUrl: agent.website_url,
+        officePhotos,
         memberSince: agent.created_at ? new Date(agent.created_at).getFullYear() : null,
         packages: (packages || []).map((p) => ({
           id: p.id,
