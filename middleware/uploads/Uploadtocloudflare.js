@@ -1,5 +1,5 @@
 import multer from 'multer';
-import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, PutObjectCommand, DeleteObjectsCommand } from '@aws-sdk/client-s3';
 import { fileTypeFromBuffer } from 'file-type';
 import crypto from 'crypto';
 import path from 'path';
@@ -12,6 +12,7 @@ import logger, { logFileUpload, logSuspiciousActivity } from '../../config/logge
  * Exports:
  *  - parseFormData        — image uploads  (packages flow)
  *  - uploadImagesToR2     — image uploads  (packages flow)
+ *  - deleteImagesFromR2   — image cleanup  (packages flow — delete/edit)
  *  - parseDocumentData    — document uploads (agent documents flow)
  *  - uploadDocumentsToR2  — document uploads (agent documents flow)
  */
@@ -125,6 +126,39 @@ export const uploadImagesToR2 = async (req, res, next) => {
   } catch (error) {
     logger.error('R2 image upload failed', { error: error.message, userId: req.userId });
     return res.status(500).json({ success: false, error: 'Image upload failed. Please try again.' });
+  }
+};
+
+// Step 3 — cleanup: delete images from R2 (package deletion + edit removals).
+// Accepts the public URLs as stored in `image_urls`. Only ever strips keys
+// that actually live under this PUBLIC_URL — anything else (a stray external
+// URL, a null, etc.) is silently skipped rather than risking a malformed
+// delete. Best-effort: never throws — a dangling R2 object after a DB write
+// has already succeeded is a much smaller problem than a failed API response,
+// so callers should fire this and log, not await-and-fail on it.
+export const deleteImagesFromR2 = async (urls = []) => {
+  const prefix = `${PUBLIC_URL}/`;
+  const keys = (urls || [])
+    .filter((u) => typeof u === 'string' && u.startsWith(prefix))
+    .map((u) => u.slice(prefix.length));
+
+  if (keys.length === 0) return { deleted: 0, failed: 0 };
+
+  try {
+    // DeleteObjectsCommand caps at 1000 keys/call — packages max out at 10
+    // images, so a single batch is always enough here.
+    const result = await R2.send(new DeleteObjectsCommand({
+      Bucket: BUCKET,
+      Delete: { Objects: keys.map((Key) => ({ Key })), Quiet: true },
+    }));
+    const failed = result.Errors?.length ?? 0;
+    if (failed > 0) {
+      logger.error('R2 image cleanup partial failure', { failed, errors: result.Errors });
+    }
+    return { deleted: keys.length - failed, failed };
+  } catch (error) {
+    logger.error('R2 image cleanup failed', { error: error.message, keys });
+    return { deleted: 0, failed: keys.length };
   }
 };
 

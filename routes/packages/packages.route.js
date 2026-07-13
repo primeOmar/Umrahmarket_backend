@@ -1,7 +1,7 @@
 import express from 'express';
 import { parseFormData, uploadImagesToR2 } from '../../middleware/uploads/Uploadtocloudflare.js';
 import { getAgentPackages, getAllActivePackages } from '../../controllers/packages/getpackages.controller.js';
-import { createPackage, updatePackage } from '../../controllers/packages/createpackages.controller.js';
+import { createPackage, updatePackage, deletePackage } from '../../controllers/packages/createpackages.controller.js';
 import { getItinerary, saveItinerary } from '../../controllers/packages/itinerary.controller.js';
 import { verifyToken } from '../../middleware/auth.middleware.js';
 import { validatePackage } from '../../middleware/uploads/Validatepackage.js';
@@ -49,6 +49,9 @@ router.put(
   uploadImagesToR2,
   updatePackage
 );
+
+// DELETE /api/packages/:id — agent deletes their own package
+router.delete('/:id', verifyToken, deletePackage);
 
 // GET  /api/packages/:id/itinerary  — public
 router.get('/:id/itinerary', getItinerary);

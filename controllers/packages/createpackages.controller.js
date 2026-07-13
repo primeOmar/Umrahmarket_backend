@@ -1,4 +1,5 @@
 import supabase from '../../config/supabase.js';
+import { deleteImagesFromR2 } from '../../middleware/uploads/Uploadtocloudflare.js';
 
 export const handleDatabaseError = (res, error) => {
   console.error('Database error:', error);
@@ -247,7 +248,7 @@ export const updatePackage = async (req, res) => {
 
   const { data: existing, error: fetchErr } = await supabase
     .from('packages')
-    .select('id, created_by')
+    .select('id, created_by, image_urls')
     .eq('id', id)
     .single();
 
@@ -355,6 +356,18 @@ export const updatePackage = async (req, res) => {
 
     const record = data?.[0] ?? null;
 
+    // Any image that was on the package before but isn't in the new
+    // image_urls is one the agent removed (or replaced) — clean it up from
+    // R2. Fire-and-forget: the update already succeeded, so a cleanup
+    // failure here shouldn't turn into a failed response.
+    const previousUrls = Array.isArray(existing.image_urls) ? existing.image_urls : [];
+    const removedUrls = previousUrls.filter((u) => !image_urls.includes(u));
+    if (removedUrls.length > 0) {
+      deleteImagesFromR2(removedUrls).catch((err) =>
+        console.error('[updatePackage] R2 cleanup failed:', err.message)
+      );
+    }
+
     return res.status(200).json({
       success: true,
       message: `Package "${name}" has been updated successfully.`,
@@ -370,6 +383,58 @@ export const updatePackage = async (req, res) => {
         message: `A package with this ${field} already exists.`,
       });
     }
+    return handleDatabaseError(res, error);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// deletePackage  DELETE /api/packages/:id
+// Agent can delete their own package. Ownership re-verified server-side —
+// the frontend already had a delete confirmation modal + packagesApi call
+// wired up, but there was no matching route, so it silently failed (404).
+// Also cleans up the package's images from R2 after the row is gone.
+// ─────────────────────────────────────────────────────────────────────────────
+export const deletePackage = async (req, res) => {
+  const { id } = req.params;
+  const userId = req.user.id;
+
+  const { data: existing, error: fetchErr } = await supabase
+    .from('packages')
+    .select('id, created_by, name, image_urls')
+    .eq('id', id)
+    .single();
+
+  if (fetchErr || !existing) {
+    return res.status(404).json({ success: false, message: 'Package not found.' });
+  }
+  if (existing.created_by !== userId) {
+    return res.status(403).json({ success: false, message: 'You do not have permission to delete this package.' });
+  }
+
+  try {
+    const { error } = await supabase
+      .from('packages')
+      .delete()
+      .eq('id', id);
+
+    if (error) {
+      console.error('[deletePackage] Supabase delete error:', error);
+      throw error;
+    }
+
+    // Row is gone either way at this point — cleanup is best-effort and
+    // shouldn't turn into a failed response if R2 hiccups.
+    if (Array.isArray(existing.image_urls) && existing.image_urls.length > 0) {
+      deleteImagesFromR2(existing.image_urls).catch((err) =>
+        console.error('[deletePackage] R2 cleanup failed:', err.message)
+      );
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: `Package "${existing.name}" has been deleted.`,
+    });
+  } catch (error) {
     return handleDatabaseError(res, error);
   }
 };
