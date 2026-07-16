@@ -4,7 +4,7 @@ import { getAgentPackages, getAllActivePackages } from '../../controllers/packag
 import { createPackage, updatePackage, deletePackage } from '../../controllers/packages/createpackages.controller.js';
 import { getItinerary, saveItinerary } from '../../controllers/packages/itinerary.controller.js';
 import { verifyToken } from '../../middleware/auth.middleware.js';
-import { validatePackage } from '../../middleware/uploads/Validatepackage.js';
+import { validatePackage } from '../../middleware/uploads/validatePackage.js';
 import { requireApprovedAgent } from '../../middleware/agentVerification.middleware.js';
 
 const router = express.Router();
