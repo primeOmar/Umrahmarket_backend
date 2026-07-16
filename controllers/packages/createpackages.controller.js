@@ -7,7 +7,9 @@ export const handleDatabaseError = (res, error) => {
 };
 
 const ALLOWED_TYPES     = ['umrah', 'hajj'];
-const ALLOWED_LOCATIONS = ['makkah', 'madinah', 'jeddah'];
+// A package's `location` is one of three coverage tiers, not an independent
+// single city — keep in sync with validatePackage.js's ALLOWED_LOCATIONS.
+const ALLOWED_LOCATIONS = ['makkah', 'makkah_madinah', 'makkah_madinah_jeddah'];
 
 function sanitizeText(value = '', maxLen = 120) {
   return String(value)

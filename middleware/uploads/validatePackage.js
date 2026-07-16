@@ -8,7 +8,10 @@ import logger from '../../config/logger.js';
  */
 
 const ALLOWED_TYPES     = ['umrah', 'hajj'];
-const ALLOWED_LOCATIONS = ['makkah', 'madinah', 'jeddah'];
+// A package's `location` is one of three coverage tiers (set in the agent
+// dashboard's "Primary Location" field) — not an independent single city —
+// so clients can filter by exactly which cities a package covers.
+const ALLOWED_LOCATIONS = ['makkah', 'makkah_madinah', 'makkah_madinah_jeddah'];
 
 export const validatePackage = (req, res, next) => {
   const errors = [];
