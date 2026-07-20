@@ -6,12 +6,24 @@ import { notifyAgents } from './chatMailer.js';
  * publicChat.js — controllers for the public website live chat.
  * Suggested location:  controllers/chat/publicChat.js
  *
- * Data lives in the `public_chat_conversations` table (see
- * public_chat_schema.sql). All messages — visitor sends, agent replies and
- * system notes — are stored in the row's `messages` JSONB array, each entry
- * shaped as { id, sender, text, created_at }. Appends go through the
- * `append_public_chat_message()` Postgres function so counters and the
- * needs_agent flag update atomically.
+ * Data lives in the `public_chat_conversations` table. All messages are stored
+ * in the row's `messages` JSONB array as { id, sender, text, created_at }.
+ * Appends go through the `append_public_chat_message()` Postgres function so
+ * counters and the needs_agent flag update atomically.
+ *
+ * THIS REVISION ADDS TYPING PRESENCE (polling-based):
+ *   The row gains two timestamp columns —
+ *     ALTER TABLE public_chat_conversations
+ *       ADD COLUMN IF NOT EXISTS visitor_typing_at timestamptz,
+ *       ADD COLUMN IF NOT EXISTS agent_typing_at   timestamptz;
+ *   Each side POSTs a throttled "typing" ping that stamps its column with
+ *   now(). The other side's poll returns a boolean derived from freshness
+ *   (stamp within TYPING_FRESH_MS). Sending a real message clears your own
+ *   stamp so the indicator disappears the moment the message lands.
+ *
+ * New routes to register:
+ *   publicChatRouter.post('/chat/conversations/:id/typing', setVisitorTyping);
+ *   superadminChatRouter.post('/superadmin/public-chats/:id/typing', setAgentTyping);
  */
 
 export const handleDatabaseError = (res, error) => {
@@ -35,6 +47,17 @@ const TABLE = 'public_chat_conversations';
 const PHONE_REGEX = /^\+?[0-9][0-9\s\-()]{6,18}[0-9]$/;
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+// A typing stamp older than this is considered stale (the person stopped).
+// Slightly longer than the widget's 4s poll so the indicator doesn't flicker
+// between polls while someone is actively composing.
+const TYPING_FRESH_MS = 8000;
+
+const isTypingFresh = (ts) => {
+  if (!ts) return false;
+  const t = new Date(ts).getTime();
+  return Number.isFinite(t) && Date.now() - t < TYPING_FRESH_MS;
+};
+
 const buildMessage = (sender, text) => ({
   id: crypto.randomUUID(),
   sender, // 'visitor' | 'agent' | 'system'
@@ -50,6 +73,22 @@ const appendMessage = async (conversationId, message) => {
   });
   if (error) throw new Error(error.message);
   return data; // full updated conversation row
+};
+
+/**
+ * Best-effort update of a typing timestamp. Never throws — presence is
+ * cosmetic and must not break message flows.
+ */
+const stampTyping = async (conversationId, column, value) => {
+  try {
+    await supabase
+      .from(TABLE)
+      .update({ [column]: value })
+      .eq('id', conversationId)
+      .neq('status', 'closed');
+  } catch {
+    /* ignore — next ping will try again */
+  }
 };
 
 /** Map a DB row to the shape the superadmin PublicChatTab expects. */
@@ -131,7 +170,7 @@ export const startConversation = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // getVisitorMessages   GET /api/chat/conversations/:id/messages   (public)
-// The visitor's widget polls this for agent replies.
+// The visitor's widget polls this for agent replies AND typing presence.
 // ─────────────────────────────────────────────────────────────────────────────
 export const getVisitorMessages = async (req, res) => {
   const { id } = req.params;
@@ -143,7 +182,7 @@ export const getVisitorMessages = async (req, res) => {
   try {
     const { data, error } = await supabase
       .from(TABLE)
-      .select('id, status, messages')
+      .select('id, status, messages, agent_typing_at')
       .eq('id', id)
       .single();
 
@@ -151,7 +190,12 @@ export const getVisitorMessages = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Conversation not found.' });
     }
 
-    return res.status(200).json({ success: true, status: data.status, messages: data.messages });
+    return res.status(200).json({
+      success: true,
+      status: data.status,
+      messages: data.messages,
+      agent_typing: data.status !== 'closed' && isTypingFresh(data.agent_typing_at),
+    });
 
   } catch (error) {
     return handleDatabaseError(res, error);
@@ -177,6 +221,9 @@ export const sendVisitorMessage = async (req, res) => {
     const message = buildMessage('visitor', text);
     const conversation = await appendMessage(id, message);
 
+    // The message landed — the "visitor is typing" stamp is now stale.
+    stampTyping(id, 'visitor_typing_at', null); // fire-and-forget
+
     // Alert human agents — never blocks or fails the visitor's request
     notifyAgents(conversation, text);
 
@@ -193,6 +240,19 @@ export const sendVisitorMessage = async (req, res) => {
     }
     return handleDatabaseError(res, error);
   }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// setVisitorTyping   POST /api/chat/conversations/:id/typing   (public)
+// Throttled ping from the widget while the visitor is composing.
+// ─────────────────────────────────────────────────────────────────────────────
+export const setVisitorTyping = async (req, res) => {
+  const { id } = req.params;
+  if (!id) {
+    return res.status(400).json({ success: false, message: 'Conversation id is required.' });
+  }
+  await stampTyping(id, 'visitor_typing_at', new Date().toISOString());
+  return res.status(204).end();
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -219,6 +279,7 @@ export const listConversations = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // getConversationMessages   GET /api/superadmin/public-chats/:id/messages
+// Now also returns visitor typing presence for the open-thread indicator.
 // ─────────────────────────────────────────────────────────────────────────────
 export const getConversationMessages = async (req, res) => {
   const { id } = req.params;
@@ -230,7 +291,7 @@ export const getConversationMessages = async (req, res) => {
   try {
     const { data, error } = await supabase
       .from(TABLE)
-      .select('id, status, messages')
+      .select('id, status, messages, visitor_typing_at')
       .eq('id', id)
       .single();
 
@@ -238,7 +299,12 @@ export const getConversationMessages = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Conversation not found.' });
     }
 
-    return res.status(200).json({ success: true, status: data.status, data: data.messages });
+    return res.status(200).json({
+      success: true,
+      status: data.status,
+      data: data.messages,
+      visitor_typing: data.status !== 'closed' && isTypingFresh(data.visitor_typing_at),
+    });
 
   } catch (error) {
     return handleDatabaseError(res, error);
@@ -264,6 +330,9 @@ export const sendAgentReply = async (req, res) => {
     const message = buildMessage('agent', text);
     const conversation = await appendMessage(id, message);
 
+    // The reply landed — the "agent is typing" stamp is now stale.
+    stampTyping(id, 'agent_typing_at', null); // fire-and-forget
+
     return res.status(201).json({ success: true, message, messages: conversation.messages });
 
   } catch (error) {
@@ -272,6 +341,19 @@ export const sendAgentReply = async (req, res) => {
     }
     return handleDatabaseError(res, error);
   }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// setAgentTyping   POST /api/superadmin/public-chats/:id/typing
+// Throttled ping from the dashboard while an agent is composing a reply.
+// ─────────────────────────────────────────────────────────────────────────────
+export const setAgentTyping = async (req, res) => {
+  const { id } = req.params;
+  if (!id) {
+    return res.status(400).json({ success: false, message: 'Conversation id is required.' });
+  }
+  await stampTyping(id, 'agent_typing_at', new Date().toISOString());
+  return res.status(204).end();
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -307,6 +389,8 @@ export const closeConversation = async (req, res) => {
         needs_agent: false,
         close_reason: reason,
         closed_at: new Date().toISOString(),
+        visitor_typing_at: null,
+        agent_typing_at: null,
       })
       .eq('id', id)
       .select()
