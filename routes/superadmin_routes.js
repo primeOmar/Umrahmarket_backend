@@ -278,7 +278,7 @@ const reconcileAgentDocumentsFromR2 = async () => {
 // MIDDLEWARE – authenticateSuperadmin
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function authenticateSuperadmin(req, res, next) {
+export async function authenticateSuperadmin(req, res, next) {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '').trim();
     if (!token) {
