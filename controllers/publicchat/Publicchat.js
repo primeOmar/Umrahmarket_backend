@@ -5,35 +5,40 @@ import { notifyAgents } from './chatMailer.js';
 /**
  * publicChat.js — controllers for the public website live chat.
  *
- * REALTIME REVISION 3 — client-supplied message ids, for direct P2P delivery.
+ * REALTIME REVISION 4 — DB-backed unread_count.
  *
- * ChatWidget and PublicChatTab now broadcast a message directly to each
- * other over Realtime the instant someone hits send — the same channel
- * typing already uses, no backend round trip required for that instant
- * delivery. This backend path still runs on every send: it's the durable
- * copy (Postgres) and the reconciling broadcast that catches anyone who
- * missed the direct one (a tab that just reconnected, a second agent who
- * wasn't watching that thread, etc).
+ * Unread badges were previously pure client-side state, rebuilt from
+ * whatever broadcasts a given browser tab happened to see. That breaks the
+ * moment a second agent window opens, or an existing one is refreshed —
+ * there's no history to replay, so it starts blank and stays wrong until
+ * fresh traffic arrives.
  *
- * For the direct broadcast and the backend-persisted copy of the same
- * message to be recognized as *the same message*, they need to share an
- * id. The client now generates the id itself, uses it for both the direct
- * broadcast and this REST call, and this file uses that same id when
- * persisting instead of minting a new one. `id` is optional and validated
- * as a UUID; if missing or malformed we fall back to generating one, so
- * this stays backward compatible with older clients.
+ * Fixed by making unread_count a real column (see
+ * public_chat_unread_migration.sql), maintained here:
+ *   - incremented via the increment_public_chat_unread() RPC on every
+ *     visitor message
+ *   - reset to 0 via reset_public_chat_unread() on every agent reply,
+ *     on close, and via the new markConversationRead() endpoint (called
+ *     when an agent opens a thread)
+ *   - included in every 'conversation_updated' broadcast (via toListShape),
+ *     so any window — new tab, refreshed tab, a different agent entirely —
+ *     converges on the same number the instant it (re)connects, and stays
+ *     in sync as other agents read/reply.
  *
- * broadcastConversationUpdate now also includes `lastMessageId` so the
- * admin grid can dedupe an unread bump against the direct
- * 'visitor_message' broadcast by id, rather than by comparing message
- * counts — which breaks the moment the two paths for the same message
- * land in different order.
+ * The direct 'visitor_message' / 'message_sent' broadcasts from REALTIME
+ * REVISION 3 are unaffected and still give the instant, backend-independent
+ * feel — this is just what makes the *number* correct everywhere, not just
+ * in the tab that happened to be open when it changed.
  *
- * REALTIME REVISION 2 (still in effect) — fix for Render free-tier
- * spin-down: broadcasts are awaited before the response is sent, and built
- * fresh per call (subscribe, send, remove) instead of cached across
- * requests, so a process that was frozen/suspended between requests can't
- * hand a broadcast to an already-dead socket.
+ * REALTIME REVISION 3 (still in effect) — client-supplied message ids, so
+ * a direct broadcast and its persisted copy share an id and never render
+ * twice.
+ *
+ * REALTIME REVISION 2 (still in effect) — broadcasts are awaited before the
+ * response is sent, and built fresh per call (subscribe, send, remove)
+ * instead of cached across requests, so a process that was frozen/
+ * suspended between requests (Render free spin-down) can't hand a
+ * broadcast to an already-dead socket.
  */
 
 export const handleDatabaseError = (res, error) => {
@@ -60,6 +65,12 @@ const PHONE_REGEX = /^\+?[0-9][0-9\s\-()]{6,18}[0-9]$/;
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+// Every column the dashboard needs, including the new unread_count.
+const ROW_SELECT =
+  'id, visitor_name, visitor_phone, visitor_email, status, needs_agent, unread_count, message_count, last_message, last_sender, last_activity, page_url, created_at, close_reason, messages';
+const ROW_SELECT_NO_MESSAGES =
+  'id, visitor_name, visitor_phone, visitor_email, status, needs_agent, unread_count, message_count, last_message, last_sender, last_activity, page_url, created_at, close_reason';
+
 /** Use a client-supplied id if present and well-formed, else mint one. */
 const resolveMessageId = (requestedId) =>
   typeof requestedId === 'string' && UUID_REGEX.test(requestedId) ? requestedId : crypto.randomUUID();
@@ -81,6 +92,22 @@ const appendMessage = async (conversationId, message) => {
   return data; // full updated conversation row
 };
 
+/** Fetch the current unread_count for a conversation (authoritative). */
+const fetchUnreadCount = async (conversationId) => {
+  const { data } = await supabase.from(TABLE).select('unread_count').eq('id', conversationId).single();
+  return data?.unread_count ?? 0;
+};
+
+const incrementUnread = async (conversationId) => {
+  await supabase.rpc('increment_public_chat_unread', { p_conversation_id: conversationId });
+  return fetchUnreadCount(conversationId);
+};
+
+const resetUnread = async (conversationId) => {
+  await supabase.rpc('reset_public_chat_unread', { p_conversation_id: conversationId });
+  return 0;
+};
+
 /** Map a DB row to the shape the superadmin PublicChatTab expects. */
 const toListShape = (row) => ({
   id: row.id,
@@ -89,6 +116,7 @@ const toListShape = (row) => ({
   visitorEmail: row.visitor_email,
   status: row.status,
   escalated: row.needs_agent, // "Needs reply" badge
+  unreadCount: row.unread_count ?? 0,
   messageCount: row.message_count,
   lastMessage: row.last_message,
   lastSender: row.last_sender,
@@ -148,10 +176,11 @@ const broadcast = async (channelName, event, payload) => {
 };
 
 /**
- * Admin-grid update, tagged with the id of the message that produced it.
- * PublicChatTab dedupes its unread bump against this id, so it never
- * double-counts a message that already arrived via the visitor's direct
- * 'visitor_message' broadcast.
+ * Admin-grid update, tagged with the id of the message that produced it
+ * (dedupes an agent tab's own optimistic bump against this event) and
+ * carrying the authoritative unread_count from the DB — this is what lets
+ * a second agent window, or a refreshed one, show the correct number
+ * immediately instead of starting from zero.
  */
 const broadcastConversationUpdate = (conversationRow) => {
   const lastMessageId = Array.isArray(conversationRow.messages) && conversationRow.messages.length
@@ -202,10 +231,9 @@ export const startConversation = async (req, res) => {
         message_count: greeting.length,
         last_message: greeting[greeting.length - 1].text,
         last_sender: 'agent',
+        unread_count: 0, // greeting is from us, nothing unread yet
       }])
-      .select(
-        'id, visitor_name, visitor_phone, visitor_email, status, needs_agent, message_count, last_message, last_sender, last_activity, page_url, created_at, close_reason, messages'
-      )
+      .select(ROW_SELECT)
       .single();
 
     if (error) throw error;
@@ -254,9 +282,7 @@ export const getVisitorMessages = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // sendVisitorMessage   POST /api/chat/conversations/:id/messages   (public)
-// Expects: { text, id? } — id, if provided, is the id the widget already
-// used for its direct optimistic broadcast; reusing it here lets every
-// path agree on "this is the same message."
+// Expects: { text, id? }
 // ─────────────────────────────────────────────────────────────────────────────
 export const sendVisitorMessage = async (req, res) => {
   const { id: conversationId } = req.params;
@@ -273,6 +299,10 @@ export const sendVisitorMessage = async (req, res) => {
   try {
     const message = buildMessage('visitor', text, requestedId);
     const conversation = await appendMessage(conversationId, message);
+
+    // A visitor message always adds one unread, for every agent watching
+    // the grid — regardless of which window/tab they're in.
+    conversation.unread_count = await incrementUnread(conversationId);
 
     await broadcastMessagesUpdated(conversationId, conversation.messages, conversation.status);
     await broadcastConversationUpdate(conversation);
@@ -301,9 +331,7 @@ export const listConversations = async (req, res) => {
   try {
     const { data, error } = await supabase
       .from(TABLE)
-      .select(
-        'id, visitor_name, visitor_phone, visitor_email, status, needs_agent, message_count, last_message, last_sender, last_activity, page_url, created_at, close_reason'
-      )
+      .select(ROW_SELECT_NO_MESSAGES)
       .order('last_activity', { ascending: false })
       .limit(200);
 
@@ -346,8 +374,9 @@ export const getConversationMessages = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // sendAgentReply   POST /api/superadmin/public-chats/:id/messages
-// Expects: { text, id? } — same client-supplied-id contract as
-// sendVisitorMessage.
+// Expects: { text, id? }
+// A reply implies the agent has read the thread, so this resets
+// unread_count to 0 for everyone watching the grid.
 // ─────────────────────────────────────────────────────────────────────────────
 export const sendAgentReply = async (req, res) => {
   const { id: conversationId } = req.params;
@@ -364,6 +393,7 @@ export const sendAgentReply = async (req, res) => {
   try {
     const message = buildMessage('agent', text, requestedId);
     const conversation = await appendMessage(conversationId, message);
+    conversation.unread_count = await resetUnread(conversationId);
 
     await broadcastMessagesUpdated(conversationId, conversation.messages, conversation.status);
     await broadcastConversationUpdate(conversation);
@@ -379,7 +409,38 @@ export const sendAgentReply = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// markConversationRead   POST /api/superadmin/public-chats/:id/read
+// Called when an agent opens a thread, even if they don't reply right
+// away. Resets unread_count to 0 and broadcasts it, so every other agent
+// window sees the badge clear too — not just the one that opened it.
+// ─────────────────────────────────────────────────────────────────────────────
+export const markConversationRead = async (req, res) => {
+  const { id } = req.params;
+
+  if (!id) {
+    return res.status(400).json({ success: false, message: 'Conversation id is required.' });
+  }
+
+  try {
+    await resetUnread(id);
+
+    const { data, error } = await supabase.from(TABLE).select(ROW_SELECT).eq('id', id).single();
+    if (error || !data) {
+      return res.status(404).json({ success: false, message: 'Conversation not found.' });
+    }
+
+    await broadcastConversationUpdate(data);
+
+    return res.status(200).json({ success: true, data: toListShape(data) });
+
+  } catch (error) {
+    return handleDatabaseError(res, error);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // closeConversation   POST /api/superadmin/public-chats/:id/close
+// Expects: { reason }
 // ─────────────────────────────────────────────────────────────────────────────
 export const closeConversation = async (req, res) => {
   const { id } = req.params;
@@ -407,11 +468,12 @@ export const closeConversation = async (req, res) => {
       .update({
         status: 'closed',
         needs_agent: false,
+        unread_count: 0,
         close_reason: reason,
         closed_at: new Date().toISOString(),
       })
       .eq('id', id)
-      .select('id, visitor_name, visitor_phone, visitor_email, status, needs_agent, message_count, last_message, last_sender, last_activity, page_url, created_at, close_reason, messages')
+      .select(ROW_SELECT)
       .single();
 
     if (error || !data) {
