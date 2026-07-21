@@ -4,54 +4,36 @@ import { notifyAgents } from './chatMailer.js';
 
 /**
  * publicChat.js — controllers for the public website live chat.
- * Suggested location:  controllers/chat/publicChat.js
  *
- * Data lives in the `public_chat_conversations` table. All messages are
- * stored in the row's `messages` JSONB array as { id, sender, text,
- * created_at }. Appends go through the `append_public_chat_message()`
- * Postgres function so counters and the needs_agent flag update atomically.
+ * REALTIME REVISION 3 — client-supplied message ids, for direct P2P delivery.
  *
- * REALTIME REVISION 2 — fix for Render free-tier spin-down.
+ * ChatWidget and PublicChatTab now broadcast a message directly to each
+ * other over Realtime the instant someone hits send — the same channel
+ * typing already uses, no backend round trip required for that instant
+ * delivery. This backend path still runs on every send: it's the durable
+ * copy (Postgres) and the reconciling broadcast that catches anyone who
+ * missed the direct one (a tab that just reconnected, a second agent who
+ * wasn't watching that thread, etc).
  *
- * The previous revision cached one long-lived Realtime channel per name in
- * a module-level Map, and fired broadcasts without awaiting them before
- * the HTTP response was sent. That's fine on an always-on process, but on
- * a host that can idle-suspend the process (Render free web services spin
- * down after ~15 min with no HTTP traffic):
+ * For the direct broadcast and the backend-persisted copy of the same
+ * message to be recognized as *the same message*, they need to share an
+ * id. The client now generates the id itself, uses it for both the direct
+ * broadcast and this REST call, and this file uses that same id when
+ * persisting instead of minting a new one. `id` is optional and validated
+ * as a UUID; if missing or malformed we fall back to generating one, so
+ * this stays backward compatible with older clients.
  *
- *   1. A cold start after spin-down can take longer than the channel
- *      subscribe timeout, so the very first broadcast after waking up
- *      silently fails (caught, logged, never surfaced).
- *   2. If the process is frozen rather than cleanly restarted, a cached
- *      channel's underlying socket can die without ever firing the
- *      CLOSED/CHANNEL_ERROR callback that would evict it from the cache —
- *      so later requests keep reusing a channel whose socket is dead.
- *   3. Because the broadcast calls were not awaited, the request handler
- *      could return its HTTP response (and the platform could recycle the
- *      process) before the broadcast's websocket send had actually
- *      flushed.
+ * broadcastConversationUpdate now also includes `lastMessageId` so the
+ * admin grid can dedupe an unread bump against the direct
+ * 'visitor_message' broadcast by id, rather than by comparing message
+ * counts — which breaks the moment the two paths for the same message
+ * land in different order.
  *
- * Fix: broadcasts are now (a) awaited before the response is sent, and
- * (b) built fresh per call — subscribe, send, then remove — instead of
- * cached across requests. This trades a small per-message handshake cost
- * for immunity to stale/dead sockets left over from a suspend/resume
- * cycle. For this traffic volume (human-typed chat messages) that cost is
- * negligible.
- *
- * If you later move off a spin-down-capable host, the long-lived cache
- * from the previous revision is a reasonable optimization to bring back —
- * but only alongside a keep-alive ping so the process never actually
- * spins down while conversations are active. On Render specifically,
- * either upgrade off the free instance type or hit a lightweight health
- * endpoint from an external cron every 5–10 minutes to prevent spin-down;
- * cold starts are the biggest lever here, bigger than anything in this
- * file.
- *
- * SECURITY NOTE: broadcasting is independent of table RLS — it only
- * requires the Realtime service (on by default). Channel names are scoped
- * by the conversation's UUID, matching the same trust boundary the REST
- * endpoints already use. For stronger guarantees, enable Supabase Realtime
- * Authorization (private channels gated by a Supabase JWT).
+ * REALTIME REVISION 2 (still in effect) — fix for Render free-tier
+ * spin-down: broadcasts are awaited before the response is sent, and built
+ * fresh per call (subscribe, send, remove) instead of cached across
+ * requests, so a process that was frozen/suspended between requests can't
+ * hand a broadcast to an already-dead socket.
  */
 
 export const handleDatabaseError = (res, error) => {
@@ -76,9 +58,14 @@ const CHANNEL_SUBSCRIBE_TIMEOUT_MS = 15000; // generous — covers a Render cold
 
 const PHONE_REGEX = /^\+?[0-9][0-9\s\-()]{6,18}[0-9]$/;
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-const buildMessage = (sender, text) => ({
-  id: crypto.randomUUID(),
+/** Use a client-supplied id if present and well-formed, else mint one. */
+const resolveMessageId = (requestedId) =>
+  typeof requestedId === 'string' && UUID_REGEX.test(requestedId) ? requestedId : crypto.randomUUID();
+
+const buildMessage = (sender, text, requestedId) => ({
+  id: resolveMessageId(requestedId),
   sender, // 'visitor' | 'agent' | 'system'
   text,
   created_at: new Date().toISOString(),
@@ -119,8 +106,7 @@ const isClosedError = (error) => /not found or already closed/i.test(error?.mess
 // One-shot per call: open a channel, wait for SUBSCRIBED, send, then remove
 // it. No cross-request caching, so a process that was frozen/suspended
 // between requests (Render free spin-down) can never hand a broadcast to a
-// socket that's already dead. Slightly more handshake overhead per message
-// than a long-lived cache, but immune to the stale-channel failure mode.
+// socket that's already dead.
 // ─────────────────────────────────────────────────────────────────────────────
 const broadcastOnce = (channelName, event, payload) =>
   new Promise((resolve) => {
@@ -161,15 +147,24 @@ const broadcast = async (channelName, event, payload) => {
   await broadcastOnce(channelName, event, payload);
 };
 
-const broadcastConversationUpdate = (conversationRow) =>
-  broadcast(ADMIN_LIST_CHANNEL, 'conversation_updated', toListShape(conversationRow));
+/**
+ * Admin-grid update, tagged with the id of the message that produced it.
+ * PublicChatTab dedupes its unread bump against this id, so it never
+ * double-counts a message that already arrived via the visitor's direct
+ * 'visitor_message' broadcast.
+ */
+const broadcastConversationUpdate = (conversationRow) => {
+  const lastMessageId = Array.isArray(conversationRow.messages) && conversationRow.messages.length
+    ? conversationRow.messages[conversationRow.messages.length - 1].id
+    : undefined;
+  return broadcast(ADMIN_LIST_CHANNEL, 'conversation_updated', { ...toListShape(conversationRow), lastMessageId });
+};
 
 const broadcastMessagesUpdated = (conversationId, messages, status) =>
   broadcast(`chat:conversation:${conversationId}`, 'messages_updated', { messages, status });
 
 // ─────────────────────────────────────────────────────────────────────────────
 // startConversation   POST /api/chat/conversations   (public — no auth)
-// Expects: { name, phone, email, page_url }
 // ─────────────────────────────────────────────────────────────────────────────
 export const startConversation = async (req, res) => {
   const name = sanitizeText(req.body?.name, 100).trim();
@@ -208,8 +203,6 @@ export const startConversation = async (req, res) => {
         last_message: greeting[greeting.length - 1].text,
         last_sender: 'agent',
       }])
-      // Select every column toListShape() needs so the dashboard grid gets
-      // a complete card the instant this conversation is broadcast to it.
       .select(
         'id, visitor_name, visitor_phone, visitor_email, status, needs_agent, message_count, last_message, last_sender, last_activity, page_url, created_at, close_reason, messages'
       )
@@ -217,7 +210,6 @@ export const startConversation = async (req, res) => {
 
     if (error) throw error;
 
-    // Awaited: don't let the platform recycle the process before this send flushes.
     await broadcast(ADMIN_LIST_CHANNEL, 'conversation_created', toListShape(data));
 
     return res.status(201).json({
@@ -234,8 +226,6 @@ export const startConversation = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // getVisitorMessages   GET /api/chat/conversations/:id/messages   (public)
-// Used for the widget's initial load and its Realtime reconciliation fetch
-// (on reconnect / tab focus) — no longer polled in a loop.
 // ─────────────────────────────────────────────────────────────────────────────
 export const getVisitorMessages = async (req, res) => {
   const { id } = req.params;
@@ -264,14 +254,16 @@ export const getVisitorMessages = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // sendVisitorMessage   POST /api/chat/conversations/:id/messages   (public)
-// Appends the visitor's message, notifies human agents, and broadcasts the
-// update to both the agent's open thread (if any) and the admin grid.
+// Expects: { text, id? } — id, if provided, is the id the widget already
+// used for its direct optimistic broadcast; reusing it here lets every
+// path agree on "this is the same message."
 // ─────────────────────────────────────────────────────────────────────────────
 export const sendVisitorMessage = async (req, res) => {
-  const { id } = req.params;
+  const { id: conversationId } = req.params;
   const text = String(req.body?.text || '').trim().slice(0, 2000);
+  const requestedId = req.body?.id;
 
-  if (!id) {
+  if (!conversationId) {
     return res.status(400).json({ success: false, message: 'Conversation id is required.' });
   }
   if (!text) {
@@ -279,15 +271,12 @@ export const sendVisitorMessage = async (req, res) => {
   }
 
   try {
-    const message = buildMessage('visitor', text);
-    const conversation = await appendMessage(id, message);
+    const message = buildMessage('visitor', text, requestedId);
+    const conversation = await appendMessage(conversationId, message);
 
-    // Both awaited: guarantees the send is flushed before we respond, and
-    // before any spin-down-capable host could recycle the process.
-    await broadcastMessagesUpdated(id, conversation.messages, conversation.status);
+    await broadcastMessagesUpdated(conversationId, conversation.messages, conversation.status);
     await broadcastConversationUpdate(conversation);
 
-    // Alert human agents — never blocks or fails the visitor's request
     notifyAgents(conversation, text);
 
     return res.status(201).json({
@@ -307,8 +296,6 @@ export const sendVisitorMessage = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // listConversations   GET /api/superadmin/public-chats
-// Still used for first load and the long-interval safety-net refresh; the
-// grid's live updates now come from the 'chat:admin:list' broadcast channel.
 // ─────────────────────────────────────────────────────────────────────────────
 export const listConversations = async (req, res) => {
   try {
@@ -331,7 +318,6 @@ export const listConversations = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // getConversationMessages   GET /api/superadmin/public-chats/:id/messages
-// Used for the thread modal's initial load and reconciliation fetch.
 // ─────────────────────────────────────────────────────────────────────────────
 export const getConversationMessages = async (req, res) => {
   const { id } = req.params;
@@ -360,14 +346,15 @@ export const getConversationMessages = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // sendAgentReply   POST /api/superadmin/public-chats/:id/messages
-// Stored with sender 'agent'; resets the needs_agent flag via the append fn,
-// then broadcasts to the visitor's widget and the admin grid.
+// Expects: { text, id? } — same client-supplied-id contract as
+// sendVisitorMessage.
 // ─────────────────────────────────────────────────────────────────────────────
 export const sendAgentReply = async (req, res) => {
-  const { id } = req.params;
+  const { id: conversationId } = req.params;
   const text = String(req.body?.text || '').trim().slice(0, 2000);
+  const requestedId = req.body?.id;
 
-  if (!id) {
+  if (!conversationId) {
     return res.status(400).json({ success: false, message: 'Conversation id is required.' });
   }
   if (!text) {
@@ -375,10 +362,10 @@ export const sendAgentReply = async (req, res) => {
   }
 
   try {
-    const message = buildMessage('agent', text);
-    const conversation = await appendMessage(id, message);
+    const message = buildMessage('agent', text, requestedId);
+    const conversation = await appendMessage(conversationId, message);
 
-    await broadcastMessagesUpdated(id, conversation.messages, conversation.status);
+    await broadcastMessagesUpdated(conversationId, conversation.messages, conversation.status);
     await broadcastConversationUpdate(conversation);
 
     return res.status(201).json({ success: true, message, messages: conversation.messages });
@@ -393,7 +380,6 @@ export const sendAgentReply = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // closeConversation   POST /api/superadmin/public-chats/:id/close
-// Expects: { reason }
 // ─────────────────────────────────────────────────────────────────────────────
 export const closeConversation = async (req, res) => {
   const { id } = req.params;
@@ -407,7 +393,6 @@ export const closeConversation = async (req, res) => {
   }
 
   try {
-    // Append a system note so the visitor sees the chat was ended
     try {
       await appendMessage(
         id,
