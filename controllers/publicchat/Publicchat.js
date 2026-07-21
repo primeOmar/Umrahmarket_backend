@@ -5,40 +5,42 @@ import { notifyAgents } from './chatMailer.js';
 /**
  * publicChat.js — controllers for the public website live chat.
  *
- * REALTIME REVISION 4 — DB-backed unread_count.
+ * REALTIME REVISION 5 — read state lives on each message, not a bare counter.
  *
- * Unread badges were previously pure client-side state, rebuilt from
- * whatever broadcasts a given browser tab happened to see. That breaks the
- * moment a second agent window opens, or an existing one is refreshed —
- * there's no history to replay, so it starts blank and stays wrong until
- * fresh traffic arrives.
+ * Every visitor message now carries its own `read: boolean` in the
+ * messages jsonb array (visitor messages start `read: false`; agent/system
+ * messages are irrelevant to this and marked `read: true` for consistency
+ * since nothing ever counts them). `unread_count` still exists as a fast
+ * cached number for the grid list — but it is now ALWAYS recomputed
+ * directly from the messages array on every write, never incremented or
+ * decremented as an independent operation. That's what fixes the drift
+ * from the previous revision: the count and the actual message history
+ * can no longer disagree, because one is always derived from the other in
+ * the same write.
  *
- * Fixed by making unread_count a real column (see
- * public_chat_unread_migration.sql), maintained here:
- *   - incremented via the increment_public_chat_unread() RPC on every
- *     visitor message
- *   - reset to 0 via reset_public_chat_unread() on every agent reply,
- *     on close, and via the new markConversationRead() endpoint (called
- *     when an agent opens a thread)
- *   - included in every 'conversation_updated' broadcast (via toListShape),
- *     so any window — new tab, refreshed tab, a different agent entirely —
- *     converges on the same number the instant it (re)connects, and stays
- *     in sync as other agents read/reply.
+ * Read semantics:
+ *   - A visitor message is unread the moment it's appended.
+ *   - Opening a thread (markConversationRead, called by the frontend both
+ *     when the thread is first opened AND again each time a new visitor
+ *     message arrives while it's still open) marks every visitor message
+ *     in that conversation read, via mark_public_chat_read(), and the
+ *     cached unread_count drops to 0 in the same statement.
+ *   - Sending an agent reply implies the agent has seen everything up to
+ *     that point, so it also calls mark_public_chat_read() right after
+ *     appending.
+ *   - If nobody has the thread open, new visitor messages simply
+ *     accumulate as unread — no special handling needed, that's just the
+ *     default state.
  *
- * The direct 'visitor_message' / 'message_sent' broadcasts from REALTIME
- * REVISION 3 are unaffected and still give the instant, backend-independent
- * feel — this is just what makes the *number* correct everywhere, not just
- * in the tab that happened to be open when it changed.
+ * REALTIME REVISION 3 (still in effect) — a message broadcasts directly to
+ * the other side the instant it's sent, over the same channel typing uses;
+ * the REST call + backend broadcast is the durable/reconciling path
+ * underneath, using a client-supplied id so both never render twice.
  *
- * REALTIME REVISION 3 (still in effect) — client-supplied message ids, so
- * a direct broadcast and its persisted copy share an id and never render
- * twice.
- *
- * REALTIME REVISION 2 (still in effect) — broadcasts are awaited before the
- * response is sent, and built fresh per call (subscribe, send, remove)
- * instead of cached across requests, so a process that was frozen/
- * suspended between requests (Render free spin-down) can't hand a
- * broadcast to an already-dead socket.
+ * REALTIME REVISION 2 (still in effect) — every broadcast is awaited and
+ * built fresh per call (subscribe, send, remove) instead of cached across
+ * requests, so a process frozen/suspended between requests (Render free
+ * spin-down) can't hand a broadcast to an already-dead socket.
  */
 
 export const handleDatabaseError = (res, error) => {
@@ -65,7 +67,6 @@ const PHONE_REGEX = /^\+?[0-9][0-9\s\-()]{6,18}[0-9]$/;
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-// Every column the dashboard needs, including the new unread_count.
 const ROW_SELECT =
   'id, visitor_name, visitor_phone, visitor_email, status, needs_agent, unread_count, message_count, last_message, last_sender, last_activity, page_url, created_at, close_reason, messages';
 const ROW_SELECT_NO_MESSAGES =
@@ -80,9 +81,15 @@ const buildMessage = (sender, text, requestedId) => ({
   sender, // 'visitor' | 'agent' | 'system'
   text,
   created_at: new Date().toISOString(),
+  // Only visitor messages are ever counted as unread; agent/system
+  // messages are marked read for consistency, though nothing reads this
+  // field for them.
+  read: sender !== 'visitor',
 });
 
-/** Atomic append via the Postgres function (see public_chat_schema.sql). */
+/** Atomic append via the Postgres function (see public_chat_schema.sql).
+ *  Unchanged — it just appends whatever message object it's given, so the
+ *  new `read` field passes through with no changes needed on its side. */
 const appendMessage = async (conversationId, message) => {
   const { data, error } = await supabase.rpc('append_public_chat_message', {
     p_conversation_id: conversationId,
@@ -92,20 +99,26 @@ const appendMessage = async (conversationId, message) => {
   return data; // full updated conversation row
 };
 
-/** Fetch the current unread_count for a conversation (authoritative). */
-const fetchUnreadCount = async (conversationId) => {
-  const { data } = await supabase.from(TABLE).select('unread_count').eq('id', conversationId).single();
-  return data?.unread_count ?? 0;
+/** The single source of truth for "how many are unread" — always derived
+ *  from the messages array itself, never tracked independently. */
+const countUnread = (messages) =>
+  Array.isArray(messages) ? messages.filter((m) => m.sender === 'visitor' && m.read === false).length : 0;
+
+/** Recompute unread_count from the row's own messages array and persist
+ *  it as the cached value the grid list reads. */
+const syncUnreadCount = async (conversationId, messages) => {
+  const unreadCount = countUnread(messages);
+  await supabase.from(TABLE).update({ unread_count: unreadCount }).eq('id', conversationId);
+  return unreadCount;
 };
 
-const incrementUnread = async (conversationId) => {
-  await supabase.rpc('increment_public_chat_unread', { p_conversation_id: conversationId });
-  return fetchUnreadCount(conversationId);
-};
-
-const resetUnread = async (conversationId) => {
-  await supabase.rpc('reset_public_chat_unread', { p_conversation_id: conversationId });
-  return 0;
+/** Marks every visitor message in the conversation read and zeroes
+ *  unread_count, atomically, via mark_public_chat_read(). Used both when
+ *  an agent opens/re-views a thread and right after an agent reply. */
+const markRead = async (conversationId) => {
+  const { data, error } = await supabase.rpc('mark_public_chat_read', { p_conversation_id: conversationId });
+  if (error) throw new Error(error.message);
+  return data; // full updated row, messages included
 };
 
 /** Map a DB row to the shape the superadmin PublicChatTab expects. */
@@ -129,12 +142,8 @@ const toListShape = (row) => ({
 const isClosedError = (error) => /not found or already closed/i.test(error?.message || '');
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Realtime broadcast helper
-//
-// One-shot per call: open a channel, wait for SUBSCRIBED, send, then remove
-// it. No cross-request caching, so a process that was frozen/suspended
-// between requests (Render free spin-down) can never hand a broadcast to a
-// socket that's already dead.
+// Realtime broadcast helper — one-shot per call, no cross-request caching.
+// See REALTIME REVISION 2 in the module comment for why.
 // ─────────────────────────────────────────────────────────────────────────────
 const broadcastOnce = (channelName, event, payload) =>
   new Promise((resolve) => {
@@ -170,18 +179,10 @@ const broadcastOnce = (channelName, event, payload) =>
     });
   });
 
-/** Best-effort broadcast — logs on failure but never throws to the caller. */
 const broadcast = async (channelName, event, payload) => {
   await broadcastOnce(channelName, event, payload);
 };
 
-/**
- * Admin-grid update, tagged with the id of the message that produced it
- * (dedupes an agent tab's own optimistic bump against this event) and
- * carrying the authoritative unread_count from the DB — this is what lets
- * a second agent window, or a refreshed one, show the correct number
- * immediately instead of starting from zero.
- */
 const broadcastConversationUpdate = (conversationRow) => {
   const lastMessageId = Array.isArray(conversationRow.messages) && conversationRow.messages.length
     ? conversationRow.messages[conversationRow.messages.length - 1].id
@@ -231,7 +232,7 @@ export const startConversation = async (req, res) => {
         message_count: greeting.length,
         last_message: greeting[greeting.length - 1].text,
         last_sender: 'agent',
-        unread_count: 0, // greeting is from us, nothing unread yet
+        unread_count: 0, // greeting is from us — nothing unread yet
       }])
       .select(ROW_SELECT)
       .single();
@@ -283,6 +284,8 @@ export const getVisitorMessages = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // sendVisitorMessage   POST /api/chat/conversations/:id/messages   (public)
 // Expects: { text, id? }
+// New message starts unread (read: false, set in buildMessage). No
+// increment RPC — unread_count is recomputed straight from the array.
 // ─────────────────────────────────────────────────────────────────────────────
 export const sendVisitorMessage = async (req, res) => {
   const { id: conversationId } = req.params;
@@ -299,10 +302,7 @@ export const sendVisitorMessage = async (req, res) => {
   try {
     const message = buildMessage('visitor', text, requestedId);
     const conversation = await appendMessage(conversationId, message);
-
-    // A visitor message always adds one unread, for every agent watching
-    // the grid — regardless of which window/tab they're in.
-    conversation.unread_count = await incrementUnread(conversationId);
+    conversation.unread_count = await syncUnreadCount(conversationId, conversation.messages);
 
     await broadcastMessagesUpdated(conversationId, conversation.messages, conversation.status);
     await broadcastConversationUpdate(conversation);
@@ -375,8 +375,8 @@ export const getConversationMessages = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // sendAgentReply   POST /api/superadmin/public-chats/:id/messages
 // Expects: { text, id? }
-// A reply implies the agent has read the thread, so this resets
-// unread_count to 0 for everyone watching the grid.
+// Replying implies the agent has seen everything up to now, so this marks
+// all visitor messages read (and unread_count -> 0) right after appending.
 // ─────────────────────────────────────────────────────────────────────────────
 export const sendAgentReply = async (req, res) => {
   const { id: conversationId } = req.params;
@@ -392,8 +392,8 @@ export const sendAgentReply = async (req, res) => {
 
   try {
     const message = buildMessage('agent', text, requestedId);
-    const conversation = await appendMessage(conversationId, message);
-    conversation.unread_count = await resetUnread(conversationId);
+    await appendMessage(conversationId, message);
+    const conversation = await markRead(conversationId); // full row, messages read-flagged, unread_count 0
 
     await broadcastMessagesUpdated(conversationId, conversation.messages, conversation.status);
     await broadcastConversationUpdate(conversation);
@@ -410,9 +410,11 @@ export const sendAgentReply = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // markConversationRead   POST /api/superadmin/public-chats/:id/read
-// Called when an agent opens a thread, even if they don't reply right
-// away. Resets unread_count to 0 and broadcasts it, so every other agent
-// window sees the badge clear too — not just the one that opened it.
+// Called when an agent opens a thread, AND again each time a new visitor
+// message arrives while that thread is still open — so messages that come
+// in while the agent is actively watching get marked read as they land,
+// not just once at open time. If nobody calls this (thread not open),
+// messages simply stay unread — that's just the default state.
 // ─────────────────────────────────────────────────────────────────────────────
 export const markConversationRead = async (req, res) => {
   const { id } = req.params;
@@ -422,10 +424,8 @@ export const markConversationRead = async (req, res) => {
   }
 
   try {
-    await resetUnread(id);
-
-    const { data, error } = await supabase.from(TABLE).select(ROW_SELECT).eq('id', id).single();
-    if (error || !data) {
+    const data = await markRead(id);
+    if (!data) {
       return res.status(404).json({ success: false, message: 'Conversation not found.' });
     }
 
