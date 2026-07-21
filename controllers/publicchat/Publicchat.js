@@ -11,42 +11,41 @@ import { notifyAgents } from './chatMailer.js';
  * created_at }. Appends go through the `append_public_chat_message()`
  * Postgres function so counters and the needs_agent flag update atomically.
  *
- * REALTIME REVISION — no more client polling.
+ * REALTIME REVISION 2 — fix for Render free-tier spin-down.
  *
- * Every write that changes what a client needs to see now BROADCASTS over
- * Supabase Realtime, using the same service-role client already imported
- * as `supabase` (no extra credentials needed):
+ * The previous revision cached one long-lived Realtime channel per name in
+ * a module-level Map, and fired broadcasts without awaiting them before
+ * the HTTP response was sent. That's fine on an always-on process, but on
+ * a host that can idle-suspend the process (Render free web services spin
+ * down after ~15 min with no HTTP traffic):
  *
- *   - `chat:conversation:{id}`  'messages_updated'  { messages, status }
- *       -> consumed by the visitor's ChatWidget and, when open, the
- *          superadmin thread modal. Sent after every append and on close.
+ *   1. A cold start after spin-down can take longer than the channel
+ *      subscribe timeout, so the very first broadcast after waking up
+ *      silently fails (caught, logged, never surfaced).
+ *   2. If the process is frozen rather than cleanly restarted, a cached
+ *      channel's underlying socket can die without ever firing the
+ *      CLOSED/CHANNEL_ERROR callback that would evict it from the cache —
+ *      so later requests keep reusing a channel whose socket is dead.
+ *   3. Because the broadcast calls were not awaited, the request handler
+ *      could return its HTTP response (and the platform could recycle the
+ *      process) before the broadcast's websocket send had actually
+ *      flushed.
  *
- *   - `chat:admin:list`  'conversation_created' | 'conversation_updated'
- *       -> consumed by the superadmin grid so cards update live without a
- *          15s poll. Sent on conversation start, every message (visitor or
- *          agent), and on close.
+ * Fix: broadcasts are now (a) awaited before the response is sent, and
+ * (b) built fresh per call — subscribe, send, then remove — instead of
+ * cached across requests. This trades a small per-message handshake cost
+ * for immunity to stale/dead sockets left over from a suspend/resume
+ * cycle. For this traffic volume (human-typed chat messages) that cost is
+ * negligible.
  *
- * TYPING is no longer a backend concern at all — it moved to direct
- * client-to-client broadcasts (ChatWidget <-> PublicChatTab) over the same
- * `chat:conversation:{id}` channel, on the 'typing' event.
- *
- * FIX (this revision): getChannel() used to call channel.subscribe() and
- * return the channel object immediately, without waiting for Supabase to
- * confirm the join. Realtime's subscribe() is asynchronous — it takes a
- * websocket round trip to actually reach the 'SUBSCRIBED' state. Any
- * broadcast() call that landed before that round trip finished was
- * silently dropped, which showed up as: the very first message on a given
- * conversation (or the first message after a server restart, since the
- * cache is in-memory) never reaching the other side in real time. Typing
- * never hit this because it's a direct browser-to-browser broadcast on a
- * channel that's had seconds to finish joining by the time someone
- * actually starts typing.
- *
- * getChannel() is now getReadyChannel() — it caches a PROMISE that only
- * resolves once the channel reports 'SUBSCRIBED', and broadcast() awaits
- * it before calling send(). If a channel ever errors, times out, or closes,
- * it's evicted from the cache so the next broadcast rebuilds a fresh one
- * instead of retrying a dead channel forever.
+ * If you later move off a spin-down-capable host, the long-lived cache
+ * from the previous revision is a reasonable optimization to bring back —
+ * but only alongside a keep-alive ping so the process never actually
+ * spins down while conversations are active. On Render specifically,
+ * either upgrade off the free instance type or hit a lightweight health
+ * endpoint from an external cron every 5–10 minutes to prevent spin-down;
+ * cold starts are the biggest lever here, bigger than anything in this
+ * file.
  *
  * SECURITY NOTE: broadcasting is independent of table RLS — it only
  * requires the Realtime service (on by default). Channel names are scoped
@@ -73,7 +72,7 @@ function sanitizeText(value = '', maxLen = 120) {
 
 const TABLE = 'public_chat_conversations';
 const ADMIN_LIST_CHANNEL = 'chat:admin:list';
-const CHANNEL_SUBSCRIBE_TIMEOUT_MS = 8000;
+const CHANNEL_SUBSCRIBE_TIMEOUT_MS = 15000; // generous — covers a Render cold start
 
 const PHONE_REGEX = /^\+?[0-9][0-9\s\-()]{6,18}[0-9]$/;
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -115,67 +114,58 @@ const toListShape = (row) => ({
 const isClosedError = (error) => /not found or already closed/i.test(error?.message || '');
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Realtime broadcast helpers
+// Realtime broadcast helper
 //
-// supabase-js channels are lightweight; we cache one per conversation (plus
-// the single shared admin-list channel) for the life of the Node process
-// instead of creating/subscribing a new one on every request.
-//
-// The cache stores a PROMISE that resolves to the channel only once Supabase
-// confirms it has actually joined ('SUBSCRIBED'). Sending on a channel that
-// hasn't finished joining yet is silently dropped by Realtime — this is
-// what fixes the "first message never arrives live" bug.
+// One-shot per call: open a channel, wait for SUBSCRIBED, send, then remove
+// it. No cross-request caching, so a process that was frozen/suspended
+// between requests (Render free spin-down) can never hand a broadcast to a
+// socket that's already dead. Slightly more handshake overhead per message
+// than a long-lived cache, but immune to the stale-channel failure mode.
 // ─────────────────────────────────────────────────────────────────────────────
-const channelCache = new Map(); // name -> Promise<RealtimeChannel>
+const broadcastOnce = (channelName, event, payload) =>
+  new Promise((resolve) => {
+    const channel = supabase.channel(channelName);
+    let settled = false;
 
-const getReadyChannel = (name) => {
-  if (channelCache.has(name)) return channelCache.get(name);
-
-  const ready = new Promise((resolve, reject) => {
-    const channel = supabase.channel(name);
+    const cleanup = (ok, err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      supabase.removeChannel(channel);
+      if (!ok) console.error(`Realtime broadcast failed (${channelName}/${event}):`, err?.message || err);
+      resolve(ok);
+    };
 
     const timeout = setTimeout(() => {
-      channelCache.delete(name);
-      reject(new Error(`Realtime subscribe timed out for channel "${name}"`));
+      cleanup(false, new Error(`subscribe timed out for channel "${channelName}"`));
     }, CHANNEL_SUBSCRIBE_TIMEOUT_MS);
 
-    channel.subscribe((status, err) => {
+    channel.subscribe(async (status, err) => {
       if (status === 'SUBSCRIBED') {
-        clearTimeout(timeout);
-        resolve(channel);
+        try {
+          await channel.send({ type: 'broadcast', event, payload });
+          cleanup(true);
+        } catch (sendErr) {
+          cleanup(false, sendErr);
+        }
         return;
       }
       if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
-        clearTimeout(timeout);
-        // Evict so the next broadcast attempt builds a fresh channel
-        // instead of being stuck behind a dead one.
-        channelCache.delete(name);
-        reject(err || new Error(`Realtime channel "${name}" failed: ${status}`));
+        cleanup(false, err || new Error(`channel "${channelName}" reported ${status}`));
       }
     });
   });
 
-  channelCache.set(name, ready);
-  return ready;
-};
-
-/** Best-effort broadcast — must never fail or block the HTTP response. */
+/** Best-effort broadcast — logs on failure but never throws to the caller. */
 const broadcast = async (channelName, event, payload) => {
-  try {
-    const channel = await getReadyChannel(channelName);
-    await channel.send({ type: 'broadcast', event, payload });
-  } catch (err) {
-    console.error(`Realtime broadcast failed (${channelName}/${event}):`, err.message);
-  }
+  await broadcastOnce(channelName, event, payload);
 };
 
-const broadcastConversationUpdate = (conversationRow) => {
+const broadcastConversationUpdate = (conversationRow) =>
   broadcast(ADMIN_LIST_CHANNEL, 'conversation_updated', toListShape(conversationRow));
-};
 
-const broadcastMessagesUpdated = (conversationId, messages, status) => {
+const broadcastMessagesUpdated = (conversationId, messages, status) =>
   broadcast(`chat:conversation:${conversationId}`, 'messages_updated', { messages, status });
-};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // startConversation   POST /api/chat/conversations   (public — no auth)
@@ -227,7 +217,8 @@ export const startConversation = async (req, res) => {
 
     if (error) throw error;
 
-    broadcast(ADMIN_LIST_CHANNEL, 'conversation_created', toListShape(data));
+    // Awaited: don't let the platform recycle the process before this send flushes.
+    await broadcast(ADMIN_LIST_CHANNEL, 'conversation_created', toListShape(data));
 
     return res.status(201).json({
       success: true,
@@ -291,8 +282,10 @@ export const sendVisitorMessage = async (req, res) => {
     const message = buildMessage('visitor', text);
     const conversation = await appendMessage(id, message);
 
-    broadcastMessagesUpdated(id, conversation.messages, conversation.status);
-    broadcastConversationUpdate(conversation);
+    // Both awaited: guarantees the send is flushed before we respond, and
+    // before any spin-down-capable host could recycle the process.
+    await broadcastMessagesUpdated(id, conversation.messages, conversation.status);
+    await broadcastConversationUpdate(conversation);
 
     // Alert human agents — never blocks or fails the visitor's request
     notifyAgents(conversation, text);
@@ -385,8 +378,8 @@ export const sendAgentReply = async (req, res) => {
     const message = buildMessage('agent', text);
     const conversation = await appendMessage(id, message);
 
-    broadcastMessagesUpdated(id, conversation.messages, conversation.status);
-    broadcastConversationUpdate(conversation);
+    await broadcastMessagesUpdated(id, conversation.messages, conversation.status);
+    await broadcastConversationUpdate(conversation);
 
     return res.status(201).json({ success: true, message, messages: conversation.messages });
 
@@ -440,8 +433,8 @@ export const closeConversation = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Conversation not found.' });
     }
 
-    broadcastMessagesUpdated(id, data.messages, 'closed');
-    broadcastConversationUpdate(data);
+    await broadcastMessagesUpdated(id, data.messages, 'closed');
+    await broadcastConversationUpdate(data);
 
     return res.status(200).json({
       success: true,
