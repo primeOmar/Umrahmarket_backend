@@ -6,24 +6,53 @@ import { notifyAgents } from './chatMailer.js';
  * publicChat.js — controllers for the public website live chat.
  * Suggested location:  controllers/chat/publicChat.js
  *
- * Data lives in the `public_chat_conversations` table. All messages are stored
- * in the row's `messages` JSONB array as { id, sender, text, created_at }.
- * Appends go through the `append_public_chat_message()` Postgres function so
- * counters and the needs_agent flag update atomically.
+ * Data lives in the `public_chat_conversations` table. All messages are
+ * stored in the row's `messages` JSONB array as { id, sender, text,
+ * created_at }. Appends go through the `append_public_chat_message()`
+ * Postgres function so counters and the needs_agent flag update atomically.
  *
- * THIS REVISION ADDS TYPING PRESENCE (polling-based):
- *   The row gains two timestamp columns —
- *     ALTER TABLE public_chat_conversations
- *       ADD COLUMN IF NOT EXISTS visitor_typing_at timestamptz,
- *       ADD COLUMN IF NOT EXISTS agent_typing_at   timestamptz;
- *   Each side POSTs a throttled "typing" ping that stamps its column with
- *   now(). The other side's poll returns a boolean derived from freshness
- *   (stamp within TYPING_FRESH_MS). Sending a real message clears your own
- *   stamp so the indicator disappears the moment the message lands.
+ * REALTIME REVISION — no more client polling.
  *
- * New routes to register:
- *   publicChatRouter.post('/chat/conversations/:id/typing', setVisitorTyping);
- *   superadminChatRouter.post('/superadmin/public-chats/:id/typing', setAgentTyping);
+ * Every write that changes what a client needs to see now BROADCASTS over
+ * Supabase Realtime, using the same service-role client already imported
+ * as `supabase` (no extra credentials needed):
+ *
+ *   - `chat:conversation:{id}`  'messages_updated'  { messages, status }
+ *       -> consumed by the visitor's ChatWidget and, when open, the
+ *          superadmin thread modal. Sent after every append and on close.
+ *
+ *   - `chat:admin:list`  'conversation_created' | 'conversation_updated'
+ *       -> consumed by the superadmin grid so cards update live without a
+ *          15s poll. Sent on conversation start, every message (visitor or
+ *          agent), and on close.
+ *
+ * TYPING is no longer a backend concern at all — it moved to direct
+ * client-to-client broadcasts (ChatWidget <-> PublicChatTab) over the same
+ * `chat:conversation:{id}` channel, on the 'typing' event.
+ *
+ * FIX (this revision): getChannel() used to call channel.subscribe() and
+ * return the channel object immediately, without waiting for Supabase to
+ * confirm the join. Realtime's subscribe() is asynchronous — it takes a
+ * websocket round trip to actually reach the 'SUBSCRIBED' state. Any
+ * broadcast() call that landed before that round trip finished was
+ * silently dropped, which showed up as: the very first message on a given
+ * conversation (or the first message after a server restart, since the
+ * cache is in-memory) never reaching the other side in real time. Typing
+ * never hit this because it's a direct browser-to-browser broadcast on a
+ * channel that's had seconds to finish joining by the time someone
+ * actually starts typing.
+ *
+ * getChannel() is now getReadyChannel() — it caches a PROMISE that only
+ * resolves once the channel reports 'SUBSCRIBED', and broadcast() awaits
+ * it before calling send(). If a channel ever errors, times out, or closes,
+ * it's evicted from the cache so the next broadcast rebuilds a fresh one
+ * instead of retrying a dead channel forever.
+ *
+ * SECURITY NOTE: broadcasting is independent of table RLS — it only
+ * requires the Realtime service (on by default). Channel names are scoped
+ * by the conversation's UUID, matching the same trust boundary the REST
+ * endpoints already use. For stronger guarantees, enable Supabase Realtime
+ * Authorization (private channels gated by a Supabase JWT).
  */
 
 export const handleDatabaseError = (res, error) => {
@@ -43,20 +72,11 @@ function sanitizeText(value = '', maxLen = 120) {
 }
 
 const TABLE = 'public_chat_conversations';
+const ADMIN_LIST_CHANNEL = 'chat:admin:list';
+const CHANNEL_SUBSCRIBE_TIMEOUT_MS = 8000;
 
 const PHONE_REGEX = /^\+?[0-9][0-9\s\-()]{6,18}[0-9]$/;
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-// A typing stamp older than this is considered stale (the person stopped).
-// Slightly longer than the widget's 4s poll so the indicator doesn't flicker
-// between polls while someone is actively composing.
-const TYPING_FRESH_MS = 8000;
-
-const isTypingFresh = (ts) => {
-  if (!ts) return false;
-  const t = new Date(ts).getTime();
-  return Number.isFinite(t) && Date.now() - t < TYPING_FRESH_MS;
-};
 
 const buildMessage = (sender, text) => ({
   id: crypto.randomUUID(),
@@ -73,22 +93,6 @@ const appendMessage = async (conversationId, message) => {
   });
   if (error) throw new Error(error.message);
   return data; // full updated conversation row
-};
-
-/**
- * Best-effort update of a typing timestamp. Never throws — presence is
- * cosmetic and must not break message flows.
- */
-const stampTyping = async (conversationId, column, value) => {
-  try {
-    await supabase
-      .from(TABLE)
-      .update({ [column]: value })
-      .eq('id', conversationId)
-      .neq('status', 'closed');
-  } catch {
-    /* ignore — next ping will try again */
-  }
 };
 
 /** Map a DB row to the shape the superadmin PublicChatTab expects. */
@@ -109,6 +113,69 @@ const toListShape = (row) => ({
 });
 
 const isClosedError = (error) => /not found or already closed/i.test(error?.message || '');
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Realtime broadcast helpers
+//
+// supabase-js channels are lightweight; we cache one per conversation (plus
+// the single shared admin-list channel) for the life of the Node process
+// instead of creating/subscribing a new one on every request.
+//
+// The cache stores a PROMISE that resolves to the channel only once Supabase
+// confirms it has actually joined ('SUBSCRIBED'). Sending on a channel that
+// hasn't finished joining yet is silently dropped by Realtime — this is
+// what fixes the "first message never arrives live" bug.
+// ─────────────────────────────────────────────────────────────────────────────
+const channelCache = new Map(); // name -> Promise<RealtimeChannel>
+
+const getReadyChannel = (name) => {
+  if (channelCache.has(name)) return channelCache.get(name);
+
+  const ready = new Promise((resolve, reject) => {
+    const channel = supabase.channel(name);
+
+    const timeout = setTimeout(() => {
+      channelCache.delete(name);
+      reject(new Error(`Realtime subscribe timed out for channel "${name}"`));
+    }, CHANNEL_SUBSCRIBE_TIMEOUT_MS);
+
+    channel.subscribe((status, err) => {
+      if (status === 'SUBSCRIBED') {
+        clearTimeout(timeout);
+        resolve(channel);
+        return;
+      }
+      if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+        clearTimeout(timeout);
+        // Evict so the next broadcast attempt builds a fresh channel
+        // instead of being stuck behind a dead one.
+        channelCache.delete(name);
+        reject(err || new Error(`Realtime channel "${name}" failed: ${status}`));
+      }
+    });
+  });
+
+  channelCache.set(name, ready);
+  return ready;
+};
+
+/** Best-effort broadcast — must never fail or block the HTTP response. */
+const broadcast = async (channelName, event, payload) => {
+  try {
+    const channel = await getReadyChannel(channelName);
+    await channel.send({ type: 'broadcast', event, payload });
+  } catch (err) {
+    console.error(`Realtime broadcast failed (${channelName}/${event}):`, err.message);
+  }
+};
+
+const broadcastConversationUpdate = (conversationRow) => {
+  broadcast(ADMIN_LIST_CHANNEL, 'conversation_updated', toListShape(conversationRow));
+};
+
+const broadcastMessagesUpdated = (conversationId, messages, status) => {
+  broadcast(`chat:conversation:${conversationId}`, 'messages_updated', { messages, status });
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // startConversation   POST /api/chat/conversations   (public — no auth)
@@ -151,10 +218,16 @@ export const startConversation = async (req, res) => {
         last_message: greeting[greeting.length - 1].text,
         last_sender: 'agent',
       }])
-      .select('id, status, messages')
+      // Select every column toListShape() needs so the dashboard grid gets
+      // a complete card the instant this conversation is broadcast to it.
+      .select(
+        'id, visitor_name, visitor_phone, visitor_email, status, needs_agent, message_count, last_message, last_sender, last_activity, page_url, created_at, close_reason, messages'
+      )
       .single();
 
     if (error) throw error;
+
+    broadcast(ADMIN_LIST_CHANNEL, 'conversation_created', toListShape(data));
 
     return res.status(201).json({
       success: true,
@@ -170,7 +243,8 @@ export const startConversation = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // getVisitorMessages   GET /api/chat/conversations/:id/messages   (public)
-// The visitor's widget polls this for agent replies AND typing presence.
+// Used for the widget's initial load and its Realtime reconciliation fetch
+// (on reconnect / tab focus) — no longer polled in a loop.
 // ─────────────────────────────────────────────────────────────────────────────
 export const getVisitorMessages = async (req, res) => {
   const { id } = req.params;
@@ -182,7 +256,7 @@ export const getVisitorMessages = async (req, res) => {
   try {
     const { data, error } = await supabase
       .from(TABLE)
-      .select('id, status, messages, agent_typing_at')
+      .select('id, status, messages')
       .eq('id', id)
       .single();
 
@@ -190,12 +264,7 @@ export const getVisitorMessages = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Conversation not found.' });
     }
 
-    return res.status(200).json({
-      success: true,
-      status: data.status,
-      messages: data.messages,
-      agent_typing: data.status !== 'closed' && isTypingFresh(data.agent_typing_at),
-    });
+    return res.status(200).json({ success: true, status: data.status, messages: data.messages });
 
   } catch (error) {
     return handleDatabaseError(res, error);
@@ -204,7 +273,8 @@ export const getVisitorMessages = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // sendVisitorMessage   POST /api/chat/conversations/:id/messages   (public)
-// Appends the visitor's message and notifies human agents (fire-and-forget).
+// Appends the visitor's message, notifies human agents, and broadcasts the
+// update to both the agent's open thread (if any) and the admin grid.
 // ─────────────────────────────────────────────────────────────────────────────
 export const sendVisitorMessage = async (req, res) => {
   const { id } = req.params;
@@ -221,8 +291,8 @@ export const sendVisitorMessage = async (req, res) => {
     const message = buildMessage('visitor', text);
     const conversation = await appendMessage(id, message);
 
-    // The message landed — the "visitor is typing" stamp is now stale.
-    stampTyping(id, 'visitor_typing_at', null); // fire-and-forget
+    broadcastMessagesUpdated(id, conversation.messages, conversation.status);
+    broadcastConversationUpdate(conversation);
 
     // Alert human agents — never blocks or fails the visitor's request
     notifyAgents(conversation, text);
@@ -243,20 +313,9 @@ export const sendVisitorMessage = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// setVisitorTyping   POST /api/chat/conversations/:id/typing   (public)
-// Throttled ping from the widget while the visitor is composing.
-// ─────────────────────────────────────────────────────────────────────────────
-export const setVisitorTyping = async (req, res) => {
-  const { id } = req.params;
-  if (!id) {
-    return res.status(400).json({ success: false, message: 'Conversation id is required.' });
-  }
-  await stampTyping(id, 'visitor_typing_at', new Date().toISOString());
-  return res.status(204).end();
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
 // listConversations   GET /api/superadmin/public-chats
+// Still used for first load and the long-interval safety-net refresh; the
+// grid's live updates now come from the 'chat:admin:list' broadcast channel.
 // ─────────────────────────────────────────────────────────────────────────────
 export const listConversations = async (req, res) => {
   try {
@@ -279,7 +338,7 @@ export const listConversations = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // getConversationMessages   GET /api/superadmin/public-chats/:id/messages
-// Now also returns visitor typing presence for the open-thread indicator.
+// Used for the thread modal's initial load and reconciliation fetch.
 // ─────────────────────────────────────────────────────────────────────────────
 export const getConversationMessages = async (req, res) => {
   const { id } = req.params;
@@ -291,7 +350,7 @@ export const getConversationMessages = async (req, res) => {
   try {
     const { data, error } = await supabase
       .from(TABLE)
-      .select('id, status, messages, visitor_typing_at')
+      .select('id, status, messages')
       .eq('id', id)
       .single();
 
@@ -299,12 +358,7 @@ export const getConversationMessages = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Conversation not found.' });
     }
 
-    return res.status(200).json({
-      success: true,
-      status: data.status,
-      data: data.messages,
-      visitor_typing: data.status !== 'closed' && isTypingFresh(data.visitor_typing_at),
-    });
+    return res.status(200).json({ success: true, status: data.status, data: data.messages });
 
   } catch (error) {
     return handleDatabaseError(res, error);
@@ -313,7 +367,8 @@ export const getConversationMessages = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // sendAgentReply   POST /api/superadmin/public-chats/:id/messages
-// Stored with sender 'agent'; resets the needs_agent flag via the append fn.
+// Stored with sender 'agent'; resets the needs_agent flag via the append fn,
+// then broadcasts to the visitor's widget and the admin grid.
 // ─────────────────────────────────────────────────────────────────────────────
 export const sendAgentReply = async (req, res) => {
   const { id } = req.params;
@@ -330,8 +385,8 @@ export const sendAgentReply = async (req, res) => {
     const message = buildMessage('agent', text);
     const conversation = await appendMessage(id, message);
 
-    // The reply landed — the "agent is typing" stamp is now stale.
-    stampTyping(id, 'agent_typing_at', null); // fire-and-forget
+    broadcastMessagesUpdated(id, conversation.messages, conversation.status);
+    broadcastConversationUpdate(conversation);
 
     return res.status(201).json({ success: true, message, messages: conversation.messages });
 
@@ -341,19 +396,6 @@ export const sendAgentReply = async (req, res) => {
     }
     return handleDatabaseError(res, error);
   }
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// setAgentTyping   POST /api/superadmin/public-chats/:id/typing
-// Throttled ping from the dashboard while an agent is composing a reply.
-// ─────────────────────────────────────────────────────────────────────────────
-export const setAgentTyping = async (req, res) => {
-  const { id } = req.params;
-  if (!id) {
-    return res.status(400).json({ success: false, message: 'Conversation id is required.' });
-  }
-  await stampTyping(id, 'agent_typing_at', new Date().toISOString());
-  return res.status(204).end();
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -389,16 +431,17 @@ export const closeConversation = async (req, res) => {
         needs_agent: false,
         close_reason: reason,
         closed_at: new Date().toISOString(),
-        visitor_typing_at: null,
-        agent_typing_at: null,
       })
       .eq('id', id)
-      .select()
+      .select('id, visitor_name, visitor_phone, visitor_email, status, needs_agent, message_count, last_message, last_sender, last_activity, page_url, created_at, close_reason, messages')
       .single();
 
     if (error || !data) {
       return res.status(404).json({ success: false, message: 'Conversation not found.' });
     }
+
+    broadcastMessagesUpdated(id, data.messages, 'closed');
+    broadcastConversationUpdate(data);
 
     return res.status(200).json({
       success: true,
