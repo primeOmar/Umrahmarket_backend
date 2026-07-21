@@ -507,12 +507,15 @@ router.post('/google', authRateLimiter, async (req, res) => {
       return res.status(400).json({ success: false, error: error.message });
     }
 
+    let dbProfile = null;
+
     if (data.user) {
       const meta      = data.user.user_metadata || {};
       const fullName  = meta.full_name || meta.name || '';
       const nameParts = fullName.trim().split(' ');
+
       // FIX Bug 4: check upsert error — silent failure here causes dummy-user sessions
-      const { error: googleProfileError } = await supabaseAdmin
+      const { data: upsertedProfile, error: googleProfileError } = await supabaseAdmin
         .from('profiles')
         .upsert({
           id:         data.user.id,
@@ -522,7 +525,9 @@ router.post('/google', authRateLimiter, async (req, res) => {
           role:       meta.role || 'client',
           approved:   true,
           created_at: new Date().toISOString(),
-        }, { onConflict: 'id' });
+        }, { onConflict: 'id' })
+        .select('role, agent_number, company_name, first_name, last_name, approved')
+        .single();
 
       if (googleProfileError) {
         logger.error('Google login: failed to upsert profile', {
@@ -531,14 +536,33 @@ router.post('/google', authRateLimiter, async (req, res) => {
         });
         return res.status(500).json({ success: false, error: 'Login failed. Please try again.' });
       }
+
+      dbProfile = upsertedProfile;
     }
 
-    const googleRole = data.user.user_metadata?.role || 'client';
-    const accessToken  = generateAccessToken(
-      data.user.id,
-      googleRole
-    );
-    const refreshToken = generateRefreshToken(data.user.id, googleRole);
+    const googleRole = dbProfile?.role || 'client';
+    const accessToken  = generateAccessToken(data.user.id, googleRole, data.user.email);
+    const refreshToken = generateRefreshToken(data.user.id, googleRole, data.user.email);
+
+    // FIX: previously no cookies were set on Google login, so req.cookies.access_token
+    // was always missing on every subsequent request — verifyToken would reject the
+    // "logged in" user immediately. This mirrors the regular /login route exactly.
+    const isProd = process.env.NODE_ENV === 'production';
+    const cookieOpts = {
+      httpOnly: true,
+      secure:   isProd,
+      sameSite: isProd ? 'none' : 'lax',
+    };
+
+    res.cookie('access_token', accessToken, {
+      ...cookieOpts,
+      maxAge: 15 * 60 * 1000,
+    });
+
+    res.cookie('refresh_token', refreshToken, {
+      ...cookieOpts,
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+    });
 
     logAuthAttempt(true, data.user.id, req.ip, req.get('user-agent'), { type: 'google-login' });
 
@@ -549,12 +573,17 @@ router.post('/google', authRateLimiter, async (req, res) => {
         user: {
           id:        data.user.id,
           email:     data.user.email,
-          firstName: data.user.user_metadata?.full_name?.split(' ')[0] || '',
-          lastName:  data.user.user_metadata?.full_name?.split(' ').slice(1).join(' ') || '',
           role:      googleRole,
+          firstName: dbProfile?.first_name || '',
+          lastName:  dbProfile?.last_name || '',
+          approved:  dbProfile?.approved ?? true,
+          ...(googleRole === 'agent' && {
+            agentNumber: dbProfile?.agent_number || null,
+            agentName:   dbProfile?.company_name || null,
+          }),
         },
         accessToken,
-        refreshToken, // ← returned in body so frontend can store in localStorage
+        refreshToken, // kept in body too, for any client code still reading it from there
       },
     });
 

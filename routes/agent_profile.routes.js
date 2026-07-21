@@ -39,6 +39,7 @@ const EDITABLE_FIELDS = {
   specialties: 'specialties',
   websiteUrl: 'website_url',
   officeMapsUrl: 'office_maps_url',
+  logoUrl: 'logo_url',
 };
 
 function toRow(body) {
