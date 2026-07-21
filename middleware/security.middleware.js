@@ -148,8 +148,8 @@ export const authRateLimiter = rateLimit({
 // 5. RATE LIMITING – File Upload Routes
 // ─────────────────────────────────────────────
 export const uploadRateLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000, // 1 hour window
-  max:      10,              // 10 uploads per IP per hour
+  windowMs: 60 * 60 * 1000,
+  max:      30,             
   standardHeaders: true,
   legacyHeaders:   false,
   handler: (req, res) => {
@@ -168,9 +168,9 @@ export const uploadRateLimiter = rateLimit({
 // ─────────────────────────────────────────────
 export const speedLimiter = slowDown({
   windowMs:    15 * 60 * 1000, // 15-minute sliding window
-  delayAfter:  50,             // First 50 req/window at full speed
-  delayMs:     (used) => (used - 50) * 500, // +500 ms per extra request
-  maxDelayMs:  5000,           // Cap at 5 s delay
+  delayAfter:  200,            // first 200 req/window at full speed (was 50)
+  delayMs:     (used) => (used - 200) * 200, // +200 ms per extra request (was 500ms)
+  maxDelayMs:  3000,           // cap at 3 s delay (was 5s)
 });
 
 // ─────────────────────────────────────────────

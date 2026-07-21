@@ -51,13 +51,13 @@ const config = {
     credentials: true,
   },
   
-  // Rate Limiting
- rateLimiting: {
-  windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 60 * 60 * 1000,
-  maxRequests: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 100,
-  loginWindowMs: parseInt(process.env.LOGIN_RATE_LIMIT_WINDOW_MS) || 60 * 60 * 1000,
-  loginMaxAttempts: parseInt(process.env.LOGIN_RATE_LIMIT_MAX_ATTEMPTS) || (process.env.NODE_ENV === 'development' ? 100 : 20),
-},
+// Rate Limiting
+  rateLimiting: {
+    windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000, 
+    maxRequests: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 600, 
+    loginWindowMs: parseInt(process.env.LOGIN_RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000,
+    loginMaxAttempts: parseInt(process.env.LOGIN_RATE_LIMIT_MAX_ATTEMPTS) || (process.env.NODE_ENV === 'development' ? 100 : 10),
+  },
   
   // File Upload
   fileUpload: {
