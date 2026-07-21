@@ -28,11 +28,25 @@ import { notifyAgents } from './chatMailer.js';
  *
  * TYPING is no longer a backend concern at all — it moved to direct
  * client-to-client broadcasts (ChatWidget <-> PublicChatTab) over the same
- * `chat:conversation:{id}` channel, on the 'typing' event. That's why the
- * `agent_typing_at` / `visitor_typing_at` columns and the /typing endpoints
- * from the previous revision are gone — typing is ephemeral and doesn't
- * need persistence or server validation, so keeping it server-side only
- * added latency and load for no benefit.
+ * `chat:conversation:{id}` channel, on the 'typing' event.
+ *
+ * FIX (this revision): getChannel() used to call channel.subscribe() and
+ * return the channel object immediately, without waiting for Supabase to
+ * confirm the join. Realtime's subscribe() is asynchronous — it takes a
+ * websocket round trip to actually reach the 'SUBSCRIBED' state. Any
+ * broadcast() call that landed before that round trip finished was
+ * silently dropped, which showed up as: the very first message on a given
+ * conversation (or the first message after a server restart, since the
+ * cache is in-memory) never reaching the other side in real time. Typing
+ * never hit this because it's a direct browser-to-browser broadcast on a
+ * channel that's had seconds to finish joining by the time someone
+ * actually starts typing.
+ *
+ * getChannel() is now getReadyChannel() — it caches a PROMISE that only
+ * resolves once the channel reports 'SUBSCRIBED', and broadcast() awaits
+ * it before calling send(). If a channel ever errors, times out, or closes,
+ * it's evicted from the cache so the next broadcast rebuilds a fresh one
+ * instead of retrying a dead channel forever.
  *
  * SECURITY NOTE: broadcasting is independent of table RLS — it only
  * requires the Realtime service (on by default). Channel names are scoped
@@ -59,6 +73,7 @@ function sanitizeText(value = '', maxLen = 120) {
 
 const TABLE = 'public_chat_conversations';
 const ADMIN_LIST_CHANNEL = 'chat:admin:list';
+const CHANNEL_SUBSCRIBE_TIMEOUT_MS = 8000;
 
 const PHONE_REGEX = /^\+?[0-9][0-9\s\-()]{6,18}[0-9]$/;
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -105,21 +120,49 @@ const isClosedError = (error) => /not found or already closed/i.test(error?.mess
 // supabase-js channels are lightweight; we cache one per conversation (plus
 // the single shared admin-list channel) for the life of the Node process
 // instead of creating/subscribing a new one on every request.
+//
+// The cache stores a PROMISE that resolves to the channel only once Supabase
+// confirms it has actually joined ('SUBSCRIBED'). Sending on a channel that
+// hasn't finished joining yet is silently dropped by Realtime — this is
+// what fixes the "first message never arrives live" bug.
 // ─────────────────────────────────────────────────────────────────────────────
-const channelCache = new Map();
+const channelCache = new Map(); // name -> Promise<RealtimeChannel>
 
-const getChannel = (name) => {
+const getReadyChannel = (name) => {
   if (channelCache.has(name)) return channelCache.get(name);
-  const channel = supabase.channel(name);
-  channel.subscribe(); // joins so .send() can publish
-  channelCache.set(name, channel);
-  return channel;
+
+  const ready = new Promise((resolve, reject) => {
+    const channel = supabase.channel(name);
+
+    const timeout = setTimeout(() => {
+      channelCache.delete(name);
+      reject(new Error(`Realtime subscribe timed out for channel "${name}"`));
+    }, CHANNEL_SUBSCRIBE_TIMEOUT_MS);
+
+    channel.subscribe((status, err) => {
+      if (status === 'SUBSCRIBED') {
+        clearTimeout(timeout);
+        resolve(channel);
+        return;
+      }
+      if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+        clearTimeout(timeout);
+        // Evict so the next broadcast attempt builds a fresh channel
+        // instead of being stuck behind a dead one.
+        channelCache.delete(name);
+        reject(err || new Error(`Realtime channel "${name}" failed: ${status}`));
+      }
+    });
+  });
+
+  channelCache.set(name, ready);
+  return ready;
 };
 
 /** Best-effort broadcast — must never fail or block the HTTP response. */
 const broadcast = async (channelName, event, payload) => {
   try {
-    const channel = getChannel(channelName);
+    const channel = await getReadyChannel(channelName);
     await channel.send({ type: 'broadcast', event, payload });
   } catch (err) {
     console.error(`Realtime broadcast failed (${channelName}/${event}):`, err.message);
