@@ -4,55 +4,43 @@ import { notifyAgents } from './chatMailer.js';
 
 /**
  * publicChat.js — controllers for the public website live chat.
- * Suggested location:  controllers/chat/publicChat.js
  *
- * Data lives in the `public_chat_conversations` table. All messages are
- * stored in the row's `messages` JSONB array as { id, sender, text,
- * created_at }. Appends go through the `append_public_chat_message()`
- * Postgres function so counters and the needs_agent flag update atomically.
+ * REALTIME REVISION 5 — read state lives on each message, not a bare counter.
  *
- * REALTIME REVISION — no more client polling.
+ * Every visitor message now carries its own `read: boolean` in the
+ * messages jsonb array (visitor messages start `read: false`; agent/system
+ * messages are irrelevant to this and marked `read: true` for consistency
+ * since nothing ever counts them). `unread_count` still exists as a fast
+ * cached number for the grid list — but it is now ALWAYS recomputed
+ * directly from the messages array on every write, never incremented or
+ * decremented as an independent operation. That's what fixes the drift
+ * from the previous revision: the count and the actual message history
+ * can no longer disagree, because one is always derived from the other in
+ * the same write.
  *
- * Every write that changes what a client needs to see now BROADCASTS over
- * Supabase Realtime, using the same service-role client already imported
- * as `supabase` (no extra credentials needed):
+ * Read semantics:
+ *   - A visitor message is unread the moment it's appended.
+ *   - Opening a thread (markConversationRead, called by the frontend both
+ *     when the thread is first opened AND again each time a new visitor
+ *     message arrives while it's still open) marks every visitor message
+ *     in that conversation read, via mark_public_chat_read(), and the
+ *     cached unread_count drops to 0 in the same statement.
+ *   - Sending an agent reply implies the agent has seen everything up to
+ *     that point, so it also calls mark_public_chat_read() right after
+ *     appending.
+ *   - If nobody has the thread open, new visitor messages simply
+ *     accumulate as unread — no special handling needed, that's just the
+ *     default state.
  *
- *   - `chat:conversation:{id}`  'messages_updated'  { messages, status }
- *       -> consumed by the visitor's ChatWidget and, when open, the
- *          superadmin thread modal. Sent after every append and on close.
+ * REALTIME REVISION 3 (still in effect) — a message broadcasts directly to
+ * the other side the instant it's sent, over the same channel typing uses;
+ * the REST call + backend broadcast is the durable/reconciling path
+ * underneath, using a client-supplied id so both never render twice.
  *
- *   - `chat:admin:list`  'conversation_created' | 'conversation_updated'
- *       -> consumed by the superadmin grid so cards update live without a
- *          15s poll. Sent on conversation start, every message (visitor or
- *          agent), and on close.
- *
- * TYPING is no longer a backend concern at all — it moved to direct
- * client-to-client broadcasts (ChatWidget <-> PublicChatTab) over the same
- * `chat:conversation:{id}` channel, on the 'typing' event.
- *
- * FIX (this revision): getChannel() used to call channel.subscribe() and
- * return the channel object immediately, without waiting for Supabase to
- * confirm the join. Realtime's subscribe() is asynchronous — it takes a
- * websocket round trip to actually reach the 'SUBSCRIBED' state. Any
- * broadcast() call that landed before that round trip finished was
- * silently dropped, which showed up as: the very first message on a given
- * conversation (or the first message after a server restart, since the
- * cache is in-memory) never reaching the other side in real time. Typing
- * never hit this because it's a direct browser-to-browser broadcast on a
- * channel that's had seconds to finish joining by the time someone
- * actually starts typing.
- *
- * getChannel() is now getReadyChannel() — it caches a PROMISE that only
- * resolves once the channel reports 'SUBSCRIBED', and broadcast() awaits
- * it before calling send(). If a channel ever errors, times out, or closes,
- * it's evicted from the cache so the next broadcast rebuilds a fresh one
- * instead of retrying a dead channel forever.
- *
- * SECURITY NOTE: broadcasting is independent of table RLS — it only
- * requires the Realtime service (on by default). Channel names are scoped
- * by the conversation's UUID, matching the same trust boundary the REST
- * endpoints already use. For stronger guarantees, enable Supabase Realtime
- * Authorization (private channels gated by a Supabase JWT).
+ * REALTIME REVISION 2 (still in effect) — every broadcast is awaited and
+ * built fresh per call (subscribe, send, remove) instead of cached across
+ * requests, so a process frozen/suspended between requests (Render free
+ * spin-down) can't hand a broadcast to an already-dead socket.
  */
 
 export const handleDatabaseError = (res, error) => {
@@ -73,19 +61,35 @@ function sanitizeText(value = '', maxLen = 120) {
 
 const TABLE = 'public_chat_conversations';
 const ADMIN_LIST_CHANNEL = 'chat:admin:list';
-const CHANNEL_SUBSCRIBE_TIMEOUT_MS = 8000;
+const CHANNEL_SUBSCRIBE_TIMEOUT_MS = 15000; // generous — covers a Render cold start
 
 const PHONE_REGEX = /^\+?[0-9][0-9\s\-()]{6,18}[0-9]$/;
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-const buildMessage = (sender, text) => ({
-  id: crypto.randomUUID(),
+const ROW_SELECT =
+  'id, visitor_name, visitor_phone, visitor_email, status, needs_agent, unread_count, message_count, last_message, last_sender, last_activity, page_url, created_at, close_reason, messages';
+const ROW_SELECT_NO_MESSAGES =
+  'id, visitor_name, visitor_phone, visitor_email, status, needs_agent, unread_count, message_count, last_message, last_sender, last_activity, page_url, created_at, close_reason';
+
+/** Use a client-supplied id if present and well-formed, else mint one. */
+const resolveMessageId = (requestedId) =>
+  typeof requestedId === 'string' && UUID_REGEX.test(requestedId) ? requestedId : crypto.randomUUID();
+
+const buildMessage = (sender, text, requestedId) => ({
+  id: resolveMessageId(requestedId),
   sender, // 'visitor' | 'agent' | 'system'
   text,
   created_at: new Date().toISOString(),
+  // Only visitor messages are ever counted as unread; agent/system
+  // messages are marked read for consistency, though nothing reads this
+  // field for them.
+  read: sender !== 'visitor',
 });
 
-/** Atomic append via the Postgres function (see public_chat_schema.sql). */
+/** Atomic append via the Postgres function (see public_chat_schema.sql).
+ *  Unchanged — it just appends whatever message object it's given, so the
+ *  new `read` field passes through with no changes needed on its side. */
 const appendMessage = async (conversationId, message) => {
   const { data, error } = await supabase.rpc('append_public_chat_message', {
     p_conversation_id: conversationId,
@@ -93,6 +97,28 @@ const appendMessage = async (conversationId, message) => {
   });
   if (error) throw new Error(error.message);
   return data; // full updated conversation row
+};
+
+/** The single source of truth for "how many are unread" — always derived
+ *  from the messages array itself, never tracked independently. */
+const countUnread = (messages) =>
+  Array.isArray(messages) ? messages.filter((m) => m.sender === 'visitor' && m.read === false).length : 0;
+
+/** Recompute unread_count from the row's own messages array and persist
+ *  it as the cached value the grid list reads. */
+const syncUnreadCount = async (conversationId, messages) => {
+  const unreadCount = countUnread(messages);
+  await supabase.from(TABLE).update({ unread_count: unreadCount }).eq('id', conversationId);
+  return unreadCount;
+};
+
+/** Marks every visitor message in the conversation read and zeroes
+ *  unread_count, atomically, via mark_public_chat_read(). Used both when
+ *  an agent opens/re-views a thread and right after an agent reply. */
+const markRead = async (conversationId) => {
+  const { data, error } = await supabase.rpc('mark_public_chat_read', { p_conversation_id: conversationId });
+  if (error) throw new Error(error.message);
+  return data; // full updated row, messages included
 };
 
 /** Map a DB row to the shape the superadmin PublicChatTab expects. */
@@ -103,6 +129,7 @@ const toListShape = (row) => ({
   visitorEmail: row.visitor_email,
   status: row.status,
   escalated: row.needs_agent, // "Needs reply" badge
+  unreadCount: row.unread_count ?? 0,
   messageCount: row.message_count,
   lastMessage: row.last_message,
   lastSender: row.last_sender,
@@ -115,71 +142,59 @@ const toListShape = (row) => ({
 const isClosedError = (error) => /not found or already closed/i.test(error?.message || '');
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Realtime broadcast helpers
-//
-// supabase-js channels are lightweight; we cache one per conversation (plus
-// the single shared admin-list channel) for the life of the Node process
-// instead of creating/subscribing a new one on every request.
-//
-// The cache stores a PROMISE that resolves to the channel only once Supabase
-// confirms it has actually joined ('SUBSCRIBED'). Sending on a channel that
-// hasn't finished joining yet is silently dropped by Realtime — this is
-// what fixes the "first message never arrives live" bug.
+// Realtime broadcast helper — one-shot per call, no cross-request caching.
+// See REALTIME REVISION 2 in the module comment for why.
 // ─────────────────────────────────────────────────────────────────────────────
-const channelCache = new Map(); // name -> Promise<RealtimeChannel>
+const broadcastOnce = (channelName, event, payload) =>
+  new Promise((resolve) => {
+    const channel = supabase.channel(channelName);
+    let settled = false;
 
-const getReadyChannel = (name) => {
-  if (channelCache.has(name)) return channelCache.get(name);
-
-  const ready = new Promise((resolve, reject) => {
-    const channel = supabase.channel(name);
+    const cleanup = (ok, err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      supabase.removeChannel(channel);
+      if (!ok) console.error(`Realtime broadcast failed (${channelName}/${event}):`, err?.message || err);
+      resolve(ok);
+    };
 
     const timeout = setTimeout(() => {
-      channelCache.delete(name);
-      reject(new Error(`Realtime subscribe timed out for channel "${name}"`));
+      cleanup(false, new Error(`subscribe timed out for channel "${channelName}"`));
     }, CHANNEL_SUBSCRIBE_TIMEOUT_MS);
 
-    channel.subscribe((status, err) => {
+    channel.subscribe(async (status, err) => {
       if (status === 'SUBSCRIBED') {
-        clearTimeout(timeout);
-        resolve(channel);
+        try {
+          await channel.send({ type: 'broadcast', event, payload });
+          cleanup(true);
+        } catch (sendErr) {
+          cleanup(false, sendErr);
+        }
         return;
       }
       if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
-        clearTimeout(timeout);
-        // Evict so the next broadcast attempt builds a fresh channel
-        // instead of being stuck behind a dead one.
-        channelCache.delete(name);
-        reject(err || new Error(`Realtime channel "${name}" failed: ${status}`));
+        cleanup(false, err || new Error(`channel "${channelName}" reported ${status}`));
       }
     });
   });
 
-  channelCache.set(name, ready);
-  return ready;
-};
-
-/** Best-effort broadcast — must never fail or block the HTTP response. */
 const broadcast = async (channelName, event, payload) => {
-  try {
-    const channel = await getReadyChannel(channelName);
-    await channel.send({ type: 'broadcast', event, payload });
-  } catch (err) {
-    console.error(`Realtime broadcast failed (${channelName}/${event}):`, err.message);
-  }
+  await broadcastOnce(channelName, event, payload);
 };
 
 const broadcastConversationUpdate = (conversationRow) => {
-  broadcast(ADMIN_LIST_CHANNEL, 'conversation_updated', toListShape(conversationRow));
+  const lastMessageId = Array.isArray(conversationRow.messages) && conversationRow.messages.length
+    ? conversationRow.messages[conversationRow.messages.length - 1].id
+    : undefined;
+  return broadcast(ADMIN_LIST_CHANNEL, 'conversation_updated', { ...toListShape(conversationRow), lastMessageId });
 };
 
-const broadcastMessagesUpdated = (conversationId, messages, status) => {
+const broadcastMessagesUpdated = (conversationId, messages, status) =>
   broadcast(`chat:conversation:${conversationId}`, 'messages_updated', { messages, status });
-};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // startConversation   POST /api/chat/conversations   (public — no auth)
-// Expects: { name, phone, email, page_url }
 // ─────────────────────────────────────────────────────────────────────────────
 export const startConversation = async (req, res) => {
   const name = sanitizeText(req.body?.name, 100).trim();
@@ -217,17 +232,14 @@ export const startConversation = async (req, res) => {
         message_count: greeting.length,
         last_message: greeting[greeting.length - 1].text,
         last_sender: 'agent',
+        unread_count: 0, // greeting is from us — nothing unread yet
       }])
-      // Select every column toListShape() needs so the dashboard grid gets
-      // a complete card the instant this conversation is broadcast to it.
-      .select(
-        'id, visitor_name, visitor_phone, visitor_email, status, needs_agent, message_count, last_message, last_sender, last_activity, page_url, created_at, close_reason, messages'
-      )
+      .select(ROW_SELECT)
       .single();
 
     if (error) throw error;
 
-    broadcast(ADMIN_LIST_CHANNEL, 'conversation_created', toListShape(data));
+    await broadcast(ADMIN_LIST_CHANNEL, 'conversation_created', toListShape(data));
 
     return res.status(201).json({
       success: true,
@@ -243,8 +255,6 @@ export const startConversation = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // getVisitorMessages   GET /api/chat/conversations/:id/messages   (public)
-// Used for the widget's initial load and its Realtime reconciliation fetch
-// (on reconnect / tab focus) — no longer polled in a loop.
 // ─────────────────────────────────────────────────────────────────────────────
 export const getVisitorMessages = async (req, res) => {
   const { id } = req.params;
@@ -273,14 +283,16 @@ export const getVisitorMessages = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // sendVisitorMessage   POST /api/chat/conversations/:id/messages   (public)
-// Appends the visitor's message, notifies human agents, and broadcasts the
-// update to both the agent's open thread (if any) and the admin grid.
+// Expects: { text, id? }
+// New message starts unread (read: false, set in buildMessage). No
+// increment RPC — unread_count is recomputed straight from the array.
 // ─────────────────────────────────────────────────────────────────────────────
 export const sendVisitorMessage = async (req, res) => {
-  const { id } = req.params;
+  const { id: conversationId } = req.params;
   const text = String(req.body?.text || '').trim().slice(0, 2000);
+  const requestedId = req.body?.id;
 
-  if (!id) {
+  if (!conversationId) {
     return res.status(400).json({ success: false, message: 'Conversation id is required.' });
   }
   if (!text) {
@@ -288,13 +300,13 @@ export const sendVisitorMessage = async (req, res) => {
   }
 
   try {
-    const message = buildMessage('visitor', text);
-    const conversation = await appendMessage(id, message);
+    const message = buildMessage('visitor', text, requestedId);
+    const conversation = await appendMessage(conversationId, message);
+    conversation.unread_count = await syncUnreadCount(conversationId, conversation.messages);
 
-    broadcastMessagesUpdated(id, conversation.messages, conversation.status);
-    broadcastConversationUpdate(conversation);
+    await broadcastMessagesUpdated(conversationId, conversation.messages, conversation.status);
+    await broadcastConversationUpdate(conversation);
 
-    // Alert human agents — never blocks or fails the visitor's request
     notifyAgents(conversation, text);
 
     return res.status(201).json({
@@ -314,16 +326,12 @@ export const sendVisitorMessage = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // listConversations   GET /api/superadmin/public-chats
-// Still used for first load and the long-interval safety-net refresh; the
-// grid's live updates now come from the 'chat:admin:list' broadcast channel.
 // ─────────────────────────────────────────────────────────────────────────────
 export const listConversations = async (req, res) => {
   try {
     const { data, error } = await supabase
       .from(TABLE)
-      .select(
-        'id, visitor_name, visitor_phone, visitor_email, status, needs_agent, message_count, last_message, last_sender, last_activity, page_url, created_at, close_reason'
-      )
+      .select(ROW_SELECT_NO_MESSAGES)
       .order('last_activity', { ascending: false })
       .limit(200);
 
@@ -338,7 +346,6 @@ export const listConversations = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // getConversationMessages   GET /api/superadmin/public-chats/:id/messages
-// Used for the thread modal's initial load and reconciliation fetch.
 // ─────────────────────────────────────────────────────────────────────────────
 export const getConversationMessages = async (req, res) => {
   const { id } = req.params;
@@ -367,14 +374,16 @@ export const getConversationMessages = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // sendAgentReply   POST /api/superadmin/public-chats/:id/messages
-// Stored with sender 'agent'; resets the needs_agent flag via the append fn,
-// then broadcasts to the visitor's widget and the admin grid.
+// Expects: { text, id? }
+// Replying implies the agent has seen everything up to now, so this marks
+// all visitor messages read (and unread_count -> 0) right after appending.
 // ─────────────────────────────────────────────────────────────────────────────
 export const sendAgentReply = async (req, res) => {
-  const { id } = req.params;
+  const { id: conversationId } = req.params;
   const text = String(req.body?.text || '').trim().slice(0, 2000);
+  const requestedId = req.body?.id;
 
-  if (!id) {
+  if (!conversationId) {
     return res.status(400).json({ success: false, message: 'Conversation id is required.' });
   }
   if (!text) {
@@ -382,11 +391,12 @@ export const sendAgentReply = async (req, res) => {
   }
 
   try {
-    const message = buildMessage('agent', text);
-    const conversation = await appendMessage(id, message);
+    const message = buildMessage('agent', text, requestedId);
+    await appendMessage(conversationId, message);
+    const conversation = await markRead(conversationId); // full row, messages read-flagged, unread_count 0
 
-    broadcastMessagesUpdated(id, conversation.messages, conversation.status);
-    broadcastConversationUpdate(conversation);
+    await broadcastMessagesUpdated(conversationId, conversation.messages, conversation.status);
+    await broadcastConversationUpdate(conversation);
 
     return res.status(201).json({ success: true, message, messages: conversation.messages });
 
@@ -394,6 +404,36 @@ export const sendAgentReply = async (req, res) => {
     if (isClosedError(error)) {
       return res.status(410).json({ success: false, message: 'This conversation is closed.' });
     }
+    return handleDatabaseError(res, error);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// markConversationRead   POST /api/superadmin/public-chats/:id/read
+// Called when an agent opens a thread, AND again each time a new visitor
+// message arrives while that thread is still open — so messages that come
+// in while the agent is actively watching get marked read as they land,
+// not just once at open time. If nobody calls this (thread not open),
+// messages simply stay unread — that's just the default state.
+// ─────────────────────────────────────────────────────────────────────────────
+export const markConversationRead = async (req, res) => {
+  const { id } = req.params;
+
+  if (!id) {
+    return res.status(400).json({ success: false, message: 'Conversation id is required.' });
+  }
+
+  try {
+    const data = await markRead(id);
+    if (!data) {
+      return res.status(404).json({ success: false, message: 'Conversation not found.' });
+    }
+
+    await broadcastConversationUpdate(data);
+
+    return res.status(200).json({ success: true, data: toListShape(data) });
+
+  } catch (error) {
     return handleDatabaseError(res, error);
   }
 };
@@ -414,7 +454,6 @@ export const closeConversation = async (req, res) => {
   }
 
   try {
-    // Append a system note so the visitor sees the chat was ended
     try {
       await appendMessage(
         id,
@@ -429,19 +468,20 @@ export const closeConversation = async (req, res) => {
       .update({
         status: 'closed',
         needs_agent: false,
+        unread_count: 0,
         close_reason: reason,
         closed_at: new Date().toISOString(),
       })
       .eq('id', id)
-      .select('id, visitor_name, visitor_phone, visitor_email, status, needs_agent, message_count, last_message, last_sender, last_activity, page_url, created_at, close_reason, messages')
+      .select(ROW_SELECT)
       .single();
 
     if (error || !data) {
       return res.status(404).json({ success: false, message: 'Conversation not found.' });
     }
 
-    broadcastMessagesUpdated(id, data.messages, 'closed');
-    broadcastConversationUpdate(data);
+    await broadcastMessagesUpdated(id, data.messages, 'closed');
+    await broadcastConversationUpdate(data);
 
     return res.status(200).json({
       success: true,
