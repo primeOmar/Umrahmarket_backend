@@ -16,7 +16,7 @@
 import { supabaseAdmin } from '../config/supabase.js';
 import config from '../config/security.config.js';
 import logger from '../config/logger.js';
-import { extractPassport, compareWithInput, extractFacePhoto } from '../lib/passportOcr.js';
+import { extractPassport, compareWithInput } from '../lib/passportOcr.js';
 import { uploadPassportBuffer, uploadFacePhotoBuffer } from '../middleware/uploads/PassportUpload.js';
 
 const MAX_ATTEMPTS = 3;
@@ -208,30 +208,14 @@ export const verifyPassportImage = async (req, res) => {
       });
     }
 
-    // 3b) Crop a face photo from the passport page for the agent-facing
-    // Umrah ID card. Best-effort only — never blocks or fails verification.
-    // Only attempted once the OCR has actually read something off the page
-    // (skips wasted work on completely unreadable images).
-    let facePhoto = null;
-    if (ocr.ok) {
-      try {
-        const face = await extractFacePhoto(req.passportFile.buffer);
-        if (face.ok) {
-          facePhoto = await uploadFacePhotoBuffer({
-            buffer: face.buffer, mime: face.mime, ext: face.ext, userId, packageId,
-          });
-          logger.info('Face photo cropped and uploaded', {
-            userId, packageId, key: facePhoto.key, method: face.method,
-          });
-        } else {
-          logger.info('Face photo crop skipped', { userId, packageId, reason: face.reason });
-        }
-      } catch (faceError) {
-        logger.warn('Face photo crop/upload failed, continuing without it', {
-          error: faceError.message, userId, packageId,
-        });
-      }
-    }
+    // NOTE: passport-page face-photo cropping has been intentionally removed
+    // from this step. Clients now provide their own dedicated headshot via
+    // FacePhotoModal -> POST /api/passport/face-photo (saveFacePhoto), which
+    // is a clearer photo than anything auto-cropped from the passport page
+    // and avoids two flows racing to set face_photo_url for the same booking.
+    // upsertVerification() below still preserves an existing face_photo_url
+    // from that flow (or an earlier one) when this attempt doesn't provide one.
+    const facePhoto = null;
 
     // 4) Decide outcome.
     const autoVerified = ocr.ok && ocr.confidence >= MIN_OCR_CONFIDENCE && comparison.matched;
