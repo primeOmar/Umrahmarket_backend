@@ -5,32 +5,29 @@ import { notifyAgents } from './chatMailer.js';
 /**
  * publicChat.js — controllers for the public website live chat.
  *
- * REALTIME REVISION 5 — read state lives on each message, not a bare counter.
+ * REALTIME REVISION 6 — resume an existing conversation by identity.
  *
- * Every visitor message now carries its own `read: boolean` in the
- * messages jsonb array (visitor messages start `read: false`; agent/system
- * messages are irrelevant to this and marked `read: true` for consistency
- * since nothing ever counts them). `unread_count` still exists as a fast
- * cached number for the grid list — but it is now ALWAYS recomputed
- * directly from the messages array on every write, never incremented or
- * decremented as an independent operation. That's what fixes the drift
- * from the previous revision: the count and the actual message history
- * can no longer disagree, because one is always derived from the other in
- * the same write.
+ * startConversation() now checks for an existing, non-closed conversation
+ * with the same email AND phone before creating a new row. If one exists,
+ * it's returned as-is (same response shape as a fresh start) instead of
+ * inserting a duplicate — so a visitor who reopens the site, or refills
+ * the pre-chat form after clearing session storage, picks up where they
+ * left off rather than spawning a new thread every time. Once a
+ * conversation is closed, this lookup deliberately excludes it — closed
+ * means closed, and the next message starts a brand new conversation.
  *
- * Read semantics:
- *   - A visitor message is unread the moment it's appended.
- *   - Opening a thread (markConversationRead, called by the frontend both
- *     when the thread is first opened AND again each time a new visitor
- *     message arrives while it's still open) marks every visitor message
- *     in that conversation read, via mark_public_chat_read(), and the
- *     cached unread_count drops to 0 in the same statement.
- *   - Sending an agent reply implies the agent has seen everything up to
- *     that point, so it also calls mark_public_chat_read() right after
- *     appending.
- *   - If nobody has the thread open, new visitor messages simply
- *     accumulate as unread — no special handling needed, that's just the
- *     default state.
+ * Phone numbers are compared digit-only (normalizePhone), since the same
+ * number can be stored as "+254799690364" or "254799690364" depending on
+ * how it was typed — a plain string match would treat those as different
+ * visitors.
+ *
+ * REALTIME REVISION 5 (still in effect) — read state lives on each
+ * message (`read: boolean` in the messages jsonb), not a bare counter.
+ * `unread_count` is a cached number for the grid list, always recomputed
+ * from the messages array (countUnread/syncUnreadCount), never
+ * incremented as an independent operation. mark_public_chat_read() flips
+ * every visitor message to read and zeroes the count atomically —used
+ * when a thread is opened and right after an agent reply.
  *
  * REALTIME REVISION 3 (still in effect) — a message broadcasts directly to
  * the other side the instant it's sent, over the same channel typing uses;
@@ -72,6 +69,9 @@ const ROW_SELECT =
 const ROW_SELECT_NO_MESSAGES =
   'id, visitor_name, visitor_phone, visitor_email, status, needs_agent, unread_count, message_count, last_message, last_sender, last_activity, page_url, created_at, close_reason';
 
+/** Digits only, so "+254799690364" and "254799690364" compare equal. */
+const normalizePhone = (value) => String(value || '').replace(/[^0-9]/g, '');
+
 /** Use a client-supplied id if present and well-formed, else mint one. */
 const resolveMessageId = (requestedId) =>
   typeof requestedId === 'string' && UUID_REGEX.test(requestedId) ? requestedId : crypto.randomUUID();
@@ -89,7 +89,7 @@ const buildMessage = (sender, text, requestedId) => ({
 
 /** Atomic append via the Postgres function (see public_chat_schema.sql).
  *  Unchanged — it just appends whatever message object it's given, so the
- *  new `read` field passes through with no changes needed on its side. */
+ *  `read` field passes through with no changes needed on its side. */
 const appendMessage = async (conversationId, message) => {
   const { data, error } = await supabase.rpc('append_public_chat_message', {
     p_conversation_id: conversationId,
@@ -119,6 +119,22 @@ const markRead = async (conversationId) => {
   const { data, error } = await supabase.rpc('mark_public_chat_read', { p_conversation_id: conversationId });
   if (error) throw new Error(error.message);
   return data; // full updated row, messages included
+};
+
+/** Finds a non-closed conversation with the same email and phone, most
+ *  recently active first. Returns the full row, or null if none matches. */
+const findResumableConversation = async (email, phone) => {
+  const { data, error } = await supabase
+    .from(TABLE)
+    .select(ROW_SELECT)
+    .ilike('visitor_email', email)
+    .neq('status', 'closed')
+    .order('last_activity', { ascending: false });
+
+  if (error || !Array.isArray(data)) return null;
+
+  const targetPhone = normalizePhone(phone);
+  return data.find((row) => normalizePhone(row.visitor_phone) === targetPhone) || null;
 };
 
 /** Map a DB row to the shape the superadmin PublicChatTab expects. */
@@ -195,6 +211,11 @@ const broadcastMessagesUpdated = (conversationId, messages, status) =>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // startConversation   POST /api/chat/conversations   (public — no auth)
+// Expects: { name, phone, email, page_url }
+//
+// If a non-closed conversation already exists for this email+phone, it's
+// resumed (returned as-is, response includes resumed: true) instead of
+// creating a new row. Otherwise behaves exactly as before.
 // ─────────────────────────────────────────────────────────────────────────────
 export const startConversation = async (req, res) => {
   const name = sanitizeText(req.body?.name, 100).trim();
@@ -212,15 +233,26 @@ export const startConversation = async (req, res) => {
     return res.status(400).json({ success: false, message: 'Invalid email address.' });
   }
 
-  const greeting = [
-    buildMessage('system', `Welcome, ${name.split(' ')[0]}. You are connected to Umrah Market support.`),
-    buildMessage(
-      'agent',
-      'Assalamu alaikum! Ask anything about our services, customer care agents are here to serve you.'
-    ),
-  ];
-
   try {
+    const resumable = await findResumableConversation(email, phone);
+    if (resumable) {
+      return res.status(200).json({
+        success: true,
+        resumed: true,
+        conversation_id: resumable.id,
+        status: resumable.status,
+        messages: resumable.messages,
+      });
+    }
+
+    const greeting = [
+      buildMessage('system', `Welcome, ${name.split(' ')[0]}. You are connected to Umrah Market support.`),
+      buildMessage(
+        'agent',
+        'Assalamu alaikum! Ask anything about our services, customer care agents are here to serve you.'
+      ),
+    ];
+
     const { data, error } = await supabase
       .from(TABLE)
       .insert([{
@@ -243,6 +275,7 @@ export const startConversation = async (req, res) => {
 
     return res.status(201).json({
       success: true,
+      resumed: false,
       conversation_id: data.id,
       status: data.status,
       messages: data.messages,
