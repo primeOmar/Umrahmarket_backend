@@ -10,6 +10,13 @@
  *   POST /api/onboarding/contact      — save/confirm email + mobile number
  *   POST /api/onboarding/next-of-kin  — save next-of-kin details for a package
  *
+ * This does NOT touch passport document scanning/OCR (that's a separate,
+ * pre-existing flow in passport.controller.js — checkPassportValidity /
+ * verifyPassportImage). The "idPhoto" completeness here tracks a different,
+ * simpler thing: the dedicated Umrah ID photo the client uploads/takes
+ * directly (plain background, no OCR, no cropping) via
+ * POST /api/passport/face-photo (saveFacePhoto), which writes to the same
+ * passport_verifications.face_photo_url column.
  */
 import { supabaseAdmin } from '../config/supabase.js';
 import logger from '../config/logger.js';
@@ -63,21 +70,23 @@ async function getNextOfKinState(userId, packageId) {
   return { data: data || null, complete: Boolean(data?.full_name && data?.phone) };
 }
 
-async function getPassportState(userId, packageId) {
+// This checks the DEDICATED Umrah ID photo (a plain-background, forward-facing
+// photo the client uploads/takes directly — no OCR, no cropping). It is
+// intentionally separate from passport *document* verification: that's a
+// different, pre-existing flow (checkPassportValidity / verifyPassportImage)
+// that this onboarding step does not gate on.
+async function getIdPhotoState(userId, packageId) {
   const { data, error } = await supabaseAdmin
     .from('passport_verifications')
-    .select('verification_status, verified, passport_image_url')
+    .select('face_photo_url')
     .eq('user_id', userId)
     .eq('package_id', packageId)
     .maybeSingle();
   if (error) throw new Error(error.message);
 
-  const hasImage = Boolean(data?.passport_image_url) && !data.passport_image_url.startsWith('pending://');
-  // Mirrors getPassportStatus()'s canProceed logic in passport.controller.js —
-  // verified or manual_review both count as "done" for gating purposes.
-  const complete = Boolean(data) && ['verified', 'manual_review'].includes(data.verification_status);
+  const hasPhoto = Boolean(data?.face_photo_url) && !data.face_photo_url.startsWith('pending://');
 
-  return { status: data?.verification_status || null, hasImage, complete };
+  return { url: data?.face_photo_url || null, complete: hasPhoto };
 }
 
 // =============================================================================
@@ -89,18 +98,18 @@ export const getOnboardingStatus = async (req, res) => {
     const { packageId } = req.query;
     if (!packageId) return res.status(400).json({ success: false, message: 'packageId is required.' });
 
-    const [contact, nextOfKin, passport] = await Promise.all([
+    const [contact, nextOfKin, idPhoto] = await Promise.all([
       getContactState(userId),
       getNextOfKinState(userId, packageId),
-      getPassportState(userId, packageId),
+      getIdPhotoState(userId, packageId),
     ]);
 
     return res.json({
       success: true,
       contact,
       nextOfKin,
-      passport,
-      allComplete: contact.complete && nextOfKin.complete && passport.complete,
+      idPhoto,
+      allComplete: contact.complete && nextOfKin.complete && idPhoto.complete,
     });
   } catch (err) {
     logger.error('[getOnboardingStatus] failed', { error: err.message });
@@ -125,20 +134,20 @@ export const getMissingOnboarding = async (req, res) => {
 
     const packageIds = [...new Set(bookings.map((b) => b.package_id))];
 
-    const [contact, kinRows, passRows] = await Promise.all([
+    const [contact, kinRows, idPhotoRows] = await Promise.all([
       getContactState(userId),
       supabaseAdmin.from('next_of_kin').select('package_id, full_name, phone')
         .eq('user_id', userId).in('package_id', packageIds),
-      supabaseAdmin.from('passport_verifications').select('package_id, verification_status')
+      supabaseAdmin.from('passport_verifications').select('package_id, face_photo_url')
         .eq('user_id', userId).in('package_id', packageIds),
     ]);
 
     const kinComplete = new Set(
       (kinRows.data || []).filter((k) => k.full_name && k.phone).map((k) => k.package_id)
     );
-    const passportComplete = new Set(
-      (passRows.data || [])
-        .filter((p) => ['verified', 'manual_review'].includes(p.verification_status))
+    const idPhotoComplete = new Set(
+      (idPhotoRows.data || [])
+        .filter((p) => p.face_photo_url && !p.face_photo_url.startsWith('pending://'))
         .map((p) => p.package_id)
     );
 
@@ -148,9 +157,9 @@ export const getMissingOnboarding = async (req, res) => {
         packageId: b.package_id,
         missingContact: !contact.complete,
         missingNextOfKin: !kinComplete.has(b.package_id),
-        missingPassport: !passportComplete.has(b.package_id),
+        missingIdPhoto: !idPhotoComplete.has(b.package_id),
       }))
-      .filter((b) => b.missingContact || b.missingNextOfKin || b.missingPassport);
+      .filter((b) => b.missingContact || b.missingNextOfKin || b.missingIdPhoto);
 
     return res.json({ success: true, bookingsMissingDetails });
   } catch (err) {
@@ -176,7 +185,7 @@ export const saveContactInfo = async (req, res) => {
     if (!cleanPhone) {
       return res.status(400).json({
         success: false,
-        message: 'A valid mobile number is required, e.g. 07XXXXXXXX or +2547XXXXXXXX.',
+        message: 'A valid mobile number with country code is required, e.g. +2547XXXXXXXX or +447XXXXXXXXX.',
       });
     }
 
@@ -219,7 +228,7 @@ export const saveNextOfKin = async (req, res) => {
     if (!cleanPhone) {
       return res.status(400).json({
         success: false,
-        message: 'A valid next-of-kin mobile number is required, e.g. 07XXXXXXXX or +2547XXXXXXXX.',
+        message: 'A valid next-of-kin mobile number with country code is required, e.g. +2547XXXXXXXX or +447XXXXXXXXX.',
       });
     }
     if (cleanEmail && !EMAIL_RE.test(cleanEmail)) {
