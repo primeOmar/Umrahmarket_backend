@@ -492,6 +492,27 @@ export async function saveFacePhoto(req, res) {
       });
     }
 
+    // A verified (or manual-review) passport is mandatory for every booking —
+    // the client should never reach this step without one, since BookingFlow
+    // gates payment on passport verification. Enforce it here too so the
+    // endpoint can't be hit directly to bypass passport verification entirely.
+    const { data: existing } = await supabaseAdmin
+      .from('passport_verifications')
+      .select('id, passport_image_url, verification_status')
+      .eq('user_id', userId)
+      .eq('package_id', packageId)
+      .maybeSingle();
+
+    if (!existing || !['verified', 'manual_review'].includes(existing.verification_status)) {
+      logger.warn('saveFacePhoto rejected — passport not verified for this booking', {
+        userId, packageId, status: existing?.verification_status || 'none',
+      });
+      return res.status(403).json({
+        success: false,
+        error: 'Please complete passport verification for this booking before submitting your ID photo.',
+      });
+    }
+
     // Upload to R2 (public-read, just the headshot — no PII baked in).
     const facePhoto = await uploadFacePhotoBuffer({
       buffer: req.file.buffer,
@@ -503,52 +524,19 @@ export async function saveFacePhoto(req, res) {
 
     logger.info('Dedicated face photo uploaded', { userId, packageId, key: facePhoto.key });
 
-    // Upsert into passport_verifications.
-    // We do a targeted patch so we don't accidentally clobber a verified
-    // passport row; if no row exists yet we create a minimal one.
-    const { data: existing } = await supabaseAdmin
+    // Patch only the face photo fields — never touch the verification fields.
+    const { error: upErr } = await supabaseAdmin
       .from('passport_verifications')
-      .select('id, passport_image_url, verification_status')
+      .update({
+        face_photo_url: facePhoto.url,
+        face_photo_key: facePhoto.key,
+      })
       .eq('user_id', userId)
-      .eq('package_id', packageId)
-      .maybeSingle();
+      .eq('package_id', packageId);
 
-    if (existing) {
-      // Row already exists — patch only the face photo fields.
-      const { error: upErr } = await supabaseAdmin
-        .from('passport_verifications')
-        .update({
-          face_photo_url: facePhoto.url,
-          face_photo_key: facePhoto.key,
-        })
-        .eq('user_id', userId)
-        .eq('package_id', packageId);
-
-      if (upErr) {
-        logger.error('saveFacePhoto update failed', { error: upErr.message, userId, packageId });
-        return res.status(500).json({ success: false, error: 'Could not save photo. Please try again.' });
-      }
-    } else {
-      // No verification row yet (passport step was skipped or not reached).
-      // Create a minimal stub so the face_photo_url is findable.
-      const { error: insErr } = await supabaseAdmin
-        .from('passport_verifications')
-        .insert({
-          user_id:              userId,
-          package_id:           packageId,
-          passport_image_url:   'pending://face-photo-only',
-          face_photo_url:       facePhoto.url,
-          face_photo_key:       facePhoto.key,
-          verification_status:  'pending',
-          verified:             false,
-          attempts:             0,
-          last_attempt_at:      new Date().toISOString(),
-        });
-
-      if (insErr) {
-        logger.error('saveFacePhoto insert failed', { error: insErr.message, userId, packageId });
-        return res.status(500).json({ success: false, error: 'Could not save photo. Please try again.' });
-      }
+    if (upErr) {
+      logger.error('saveFacePhoto update failed', { error: upErr.message, userId, packageId });
+      return res.status(500).json({ success: false, error: 'Could not save photo. Please try again.' });
     }
 
     return res.json({
