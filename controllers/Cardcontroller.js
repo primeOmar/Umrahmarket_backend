@@ -380,8 +380,14 @@ export const verify = async (req, res) => {
       return res.json({ success: true, alreadyProcessed: true, booking });
     }
 
-    if (payment.status === 'FAILED')
-      return res.status(400).json({ success: false, message: 'This payment was already marked as failed.' });
+    // NOTE: we deliberately do NOT short-circuit on payment.status === 'FAILED'
+    // here. Pesapal's transaction status can be transiently non-COMPLETED
+    // right after redirect (e.g. still settling), and a premature verify call
+    // used to lock this payment as FAILED forever — even if Pesapal later
+    // confirms COMPLETED. Pesapal is the source of truth, not our cache, so
+    // every verify call re-queries it below and only trusts a definitive
+    // result. If it's still not COMPLETED, we simply report PENDING again
+    // rather than a hard, unrecoverable failure.
 
     // ── 2. Query Pesapal server-to-server ─────────────────────────────────────
     let token, txStatus;
