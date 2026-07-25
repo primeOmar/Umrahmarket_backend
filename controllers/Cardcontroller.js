@@ -166,6 +166,31 @@ export const initiate = async (req, res) => {
       return res.status(400).json({ success: false, message: 'You have already booked this package. You cannot book the same package twice.' });
     }
 
+    // ── Require passport verification for THIS package before payment ────────
+    // The frontend BookingFlow already gates the UI on this, but that's not
+    // enforcement — a request made directly against this endpoint must not be
+    // able to skip verification just because it never went through the modal.
+    const { data: passport, error: passportErr } = await supabaseAdmin
+      .from('passport_verifications')
+      .select('verification_status, verified')
+      .eq('user_id', userId)
+      .eq('package_id', packageId)
+      .maybeSingle();
+
+    if (passportErr) {
+      console.error('[Card initiate] Passport verification check error:', passportErr.message);
+      return res.status(500).json({ success: false, message: 'Failed to verify passport status' });
+    }
+
+    const passportVerified = passport?.verification_status === 'verified' || passport?.verified === true;
+    if (!passportVerified) {
+      return res.status(403).json({
+        success: false,
+        code:    'PASSPORT_NOT_VERIFIED',
+        message: 'Please complete passport verification for this package before paying.',
+      });
+    }
+
     // ── 2. Idempotency — resume pending within 10 min ────────────────────────
     const tenMinAgo = new Date(Date.now() - 10 * 60_000).toISOString();
     const { data: existing } = await supabaseAdmin
