@@ -178,21 +178,79 @@ router.post(
           error: 'Registration failed. Please try again later.',
         });
       }
-      
+
       logAuthAttempt(true, authData.user.id, req.ip, req.get('user-agent'), {
         type: 'registration',
         role: 'client',
       });
-      
+
       logSecurityEvent('New client registered', {
         userId: authData.user.id,
         email,
         ip: req.ip,
       });
-      
+
+      // ── Establish a real session immediately ──────────────────────────
+      // The frontend treats a successful registration as an instant login
+      // and sends the client straight into the booking flow — so it needs
+      // real tokens back here, not just a user record. signUp() above
+      // withholds a session until the email-confirmation link is clicked,
+      // so mark the account confirmed via the admin API and sign in
+      // server-side to get one now.
+      const { error: confirmError } = await supabaseAdmin.auth.admin.updateUserById(
+        authData.user.id,
+        { email_confirm: true },
+      );
+      if (confirmError) {
+        logger.error('Failed to auto-confirm new client email', {
+          error: confirmError.message,
+          userId: authData.user.id,
+        });
+        // Account exists but couldn't be auto-confirmed — fail closed to
+        // login-required rather than silently leaving them unauthenticated.
+        return res.status(201).json({
+          success: true,
+          message: 'Registration successful. Please log in to continue.',
+          data: {
+            user: {
+              id: authData.user.id,
+              email: authData.user.email,
+              firstName,
+              lastName,
+              role: 'client',
+            },
+          },
+        });
+      }
+
+      const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({
+        email,
+        password,
+      });
+
+      if (signInError || !signInData?.session) {
+        logger.error('Failed to sign in new client after registration', {
+          error: signInError?.message,
+          userId: authData.user.id,
+        });
+        return res.status(201).json({
+          success: true,
+          message: 'Registration successful. Please log in to continue.',
+          data: {
+            user: {
+              id: authData.user.id,
+              email: authData.user.email,
+              firstName,
+              lastName,
+              role: 'client',
+            },
+          },
+        });
+      }
+
       res.status(201).json({
         success: true,
-        message: 'Registration successful. Please check your email to verify your account.',
+        message: 'Registration successful.',
         data: {
           user: {
             id: authData.user.id,
@@ -201,6 +259,8 @@ router.post(
             lastName,
             role: 'client',
           },
+          accessToken:  signInData.session.access_token,
+          refreshToken: signInData.session.refresh_token,
         },
       });
     } catch (error) {
