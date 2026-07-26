@@ -1,32 +1,10 @@
-// controllers/Cardcontroller.js
-// ─────────────────────────────────────────────────────────────────────────────
-// Card payment via Pesapal (PCI-DSS compliant — hosted payment page).
-// 
-// HOW IT WORKS (card data never touches your server):
-//   1. POST /api/payments/card/initiate  → backend gets Pesapal token,
-//      registers IPN, submits order → returns redirect_url to frontend
-//   2. Frontend redirects user to Pesapal hosted checkout page
-//      (user enters card / M-Pesa on Pesapal's PCI-certified servers)
-//   3. Pesapal redirects back to PESAPAL_CALLBACK_URL/:packageId with ?OrderTrackingId=xxx
-//   4. Frontend calls POST /api/payments/card/verify { orderTrackingId, packageId }
-//   5. Backend queries Pesapal transaction status server-to-server
-//   6. All security checks pass → booking created in Supabase
-//   7. POST /api/payments/card/ipn  ← Pesapal async notification (backup)
-//
-// Required env vars (Render dashboard):
-//   PESAPAL_CONSUMER_KEY      ← from Pesapal merchant dashboard
-//   PESAPAL_CONSUMER_SECRET   ← from Pesapal merchant dashboard
-//   PESAPAL_ENV               ← 'sandbox' or 'production'
-//   PESAPAL_CALLBACK_URL      ← https://umrahmarket.vercel.app/payment/callback
-//   PESAPAL_IPN_URL           ← https://umrahmarket-backend.onrender.com/api/payments/card/ipn
-//   KES_PER_USD               ← e.g. 130  (now overridden by live rate)
-// ─────────────────────────────────────────────────────────────────────────────
 
 import axios             from 'axios';
 import crypto            from 'crypto';
 import { supabaseAdmin } from '../config/supabase.js';
 import { createBookingMessage } from './messagesController.js';
 import { getUsdKesRate, usdToKes } from '../services/currency.service.js'; // <-- NEW
+import { computeBookingAmount } from '../services/pricing.service.js'; // <-- travelers → total price
 
 const KES_RATE   = Number(process.env.KES_PER_USD) || 130; // kept for fallback
 const IS_SANDBOX = (process.env.PESAPAL_ENV || 'sandbox') !== 'production';
@@ -108,7 +86,7 @@ async function queryTransaction(orderTrackingId, token) {
 export const initiate = async (req, res) => {
   try {
     const userId     = req.user?.id;
-    const { packageId, currency = 'KES' } = req.body; // <-- added currency
+    const { packageId, currency = 'KES', travelers: rawTravelers } = req.body; // <-- added currency + travelers
 
     if (!userId)
       return res.status(401).json({ success: false, message: 'Unauthorised' });
@@ -125,7 +103,7 @@ export const initiate = async (req, res) => {
     // ── 1. Fetch package price from DB — NEVER trust frontend ────────────────
     const { data: pkg, error: pkgErr } = await supabaseAdmin
       .from('packages')
-      .select('id, name, price, status, created_by, agent_name')
+      .select('id, name, price, price_tiers, status, created_by, agent_name')
       .eq('id', packageId)
       .maybeSingle();
 
@@ -140,9 +118,19 @@ export const initiate = async (req, res) => {
     if (!['active', 'published', 'approved'].includes(pkgStatus))
       return res.status(404).json({ success: false, message: 'Package not available for booking' });
 
-    const priceUSD = pkg.price ?? 0;
-    if (priceUSD <= 0)
+    if ((pkg.price ?? 0) <= 0)
       return res.status(400).json({ success: false, message: 'Package has no valid price' });
+
+    // ── Compute total from age-tier prices × requested traveler counts ───────
+    // NEVER trust a client-sent amount — only the traveler *counts* come from
+    // the request; every price comes from the package row fetched above.
+    let travelers, totalTravelers, priceUSD, priceBreakdown;
+    try {
+      ({ travelers, totalTravelers, totalUSD: priceUSD, breakdown: priceBreakdown } =
+        computeBookingAmount(pkg, rawTravelers));
+    } catch (calcErr) {
+      return res.status(calcErr.status || 400).json({ success: false, message: calcErr.message });
+    }
 
     // ── Get live FX rate and convert to KES ──────────────────────────────────
     const rate = await getUsdKesRate();
@@ -195,7 +183,7 @@ export const initiate = async (req, res) => {
     const tenMinAgo = new Date(Date.now() - 10 * 60_000).toISOString();
     const { data: existing } = await supabaseAdmin
       .from('payments')
-      .select('id, pesapal_order_tracking_id, pesapal_redirect_url')
+      .select('id, pesapal_order_tracking_id, pesapal_redirect_url, travelers')
       .eq('user_id', userId)
       .eq('package_id', packageId)
       .eq('method', 'CARD')
@@ -204,7 +192,13 @@ export const initiate = async (req, res) => {
       .not('pesapal_redirect_url', 'is', null)
       .maybeSingle();
 
-    if (existing?.pesapal_redirect_url) {
+    // Only resume the pending order if the traveler selection hasn't changed
+    // since it was created — otherwise a user who went back and added more
+    // people would silently be resumed into paying the OLD, smaller amount.
+    const sameTravelers = existing?.travelers &&
+      JSON.stringify(existing.travelers) === JSON.stringify(travelers);
+
+    if (existing?.pesapal_redirect_url && sameTravelers) {
       return res.json({
         success:         true,
         redirectUrl:     existing.pesapal_redirect_url,
@@ -243,7 +237,7 @@ export const initiate = async (req, res) => {
       id:                    merchantRef,
       currency:              'KES',
       amount:                amountKes, // <-- use converted KES amount
-      description:           `Umrah Package: ${(pkg.name || '').slice(0, 100)}`,
+      description:           `Umrah Package: ${(pkg.name || '').slice(0, 90)} (${totalTravelers} traveler${totalTravelers === 1 ? '' : 's'})`,
       callback_url:          callbackUrl,
       notification_id:       ipnId,
       billing_address: {
@@ -288,9 +282,11 @@ export const initiate = async (req, res) => {
         method:                     'CARD',
         status:                     'PENDING',
         amount_kes:                 amountKes,
-        amount_usd:                 priceUSD,        // <-- store USD price
+        amount_usd:                 priceUSD,        // <-- store USD price (already totalled for all travelers)
         fx_rate_used:               rate,            // <-- store rate used
         currency:                   currency,        // <-- user's selected display currency
+        travelers:                  travelers,       // <-- { adult, child, minor_child, infant } counts
+        traveler_count:             totalTravelers,  // <-- total headcount, for quick reporting
         phone:                      req.user?.phone || 'N/A',
         pesapal_merchant_ref:       merchantRef,
         pesapal_order_tracking_id:  orderRes.order_tracking_id,
@@ -338,7 +334,7 @@ export const verify = async (req, res) => {
     // ── 1. Find payment record — scoped to this user (IDOR prevention) ───────
     const { data: payment, error: payErr } = await supabaseAdmin
       .from('payments')
-      .select('id, user_id, package_id, amount_kes, status, pesapal_merchant_ref')
+      .select('id, user_id, package_id, amount_kes, status, pesapal_merchant_ref, travelers, traveler_count')
       .eq('pesapal_order_tracking_id', orderTrackingId)
       .eq('user_id', userId)
       .eq('package_id', packageId)
@@ -351,7 +347,7 @@ export const verify = async (req, res) => {
     if (payment.status === 'SUCCESS') {
       let { data: booking, error: bookingErr } = await supabaseAdmin
         .from('bookings')
-        .select('id, status, amount_paid, confirmed_at, package:package_id(id, name, price, image_urls, duration, created_by, agent_name)')
+        .select('id, status, amount_paid, confirmed_at, travelers, traveler_count, package:package_id(id, name, price, image_urls, duration, created_by, agent_name)')
         .eq('payment_id', payment.id)
         .maybeSingle();
 
@@ -365,10 +361,12 @@ export const verify = async (req, res) => {
             payment_method: 'CARD',
             amount_paid:    payment.amount_kes,
             currency:       'KES',
+            travelers:      payment.travelers ?? null,
+            traveler_count: payment.traveler_count ?? null,
             status:         'confirmed',
             confirmed_at:   new Date().toISOString(),
           })
-          .select('id, status, amount_paid, confirmed_at, package:package_id(id, name, price, image_urls, duration, created_by, agent_name)')
+          .select('id, status, amount_paid, confirmed_at, travelers, traveler_count, package:package_id(id, name, price, image_urls, duration, created_by, agent_name)')
           .maybeSingle();
 
         if (restoreErr) {
@@ -477,10 +475,12 @@ export const verify = async (req, res) => {
         payment_method: 'CARD',
         amount_paid:    isNaN(paidAmount) ? payment.amount_kes : paidAmount,
         currency:       'KES',
+        travelers:      payment.travelers ?? null,
+        traveler_count: payment.traveler_count ?? null,
         status:         'confirmed',
         confirmed_at:   new Date().toISOString(),
       })
-      .select('id, status, amount_paid, confirmed_at, package:package_id(id, name, price, image_urls, duration, created_by, agent_name)')
+      .select('id, status, amount_paid, confirmed_at, travelers, traveler_count, package:package_id(id, name, price, image_urls, duration, created_by, agent_name)')
       .single();
 
     if (bookErr) {
@@ -538,7 +538,7 @@ export const ipn = async (req, res) => {
 
     const { data: payment } = await supabaseAdmin
       .from('payments')
-      .select('id, user_id, package_id, amount_kes, status')
+      .select('id, user_id, package_id, amount_kes, status, travelers, traveler_count')
       .eq('pesapal_order_tracking_id', orderTrackingId)
       .maybeSingle();
 
@@ -586,6 +586,8 @@ export const ipn = async (req, res) => {
         payment_method: 'CARD',
         amount_paid:    isNaN(paidAmount) ? payment.amount_kes : paidAmount,
         currency:       'KES',
+        travelers:      payment.travelers ?? null,
+        traveler_count: payment.traveler_count ?? null,
         status:         'confirmed',
         confirmed_at:   new Date().toISOString(),
       })

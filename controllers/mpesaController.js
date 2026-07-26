@@ -1,9 +1,9 @@
 // controllers/mpesaController.js
-// Pure Supabase — no Mongoose models used anywhere in this file.
 import { supabaseAdmin } from '../config/supabase.js';
 import { stkPush, stkQuery } from '../services/Mpesaservice.js';
 import { createBookingMessage } from './messagesController.js';
 import { getUsdKesRate, usdToKes } from '../services/currency.service.js'; // <-- NEW
+import { computeBookingAmount } from '../services/pricing.service.js'; // <-- travelers → total price
 
 const KES_RATE       = Number(process.env.KES_PER_USD) || 130; // kept for backward compatibility, but now overridden by live rate
 const MPESA_PHONE_RE = /^254[17]\d{8}$/;
@@ -13,7 +13,7 @@ function maskPhone(p) { return p ? `${p.slice(0, 6)}****${p.slice(-2)}` : '?'; }
 export const initiate = async (req, res) => {
   try {
     const userId    = req.user?.id;
-    const { packageId, phone, currency = 'KES' } = req.body; // <-- added currency
+    const { packageId, phone, currency = 'KES', travelers: rawTravelers } = req.body; // <-- added currency + travelers
 
     if (!userId)
       return res.status(401).json({ success: false, message: 'Unauthorised' });
@@ -32,7 +32,7 @@ export const initiate = async (req, res) => {
     // ── Fetch package from Supabase — NEVER trust FE price ──────────────
     const { data: pkg, error: pkgErr } = await supabaseAdmin
       .from('packages')
-      .select('id, name, price, status, created_by, agent_name')
+      .select('id, name, price, price_tiers, status, created_by, agent_name')
       .eq('id', packageId)
       .maybeSingle();
 
@@ -49,9 +49,18 @@ export const initiate = async (req, res) => {
       return res.status(400).json({ success: false, message: `Package is not available for booking (status: ${pkg.status})` });
     }
 
-    const priceUSD  = pkg.price ?? 0;
-    if (priceUSD <= 0)
+    if ((pkg.price ?? 0) <= 0)
       return res.status(400).json({ success: false, message: 'Package has no valid price' });
+
+    // ── Compute total from age-tier prices × requested traveler counts ───────
+    // NEVER trust a client-sent amount — only the traveler *counts* come from
+    // the request; every price comes from the package row fetched above.
+    let travelers, totalTravelers, priceUSD;
+    try {
+      ({ travelers, totalTravelers, totalUSD: priceUSD } = computeBookingAmount(pkg, rawTravelers));
+    } catch (calcErr) {
+      return res.status(calcErr.status || 400).json({ success: false, message: calcErr.message });
+    }
 
     // ── Get live FX rate and convert to KES ──────────────────────────────
     const rate = await getUsdKesRate();
@@ -104,14 +113,20 @@ export const initiate = async (req, res) => {
     const fiveMinAgo = new Date(Date.now() - 5 * 60_000).toISOString();
     const { data: existing } = await supabaseAdmin
       .from('payments')
-      .select('checkout_request_id')
+      .select('checkout_request_id, travelers')
       .eq('user_id', userId)
       .eq('package_id', packageId)
       .eq('status', 'PENDING')
       .gte('created_at', fiveMinAgo)
       .maybeSingle();
 
-    if (existing?.checkout_request_id) {
+    // Only resume if the traveler selection hasn't changed since the pending
+    // STK push was sent — otherwise a bigger party would silently resume the
+    // smaller, stale amount instead of triggering a fresh push.
+    const sameTravelers = existing?.travelers &&
+      JSON.stringify(existing.travelers) === JSON.stringify(travelers);
+
+    if (existing?.checkout_request_id && sameTravelers) {
       return res.json({ success: true, checkoutRequestId: existing.checkout_request_id, resumed: true });
     }
 
@@ -122,7 +137,7 @@ export const initiate = async (req, res) => {
         phone,
         amount:      amountKes, // <-- use converted KES amount
         accountRef:  `PKG-${packageId.slice(-6).toUpperCase()}`,
-        description: 'Umrah Package',
+        description: `Umrah Package (${totalTravelers} traveler${totalTravelers === 1 ? '' : 's'})`,
       });
     } catch (darajaErr) {
       console.error('[M-Pesa initiate] Daraja STK push failed:', darajaErr.message);
@@ -146,9 +161,11 @@ export const initiate = async (req, res) => {
         method:              'MPESA',
         status:              'PENDING',
         amount_kes:          amountKes,
-        amount_usd:          priceUSD,      // <-- store USD price for reference
+        amount_usd:          priceUSD,      // <-- store USD price for reference (already totalled for all travelers)
         fx_rate_used:        rate,          // <-- store the rate used
         currency:            currency,      // <-- user's selected display currency
+        travelers:           travelers,     // <-- { adult, child, minor_child, infant } counts
+        traveler_count:      totalTravelers,
         phone,
         merchant_request_id: merchantRequestId ?? null,
         checkout_request_id: checkoutRequestId,
@@ -199,7 +216,7 @@ export const callback = async (req, res) => {
 
     const { data: payment, error: payErr } = await supabaseAdmin
       .from('payments')
-      .select('id, user_id, package_id, amount_kes, status')
+      .select('id, user_id, package_id, amount_kes, status, travelers, traveler_count')
       .or(`checkout_request_id.eq.${CheckoutRequestID},merchant_request_id.eq.${MerchantRequestID}`)
       .maybeSingle();
 
@@ -262,6 +279,8 @@ export const callback = async (req, res) => {
         payment_method: 'MPESA',
         amount_paid:    paidAmount,
         currency:       'KES',
+        travelers:      payment.travelers ?? null,
+        traveler_count: payment.traveler_count ?? null,
         status:         'confirmed',
         confirmed_at:   new Date().toISOString(),
       })
@@ -316,7 +335,7 @@ export const getStatus = async (req, res) => {
 
     const { data: payment, error: payErr } = await supabaseAdmin
       .from('payments')
-      .select('id, status, result_desc, user_id, package_id, amount_kes')
+      .select('id, status, result_desc, user_id, package_id, amount_kes, travelers, traveler_count')
       .eq('checkout_request_id', checkoutRequestId)
       .eq('user_id', userId)
       .maybeSingle();
@@ -332,7 +351,7 @@ export const getStatus = async (req, res) => {
     if (payment.status === 'SUCCESS') {
       let { data: booking, error: bookingErr } = await supabaseAdmin
         .from('bookings')
-        .select('id, status, amount_paid, confirmed_at, package:package_id(id, name, price, image_urls, duration, created_by, agent_name)')
+        .select('id, status, amount_paid, confirmed_at, travelers, traveler_count, package:package_id(id, name, price, image_urls, duration, created_by, agent_name)')
         .eq('payment_id', payment.id)
         .maybeSingle();
 
@@ -346,10 +365,12 @@ export const getStatus = async (req, res) => {
             payment_method: 'MPESA',
             amount_paid:    payment.amount_kes,
             currency:       'KES',
+            travelers:      payment.travelers ?? null,
+            traveler_count: payment.traveler_count ?? null,
             status:         'confirmed',
             confirmed_at:   new Date().toISOString(),
           })
-          .select('id, status, amount_paid, confirmed_at, package:package_id(id, name, price, image_urls, duration, created_by, agent_name)')
+          .select('id, status, amount_paid, confirmed_at, travelers, traveler_count, package:package_id(id, name, price, image_urls, duration, created_by, agent_name)')
           .maybeSingle();
 
         if (createErr) {
