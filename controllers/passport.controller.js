@@ -1,18 +1,4 @@
-/**
- * Passport verification controller.
- *
- *   POST /api/passport/check         — validate typed details + 6-month rule (no image)
- *   POST /api/passport/verify-image  — OCR the photo, confirm it matches the typed
- *                                      details, enforce the expiry rule, persist.
- *   GET  /api/passport/status        — latest verification for (user, package)
- *
- * Policy (set with the product owner):
- *   - Passport expiry must be ≥ 6 months after the travel date (package
- *     available_from). Otherwise the user is told to renew.
- *   - The OCR'd photo must match the typed passport number AND expiry to
- *     auto-verify. Up to MAX_ATTEMPTS tries are allowed; after that the row is
- *     flagged for manual review and the user may proceed to payment.
- */
+
 import { supabaseAdmin } from '../config/supabase.js';
 import config from '../config/security.config.js';
 import logger from '../config/logger.js';
@@ -22,6 +8,15 @@ import { uploadPassportBuffer, uploadFacePhotoBuffer } from '../middleware/uploa
 const MAX_ATTEMPTS = 3;
 const MIN_VALIDITY_MONTHS = 6;
 const MIN_OCR_CONFIDENCE = 45; // below this the read is too noisy to trust a match
+const MAX_TRAVELERS_PER_BOOKING = 30; // mirrors services/pricing.service.js
+
+// Every traveler needs their own passport verified, regardless of age tier —
+// defaults to 0 (the lead/account-holder traveler) so this stays backward
+// compatible with any caller that doesn't send travelerIndex at all.
+function sanitizeTravelerIndex(v) {
+  const n = Number.parseInt(v, 10);
+  return Number.isFinite(n) && n >= 0 && n < MAX_TRAVELERS_PER_BOOKING ? n : 0;
+}
 
 // ── date helpers (UTC, day-precision) ────────────────────────────────────────
 function parseDateOnly(s) {
@@ -81,6 +76,7 @@ function evaluateExpiry(expiryInput, travelDate, minExpiry) {
 export const checkPassportValidity = async (req, res) => {
   try {
     const { packageId, passportExpiry } = req.body;
+    const travelerIndex = sanitizeTravelerIndex(req.body.travelerIndex);
     if (!packageId) return res.status(400).json({ success: false, error: 'packageId is required.' });
 
     const { travelDate, minExpiry, packageTitle } = await resolveTravelWindow(packageId);
@@ -88,6 +84,7 @@ export const checkPassportValidity = async (req, res) => {
 
     return res.json({
       success: true,
+      travelerIndex,
       valid: result.valid,
       reason: result.reason,
       travelDate: toISODate(travelDate),
@@ -115,6 +112,7 @@ export const verifyPassportImage = async (req, res) => {
       packageId, passportNumber, passportCountry,
       passportExpiry, surname, givenNames, dateOfBirth, nationality,
     } = req.body;
+    const travelerIndex = sanitizeTravelerIndex(req.body.travelerIndex);
 
     if (!packageId || !passportNumber || !passportExpiry || !surname) {
       return res.status(400).json({ success: false, error: 'Missing required passport details.' });
@@ -124,24 +122,26 @@ export const verifyPassportImage = async (req, res) => {
     }
 
     logger.info('Starting passport verification', {
-      userId, packageId, passportNumber: `${passportNumber.substring(0, 3)}***`,
+      userId, packageId, travelerIndex, passportNumber: `${passportNumber.substring(0, 3)}***`,
       fileSize: req.passportFile.buffer.length,
     });
 
-    // Don't re-verify an already-verified passport for this package.
+    // Don't re-verify an already-verified passport for this traveler slot.
     const { data: existing } = await supabaseAdmin
       .from('passport_verifications')
       .select('id, attempts, verification_status, face_photo_url')
       .eq('user_id', userId)
       .eq('package_id', packageId)
+      .eq('traveler_index', travelerIndex)
       .maybeSingle();
 
     if (existing?.verification_status === 'verified') {
-      logger.info('Passport already verified for this package', { userId, packageId });
+      logger.info('Passport already verified for this traveler', { userId, packageId, travelerIndex });
       return res.json({
         success: true, status: 'verified', verified: true, canProceed: true,
+        travelerIndex,
         facePhotoUrl: existing.face_photo_url || null,
-        message: 'Passport already verified for this package.',
+        message: 'Passport already verified for this traveler.',
       });
     }
 
@@ -150,27 +150,28 @@ export const verifyPassportImage = async (req, res) => {
     const validity = evaluateExpiry(passportExpiry, travelDate, minExpiry);
     if (!validity.valid) {
       logger.info('Passport expiry check failed', {
-        userId, packageId, reason: validity.reason, passportExpiry,
+        userId, packageId, travelerIndex, reason: validity.reason, passportExpiry,
       });
       await upsertVerification({
-        userId, packageId, status: 'expired_passport', verified: false,
+        userId, packageId, travelerIndex, status: 'expired_passport', verified: false,
         input: { passportNumber, passportCountry, passportExpiry, surname, givenNames, dateOfBirth, nationality },
         travelDate, attempts: (existing?.attempts || 0),
       });
       return res.json({
         success: true, status: 'rejected', verified: false, canProceed: false,
+        travelerIndex,
         reason: validity.reason,
         message: 'Passport does not meet the 6-month validity requirement. Please renew and book again.',
       });
     }
 
     // 2) OCR the photo and compare against the typed details.
-    logger.info('Starting OCR extraction', { userId, packageId, bufferSize: req.passportFile.buffer.length });
+    logger.info('Starting OCR extraction', { userId, packageId, travelerIndex, bufferSize: req.passportFile.buffer.length });
     const ocr = await extractPassport(req.passportFile.buffer);
     const attempts = (existing?.attempts || 0) + 1;
 
     logger.info('OCR extraction complete', {
-      userId, packageId, ocrOk: ocr.ok, confidence: ocr.confidence,
+      userId, packageId, travelerIndex, ocrOk: ocr.ok, confidence: ocr.confidence,
       mrz: ocr.mrz ? 'found' : 'not_found', reason: ocr.reason,
     });
 
@@ -180,12 +181,12 @@ export const verifyPassportImage = async (req, res) => {
         passportNumber, expiry: validity.expiry, surname, givenNames, nationality,
       });
       logger.info('OCR comparison result', {
-        userId, packageId, score: comparison.score, matched: comparison.matched,
+        userId, packageId, travelerIndex, score: comparison.score, matched: comparison.matched,
         details: comparison.details,
       });
     } else {
       logger.warn('OCR confidence too low or extraction failed', {
-        userId, packageId, ocrOk: ocr.ok, confidence: ocr.confidence, minRequired: MIN_OCR_CONFIDENCE,
+        userId, packageId, travelerIndex, ocrOk: ocr.ok, confidence: ocr.confidence, minRequired: MIN_OCR_CONFIDENCE,
       });
     }
 
@@ -196,15 +197,16 @@ export const verifyPassportImage = async (req, res) => {
         buffer: req.passportFile.buffer,
         mime: req.passportFile.mime,
         ext: req.passportFile.ext,
-        userId, packageId, ip: req.ip,
+        userId, packageId, travelerIndex, ip: req.ip,
       });
-      logger.info('Passport image uploaded to R2', { userId, packageId, key: stored.key });
+      logger.info('Passport image uploaded to R2', { userId, packageId, travelerIndex, key: stored.key });
     } catch (uploadError) {
       logger.warn('Passport image upload failed, continuing without stored image', {
         error: uploadError.message,
         stack: uploadError.stack,
         userId,
         packageId,
+        travelerIndex,
       });
     }
 
@@ -235,13 +237,13 @@ export const verifyPassportImage = async (req, res) => {
     }
 
     const persisted = await upsertVerification({
-      userId, packageId, status, verified: autoVerified,
+      userId, packageId, travelerIndex, status, verified: autoVerified,
       input: { passportNumber, passportCountry, passportExpiry, surname, givenNames, dateOfBirth, nationality },
       ocr, comparison, stored, facePhoto, travelDate, attempts,
     });
 
     logger.info('Passport verification attempt complete', {
-      userId, packageId, status, attempts,
+      userId, packageId, travelerIndex, status, attempts,
       ocrOk: ocr.ok, ocrConfidence: ocr.confidence, matchScore: comparison.score,
     });
 
@@ -250,6 +252,7 @@ export const verifyPassportImage = async (req, res) => {
       status,
       verified: autoVerified,
       canProceed,
+      travelerIndex,
       attemptsUsed: attempts,
       attemptsRemaining: Math.max(0, MAX_ATTEMPTS - attempts),
       ocr: { read: ocr.ok, confidence: ocr.confidence },
@@ -269,6 +272,7 @@ export const verifyPassportImage = async (req, res) => {
       userId,
       body: {
         packageId: req.body?.packageId,
+        travelerIndex: req.body?.travelerIndex,
         passportNumber: req.body?.passportNumber,
         passportCountry: req.body?.passportCountry,
         passportExpiry: req.body?.passportExpiry,
@@ -283,12 +287,13 @@ export const verifyPassportImage = async (req, res) => {
 };
 
 // =============================================================================
-// GET /api/passport/status?packageId=...
+// GET /api/passport/status?packageId=...&travelerIndex=...
 // =============================================================================
 export const getPassportStatus = async (req, res) => {
   try {
     const userId = req.user?.id ?? req.userId;
     const { packageId } = req.query;
+    const travelerIndex = sanitizeTravelerIndex(req.query.travelerIndex);
     if (!packageId) return res.status(400).json({ success: false, error: 'packageId is required.' });
 
     const { data } = await supabaseAdmin
@@ -296,10 +301,12 @@ export const getPassportStatus = async (req, res) => {
       .select('verification_status, verified, attempts, match_score, face_photo_url, updated_at')
       .eq('user_id', userId)
       .eq('package_id', packageId)
+      .eq('traveler_index', travelerIndex)
       .maybeSingle();
 
     return res.json({
       success: true,
+      travelerIndex,
       exists: !!data,
       status: data?.verification_status || null,
       verified: data?.verified || false,
@@ -314,11 +321,70 @@ export const getPassportStatus = async (req, res) => {
   }
 };
 
-// ── persistence helper (upsert on user_id+package_id) ────────────────────────
-async function upsertVerification({ userId, packageId, status, verified, input, ocr, comparison, stored, facePhoto, travelDate, attempts }) {
+// =============================================================================
+// GET /api/passport/status-batch?packageId=...&totalTravelers=...
+//
+// Returns verification status for EVERY traveler slot (0..totalTravelers-1)
+// on a booking in one call, so BookingFlow can tell up front whether *all*
+// travelers already have a verified passport (e.g. a returning user who
+// verified everyone earlier and got interrupted before payment), and if not,
+// exactly which traveler to show the passport form for next — instead of
+// gating the whole booking on only the account holder's own passport.
+// =============================================================================
+export const getPassportStatusBatch = async (req, res) => {
+  try {
+    const userId = req.user?.id ?? req.userId;
+    const { packageId } = req.query;
+    const totalTravelers = Math.max(1, Math.min(MAX_TRAVELERS_PER_BOOKING, Number.parseInt(req.query.totalTravelers, 10) || 1));
+    if (!packageId) return res.status(400).json({ success: false, error: 'packageId is required.' });
+
+    const indices = Array.from({ length: totalTravelers }, (_, i) => i);
+    const { data, error } = await supabaseAdmin
+      .from('passport_verifications')
+      .select('traveler_index, verification_status, verified, attempts, face_photo_url')
+      .eq('user_id', userId)
+      .eq('package_id', packageId)
+      .in('traveler_index', indices);
+
+    if (error) throw new Error(error.message);
+
+    const byIndex = new Map((data || []).map((row) => [row.traveler_index, row]));
+    const travelers = indices.map((i) => {
+      const row = byIndex.get(i);
+      return {
+        travelerIndex:     i,
+        exists:            !!row,
+        status:            row?.verification_status || null,
+        verified:          row?.verified || false,
+        canProceed:        !!row && ['verified', 'manual_review'].includes(row.verification_status),
+        attemptsUsed:      row?.attempts || 0,
+        attemptsRemaining: Math.max(0, MAX_ATTEMPTS - (row?.attempts || 0)),
+        facePhotoUrl:      row?.face_photo_url || null,
+      };
+    });
+
+    const allCanProceed = travelers.every((t) => t.canProceed);
+    const nextIncompleteIndex = travelers.findIndex((t) => !t.canProceed);
+
+    return res.json({
+      success: true,
+      totalTravelers,
+      travelers,
+      allCanProceed,
+      nextIncompleteIndex: nextIncompleteIndex === -1 ? null : nextIncompleteIndex,
+    });
+  } catch (error) {
+    logger.error('getPassportStatusBatch failed', { error: error.message });
+    return res.status(500).json({ success: false, error: 'Could not load verification status.' });
+  }
+};
+
+// ── persistence helper (upsert on user_id+package_id+traveler_index) ────────
+async function upsertVerification({ userId, packageId, travelerIndex = 0, status, verified, input, ocr, comparison, stored, facePhoto, travelDate, attempts }) {
   const row = {
     user_id: userId,
     package_id: packageId,
+    traveler_index: travelerIndex,
     passport_number: input.passportNumber,
     passport_country: input.passportCountry || (ocr?.fields?.issuingCountry ?? 'UNK'),
     passport_expiry: input.passportExpiry,
@@ -360,7 +426,7 @@ async function upsertVerification({ userId, packageId, status, verified, input, 
     const { data: prev } = await supabaseAdmin
       .from('passport_verifications')
       .select('passport_image_url, image_key, face_photo_url, face_photo_key')
-      .eq('user_id', userId).eq('package_id', packageId).maybeSingle();
+      .eq('user_id', userId).eq('package_id', packageId).eq('traveler_index', travelerIndex).maybeSingle();
 
     if (!row.passport_image_url) {
       if (prev?.passport_image_url) {
@@ -379,7 +445,7 @@ async function upsertVerification({ userId, packageId, status, verified, input, 
 
   const { error } = await supabaseAdmin
     .from('passport_verifications')
-    .upsert(row, { onConflict: 'user_id,package_id' });
+    .upsert(row, { onConflict: 'user_id,package_id,traveler_index' });
   if (error) {
     logger.error('passport_verifications upsert failed', { error: error.message, userId, packageId });
     throw new Error('Could not save verification record.');
@@ -475,7 +541,7 @@ export async function saveFacePhoto(req, res) {
     // so random users can't write photos to arbitrary package slots.
     const { data: booking, error: bErr } = await supabaseAdmin
       .from('bookings')
-      .select('id, status')
+      .select('id, status, traveler_count')
       .eq('user_id', userId)
       .eq('package_id', packageId)
       .in('status', ['confirmed', 'pending'])
@@ -492,24 +558,36 @@ export async function saveFacePhoto(req, res) {
       });
     }
 
-    // A verified (or manual-review) passport is mandatory for every booking —
-    // the client should never reach this step without one, since BookingFlow
-    // gates payment on passport verification. Enforce it here too so the
-    // endpoint can't be hit directly to bypass passport verification entirely.
-    const { data: existing } = await supabaseAdmin
+    // A verified (or manual-review) passport is mandatory for EVERY traveler
+    // on this booking — not just the account holder's — since BookingFlow now
+    // walks each adult/child/minor_child/infant through its own passport
+    // check before payment. Enforce it here too so this endpoint can't be
+    // hit directly to bypass verification for any traveler on the booking.
+    const totalTravelers = Math.max(1, booking.traveler_count || 1);
+    const travelerIndices = Array.from({ length: totalTravelers }, (_, i) => i);
+    const { data: existingRows, error: existErr } = await supabaseAdmin
       .from('passport_verifications')
-      .select('id, passport_image_url, verification_status')
+      .select('traveler_index, verification_status')
       .eq('user_id', userId)
       .eq('package_id', packageId)
-      .maybeSingle();
+      .in('traveler_index', travelerIndices);
 
-    if (!existing || !['verified', 'manual_review'].includes(existing.verification_status)) {
-      logger.warn('saveFacePhoto rejected — passport not verified for this booking', {
-        userId, packageId, status: existing?.verification_status || 'none',
+    if (existErr) {
+      logger.error('saveFacePhoto passport check failed', { error: existErr.message, userId, packageId });
+      return res.status(500).json({ success: false, error: 'Could not verify booking. Please try again.' });
+    }
+
+    const verifiedByIndex = new Map((existingRows || []).map((r) => [r.traveler_index, r.verification_status]));
+    const allVerified = travelerIndices.every((i) => ['verified', 'manual_review'].includes(verifiedByIndex.get(i)));
+
+    if (!allVerified) {
+      logger.warn('saveFacePhoto rejected — not every traveler on this booking has a verified passport', {
+        userId, packageId, totalTravelers,
+        statuses: travelerIndices.map((i) => verifiedByIndex.get(i) || 'none'),
       });
       return res.status(403).json({
         success: false,
-        error: 'Please complete passport verification for this booking before submitting your ID photo.',
+        error: 'Please complete passport verification for every traveler on this booking before submitting your ID photo.',
       });
     }
 
@@ -550,4 +628,4 @@ export async function saveFacePhoto(req, res) {
   }
 }
 
-export default { checkPassportValidity, verifyPassportImage, getPassportStatus, getFacePhotoStatus, saveFacePhoto };
+export default { checkPassportValidity, verifyPassportImage, getPassportStatus, getPassportStatusBatch, getFacePhotoStatus, saveFacePhoto };
