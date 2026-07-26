@@ -25,8 +25,9 @@ import agentProfileRoutes from './routes/agent_profile.routes.js';
 import messagesRoutes from './routes/messagesRoutes.js';
 import superadminRoutes from './routes/superadmin_routes.js';
 import fxRoutes from './routes/fx.routes.js';
-import resourcesRoutes from './routes/resorces.routes.js'
-import publicChatRoutes from './routes/publicchat.route.js'
+import resourcesRoutes from './routes/resorces.routes.js';
+import publicChatRoutes from './routes/publicchat.route.js';
+import visitsRoutes from './routes/visits.routes.js';
 const router = express.Router();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -194,6 +195,7 @@ app.use('/api/agents', agentProfileRoutes);
 app.use('/api/superadmin', superadminRoutes);
 app.use('/api/resources', resourcesRoutes);
 app.use('/api/publicchat', publicChatRoutes);
+app.use('/api/visits', visitsRoutes);
 app.use('/api/agent_accounting', accountingRoutes);
 app.use('/api/fx', fxRoutes);
 
