@@ -110,50 +110,55 @@ export const logPackageVisit = async (req, res) => {
   }
 };
 
-// GET /getagentvisits?agentId=<uuid>   (agentId optional — omit for the latest across all agents)
+// GET /getagentvisits?agentId=<uuid>
+//   - with agentId  -> unchanged shape: { visits: [...], totalVisits }
+//   - without agentId -> NEW shape: one entry per agent, each carrying its
+//     own full visit history + denormalized details, in a single query.
+//     Replaces the old "latest 100 rows, then N follow-up calls per agent"
+//     pattern the frontend was doing.
 export const getAgentVisits = async (req, res) => {
   try {
     const { agentId } = req.query;
 
     let query = supabaseAdmin
       .from('agent_visits')
-      .select('*', { count: 'exact' })
+      .select('*')
       .eq('visit_type', 'agent')
       .order('visited_at', { ascending: false });
 
     if (agentId) query = query.eq('agent_id', agentId);
-    else query = query.limit(100); // guard against dumping the whole table when unfiltered
 
-    const { data, error, count } = await query;
+    const { data, error } = await query;
     if (error) throw error;
 
-    res.json({ visits: data, totalVisits: count ?? 0 });
+    if (agentId) {
+      return res.json({ visits: data, totalVisits: data.length });
+    }
+
+    const byAgent = new Map();
+    for (const row of data) {
+      if (!byAgent.has(row.agent_id)) {
+        byAgent.set(row.agent_id, {
+          agentId: row.agent_id,
+          agentName: row.agent_name,
+          verificationStatus: row.verification_status,
+          yearsExperience: row.years_experience,
+          totalVisits: 0,
+          visits: [],
+        });
+      }
+      const entry = byAgent.get(row.agent_id);
+      entry.totalVisits += 1;
+      entry.visits.push(row);
+    }
+
+    const agents = [...byAgent.values()].sort(
+      (a, b) => b.totalVisits - a.totalVisits
+    );
+
+    res.json({ agents, totalVisits: data.length });
   } catch (err) {
     console.error('[getAgentVisits]', err);
     res.status(500).json({ error: 'Failed to fetch agent visits' });
-  }
-};
-
-// GET /getpackagesvisits?packageId=<uuid>   (packageId optional — omit for the latest across all packages)
-export const getPackageAgentVisits = async (req, res) => {
-  try {
-    const { packageId } = req.query;
-
-    let query = supabaseAdmin
-      .from('agent_visits')
-      .select('*', { count: 'exact' })
-      .eq('visit_type', 'package')
-      .order('visited_at', { ascending: false });
-
-    if (packageId) query = query.eq('package_id', packageId);
-    else query = query.limit(100);
-
-    const { data, error, count } = await query;
-    if (error) throw error;
-
-    res.json({ visits: data, totalVisits: count ?? 0 });
-  } catch (err) {
-    console.error('[getPackageAgentVisits]', err);
-    res.status(500).json({ error: 'Failed to fetch package visits' });
   }
 };
