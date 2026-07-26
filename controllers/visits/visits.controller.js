@@ -110,12 +110,7 @@ export const logPackageVisit = async (req, res) => {
   }
 };
 
-// GET /getagentvisits?agentId=<uuid>
-//   - with agentId  -> unchanged shape: { visits: [...], totalVisits }
-//   - without agentId -> NEW shape: one entry per agent, each carrying its
-//     own full visit history + denormalized details, in a single query.
-//     Replaces the old "latest 100 rows, then N follow-up calls per agent"
-//     pattern the frontend was doing.
+
 export const getAgentVisits = async (req, res) => {
   try {
     const { agentId } = req.query;
@@ -123,7 +118,6 @@ export const getAgentVisits = async (req, res) => {
     let query = supabaseAdmin
       .from('agent_visits')
       .select('*')
-      .eq('visit_type', 'agent')
       .order('visited_at', { ascending: false });
 
     if (agentId) query = query.eq('agent_id', agentId);
