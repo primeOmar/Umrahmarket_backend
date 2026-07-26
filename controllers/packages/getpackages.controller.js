@@ -11,7 +11,7 @@ export const getAllActivePackages = async (req, res) => {
       .from('packages')
       .select(
         `id, name, type, location, description,
-         price, original_price, discount, duration,
+         price, price_tiers, original_price, discount, duration,
          available_from, available_to,
          makkah_hotel_rating, makkah_hotel_distance,
          makkah_check_in_date, makkah_check_out_date,
@@ -67,7 +67,7 @@ export const getAgentPackages = async (req, res) => {
       .from('packages')
       .select(
         `id, name, type, location, description,
-         price, original_price, discount, duration,
+         price, price_tiers, original_price, discount, duration,
          available_from, available_to, min_group_size, max_group_size,
          makkah_hotel_name, makkah_hotel_rating, makkah_hotel_distance,
          makkah_hotel_address, makkah_check_in_date, makkah_check_out_date,

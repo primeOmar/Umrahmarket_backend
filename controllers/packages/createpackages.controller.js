@@ -49,6 +49,38 @@ function sanitizeTags(arr, maxLen = 80, maxCount = 30) {
   return arr.slice(0, maxCount).map((t) => sanitizeText(t, maxLen)).filter(Boolean);
 }
 
+// Age-tier pricing (stored as a single `price_tiers` jsonb column):
+//   adult       — 12+ yrs, required, mirrors the top-level `price` column
+//                 so every existing query/UI that reads pkg.price keeps working
+//   child       — 7-11 yrs
+//   minor_child — 2-6 yrs
+//   infant      — under 2 yrs
+// Any tier the agent leaves blank/invalid falls back to the adult price —
+// never null — so a booking for that age group always resolves to a real
+// amount instead of the booking modal having to guess.
+function sanitizePriceTiers(raw, adultPrice) {
+  let parsed = {};
+  if (raw) {
+    try {
+      parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (!parsed || typeof parsed !== 'object') parsed = {};
+    } catch {
+      parsed = {};
+    }
+  }
+  const adult = sanitizeNumber(parsed.adult) ?? adultPrice ?? 0;
+  const tierOrFallback = (key) => {
+    const n = sanitizeNumber(parsed[key]);
+    return (n !== null && n >= 0) ? n : adult;
+  };
+  return {
+    adult,
+    child: tierOrFallback('child'),
+    minor_child: tierOrFallback('minor_child'),
+    infant: tierOrFallback('infant'),
+  };
+}
+
 // Used by both create (duplicate carries photos over) and update (agent kept
 // some existing images) — client sends the URLs it wants to keep as JSON,
 // newly uploaded files always come through req.imageUrls from uploadImagesToR2.
@@ -95,6 +127,7 @@ export const createPackage = async (req, res) => {
   const original_price = sanitizeNumber(req.body.original_price);
   const discount       = sanitizeNumber(req.body.discount);
   const duration       = sanitizeNumber(req.body.duration);
+  const price_tiers    = sanitizePriceTiers(req.body.price_tiers, price);
 
   const min_group_size = sanitizeNumber(req.body.min_group_size) ?? 1;
   const max_group_size = sanitizeNumber(req.body.max_group_size) ?? 50;
@@ -131,7 +164,7 @@ const madinah_hotel_distance = sanitizeText(req.body.madinah_hotel_distance, 30)
 
   const newPackage = {
     name, type, location, description,
-    price, original_price, discount, duration,
+    price, original_price, discount, duration, price_tiers,
     available_from, available_to,
     min_group_size, max_group_size,
     makkah_hotel_name, makkah_hotel_rating, makkah_hotel_distance,
@@ -168,6 +201,7 @@ const madinah_hotel_distance = sanitizeText(req.body.madinah_hotel_distance, 30)
       original_price: original_price || null,
       discount: discount || null,
       duration,
+      price_tiers,
       available_from: available_from || null,
       available_to: available_to || null,
       min_group_size,
@@ -201,7 +235,7 @@ const madinah_hotel_distance = sanitizeText(req.body.madinah_hotel_distance, 30)
     const { data, error } = await supabase
       .from('packages')
       .insert([packageToInsert])
-      .select('id, name, type, location, price, duration, status, created_by, agent_name, agent_number');
+      .select('id, name, type, location, price, price_tiers, duration, status, created_by, agent_name, agent_number');
 
     if (error) {
       console.error('[createPackage] Supabase insert error:', error);
@@ -278,6 +312,7 @@ export const updatePackage = async (req, res) => {
   const original_price = sanitizeNumber(req.body.original_price);
   const discount       = sanitizeNumber(req.body.discount);
   const duration       = sanitizeNumber(req.body.duration);
+  const price_tiers    = sanitizePriceTiers(req.body.price_tiers, price);
 
   const min_group_size = sanitizeNumber(req.body.min_group_size) ?? 1;
   const max_group_size = sanitizeNumber(req.body.max_group_size) ?? 50;
@@ -322,6 +357,7 @@ export const updatePackage = async (req, res) => {
       original_price: original_price || null,
       discount: discount || null,
       duration,
+      price_tiers,
       available_from: available_from || null,
       available_to: available_to || null,
       min_group_size,
@@ -349,7 +385,7 @@ export const updatePackage = async (req, res) => {
       .from('packages')
       .update(packageToUpdate)
       .eq('id', id)
-      .select('id, name, type, location, price, duration, status, created_by, agent_name, agent_number, image_urls');
+      .select('id, name, type, location, price, price_tiers, duration, status, created_by, agent_name, agent_number, image_urls');
 
     if (error) {
       console.error('[updatePackage] Supabase update error:', error);
