@@ -130,6 +130,8 @@ router.post(
     });
   },
   body('packageId').trim().notEmpty().withMessage('packageId is required'),
+  body('bookingId').optional({ values: 'falsy' }).isUUID().withMessage('bookingId must be a valid UUID'),
+  body('travelerIndex').optional({ values: 'falsy' }).isInt({ min: 0, max: 29 }).withMessage('travelerIndex must be between 0 and 29'),
   handleValidationErrors,
   saveFacePhoto,
 );

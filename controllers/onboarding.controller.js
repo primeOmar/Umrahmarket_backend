@@ -23,6 +23,19 @@ import logger from '../config/logger.js';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+function errText(err) {
+  return [err?.message, err?.details, err?.hint].filter(Boolean).join(' | ');
+}
+
+function parseMissingColumn(err) {
+  const text = errText(err);
+  let m = text.match(/Could not find the '([^']+)' column/i);
+  if (m?.[1]) return m[1];
+  m = text.match(/column\s+"?(?:[A-Za-z0-9_]+\.)?([A-Za-z0-9_]+)"?\s+does not exist/i);
+  if (m?.[1]) return m[1];
+  return null;
+}
+
 // Accepts local Kenyan formats (07XXXXXXXX / 01XXXXXXXX), 254XXXXXXXXX, or
 // already-international +<country><number>. Normalises to +<digits>.
 function normalizePhone(raw) {
@@ -70,23 +83,79 @@ async function getNextOfKinState(userId, packageId) {
   return { data: data || null, complete: Boolean(data?.full_name && data?.phone) };
 }
 
+async function getActiveBookingState(userId, packageId) {
+  const { data, error } = await supabaseAdmin
+    .from('bookings')
+    .select('id, traveler_count, status, created_at')
+    .eq('user_id', userId)
+    .eq('package_id', packageId)
+    .in('status', ['confirmed', 'pending'])
+    .order('created_at', { ascending: false })
+    .limit(1);
+
+  if (error) throw new Error(error.message);
+  const booking = Array.isArray(data) ? data[0] : null;
+  if (!booking) return null;
+  return {
+    id: booking.id,
+    travelerCount: Math.max(1, Number(booking.traveler_count) || 1),
+    status: booking.status,
+  };
+}
+
 // This checks the DEDICATED Umrah ID photo (a plain-background, forward-facing
 // photo the client uploads/takes directly — no OCR, no cropping). It is
 // intentionally separate from passport *document* verification: that's a
 // different, pre-existing flow (checkPassportValidity / verifyPassportImage)
 // that this onboarding step does not gate on.
-async function getIdPhotoState(userId, packageId) {
+async function getIdPhotoState(userId, packageId, travelerCount = 1) {
   const { data, error } = await supabaseAdmin
     .from('passport_verifications')
-    .select('face_photo_url')
+    .select('traveler_index, face_photo_url')
     .eq('user_id', userId)
     .eq('package_id', packageId)
-    .maybeSingle();
-  if (error) throw new Error(error.message);
+    .order('traveler_index', { ascending: true });
 
-  const hasPhoto = Boolean(data?.face_photo_url) && !data.face_photo_url.startsWith('pending://');
+  if (error) {
+    // Legacy fallback where traveler_index may not exist yet.
+    if (parseMissingColumn(error) === 'traveler_index') {
+      const legacy = await supabaseAdmin
+        .from('passport_verifications')
+        .select('face_photo_url')
+        .eq('user_id', userId)
+        .eq('package_id', packageId);
+      if (legacy.error) throw new Error(legacy.error.message);
 
-  return { url: data?.face_photo_url || null, complete: hasPhoto };
+      const url = (legacy.data || []).find((r) => r.face_photo_url && !r.face_photo_url.startsWith('pending://'))?.face_photo_url || null;
+      return {
+        url,
+        complete: Boolean(url),
+        totalTravelers: travelerCount,
+        completedTravelers: Boolean(url) ? 1 : 0,
+        travelerPhotos: url ? [{ travelerIndex: 0, url, complete: true }] : [],
+      };
+    }
+    throw new Error(error.message);
+  }
+
+  const rows = data || [];
+  const travelerPhotos = Array.from({ length: travelerCount }, (_, i) => {
+    const row = rows.find((r) => Number(r.traveler_index ?? 0) === i);
+    const url = row?.face_photo_url || null;
+    const complete = Boolean(url) && !String(url).startsWith('pending://');
+    return { travelerIndex: i, url: complete ? url : null, complete };
+  });
+
+  const completedTravelers = travelerPhotos.filter((p) => p.complete).length;
+  const firstUrl = travelerPhotos.find((p) => p.complete)?.url || null;
+
+  return {
+    url: firstUrl,
+    complete: completedTravelers >= travelerCount,
+    totalTravelers: travelerCount,
+    completedTravelers,
+    travelerPhotos,
+  };
 }
 
 // =============================================================================
@@ -98,14 +167,20 @@ export const getOnboardingStatus = async (req, res) => {
     const { packageId } = req.query;
     if (!packageId) return res.status(400).json({ success: false, message: 'packageId is required.' });
 
+    const booking = await getActiveBookingState(userId, packageId);
+    if (!booking) {
+      return res.status(403).json({ success: false, message: 'No active booking found for this package.' });
+    }
+
     const [contact, nextOfKin, idPhoto] = await Promise.all([
       getContactState(userId),
       getNextOfKinState(userId, packageId),
-      getIdPhotoState(userId, packageId),
+      getIdPhotoState(userId, packageId, booking.travelerCount),
     ]);
 
     return res.json({
       success: true,
+      booking: { id: booking.id, travelerCount: booking.travelerCount, status: booking.status },
       contact,
       nextOfKin,
       idPhoto,
@@ -126,7 +201,7 @@ export const getMissingOnboarding = async (req, res) => {
 
     const { data: bookings, error: bErr } = await supabaseAdmin
       .from('bookings')
-      .select('id, package_id, status')
+      .select('id, package_id, traveler_count, status')
       .eq('user_id', userId)
       .in('status', ['confirmed', 'pending']);
     if (bErr) throw new Error(bErr.message);
@@ -138,18 +213,24 @@ export const getMissingOnboarding = async (req, res) => {
       getContactState(userId),
       supabaseAdmin.from('next_of_kin').select('package_id, full_name, phone')
         .eq('user_id', userId).in('package_id', packageIds),
-      supabaseAdmin.from('passport_verifications').select('package_id, face_photo_url')
+      supabaseAdmin.from('passport_verifications').select('package_id, traveler_index, face_photo_url')
         .eq('user_id', userId).in('package_id', packageIds),
     ]);
 
     const kinComplete = new Set(
       (kinRows.data || []).filter((k) => k.full_name && k.phone).map((k) => k.package_id)
     );
-    const idPhotoComplete = new Set(
-      (idPhotoRows.data || [])
-        .filter((p) => p.face_photo_url && !p.face_photo_url.startsWith('pending://'))
-        .map((p) => p.package_id)
-    );
+    const photoCoverage = new Map();
+    const indexColumnMissing = parseMissingColumn(idPhotoRows.error) === 'traveler_index';
+
+    if (!idPhotoRows.error) {
+      (idPhotoRows.data || []).forEach((row) => {
+        if (!row.face_photo_url || row.face_photo_url.startsWith('pending://')) return;
+        const pkg = row.package_id;
+        if (!photoCoverage.has(pkg)) photoCoverage.set(pkg, new Set());
+        photoCoverage.get(pkg).add(Number(row.traveler_index ?? 0));
+      });
+    }
 
     const bookingsMissingDetails = bookings
       .map((b) => ({
@@ -157,7 +238,18 @@ export const getMissingOnboarding = async (req, res) => {
         packageId: b.package_id,
         missingContact: !contact.complete,
         missingNextOfKin: !kinComplete.has(b.package_id),
-        missingIdPhoto: !idPhotoComplete.has(b.package_id),
+        missingIdPhoto: (() => {
+          const expected = Math.max(1, Number(b.traveler_count) || 1);
+          const covered = photoCoverage.get(b.package_id) || new Set();
+
+          if (indexColumnMissing) {
+            // Legacy mode: treat any uploaded photo as completion for single-traveler behavior.
+            return covered.size === 0;
+          }
+
+          if (covered.size === 0) return true;
+          return covered.size < expected;
+        })(),
       }))
       .filter((b) => b.missingContact || b.missingNextOfKin || b.missingIdPhoto);
 

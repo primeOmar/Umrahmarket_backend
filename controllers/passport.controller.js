@@ -745,7 +745,7 @@ export async function getFacePhotoStatus(req, res) {
     // 1. Fetch the user's active bookings
     const { data: bookings, error: bErr } = await supabaseAdmin
       .from('bookings')
-      .select('id, package_id, status')
+      .select('id, package_id, status, traveler_count')
       .eq('user_id', userId)
       .in('status', ['confirmed', 'pending']);
 
@@ -759,23 +759,32 @@ export async function getFacePhotoStatus(req, res) {
     // 2. Fetch existing verifications that already have a face photo
     const { data: verifications, error: vErr } = await supabaseAdmin
       .from('passport_verifications')
-      .select('package_id, face_photo_url')
+      .select('package_id, traveler_index, face_photo_url')
       .eq('user_id', userId)
       .in('package_id', packageIds);
 
     if (vErr) throw new Error(vErr.message);
 
-    // Build a set of package IDs that already have a photo
-    const hasPhoto = new Set(
-      (verifications ?? [])
-        .filter((v) => v.face_photo_url && !v.face_photo_url.startsWith('pending://'))
-        .map((v) => v.package_id),
-    );
+    // Build package -> covered traveler indices
+    const coveredByPackage = new Map();
+    (verifications || []).forEach((row) => {
+      if (!row.face_photo_url || row.face_photo_url.startsWith('pending://')) return;
+      if (!coveredByPackage.has(row.package_id)) coveredByPackage.set(row.package_id, new Set());
+      coveredByPackage.get(row.package_id).add(Number(row.traveler_index ?? 0));
+    });
 
     // 3. Return bookings where the face photo is still missing
     const bookingsMissingPhoto = bookings
-      .filter((b) => !hasPhoto.has(b.package_id))
-      .map((b) => ({ bookingId: b.id, packageId: b.package_id }));
+      .filter((b) => {
+        const expected = Math.max(1, Number(b.traveler_count) || 1);
+        const covered = coveredByPackage.get(b.package_id)?.size || 0;
+        return covered < expected;
+      })
+      .map((b) => ({
+        bookingId: b.id,
+        packageId: b.package_id,
+        travelerCount: Math.max(1, Number(b.traveler_count) || 1),
+      }));
 
     return res.json({ bookingsMissingPhoto });
   } catch (err) {
@@ -797,7 +806,8 @@ export async function getFacePhotoStatus(req, res) {
 export async function saveFacePhoto(req, res) {
   const userId = req.user?.id ?? req.userId;
   try {
-    const { packageId } = req.body;
+    const { packageId, bookingId } = req.body;
+    const travelerIndex = sanitizeTravelerIndex(req.body?.travelerIndex);
     if (!packageId) {
       return res.status(400).json({ success: false, error: 'packageId is required.' });
     }
@@ -818,23 +828,34 @@ export async function saveFacePhoto(req, res) {
 
     // Confirm the user has a confirmed/pending booking for this package
     // so random users can't write photos to arbitrary package slots.
-    const { data: booking, error: bErr } = await supabaseAdmin
+    let bookingQuery = supabaseAdmin
       .from('bookings')
-      .select('id, status, traveler_count')
+      .select('id, status, traveler_count, package_id, created_at')
       .eq('user_id', userId)
-      .eq('package_id', packageId)
-      .in('status', ['confirmed', 'pending'])
-      .maybeSingle();
+      .in('status', ['confirmed', 'pending']);
+
+    if (bookingId) {
+      bookingQuery = bookingQuery.eq('id', bookingId);
+    } else {
+      bookingQuery = bookingQuery.eq('package_id', packageId).order('created_at', { ascending: false }).limit(1);
+    }
+
+    const { data: bookingRows, error: bErr } = await bookingQuery;
 
     if (bErr) {
       logger.error('saveFacePhoto booking check failed', { error: bErr.message, userId, packageId });
       return res.status(500).json({ success: false, error: 'Could not verify booking. Please try again.' });
     }
+    const booking = Array.isArray(bookingRows) ? bookingRows[0] : bookingRows;
     if (!booking) {
       return res.status(403).json({
         success: false,
         error: 'No confirmed booking found for this package.',
       });
+    }
+
+    if (String(booking.package_id) !== String(packageId)) {
+      return res.status(400).json({ success: false, error: 'bookingId does not match packageId.' });
     }
 
     // A verified (or manual-review) passport is mandatory for EVERY traveler
@@ -843,6 +864,12 @@ export async function saveFacePhoto(req, res) {
     // check before payment. Enforce it here too so this endpoint can't be
     // hit directly to bypass verification for any traveler on the booking.
     const totalTravelers = Math.max(1, booking.traveler_count || 1);
+    if (travelerIndex >= totalTravelers) {
+      return res.status(400).json({
+        success: false,
+        error: `travelerIndex must be between 0 and ${totalTravelers - 1}.`,
+      });
+    }
     const travelerIndices = Array.from({ length: totalTravelers }, (_, i) => i);
     const { data: existingRows, error: existErr } = await supabaseAdmin
       .from('passport_verifications')
@@ -852,6 +879,12 @@ export async function saveFacePhoto(req, res) {
       .in('traveler_index', travelerIndices);
 
     if (existErr) {
+      if (parseMissingColumn(existErr) === 'traveler_index') {
+        return res.status(500).json({
+          success: false,
+          error: 'Database schema is missing traveler_index. Apply the multi-traveler onboarding migration first.',
+        });
+      }
       logger.error('saveFacePhoto passport check failed', { error: existErr.message, userId, packageId });
       return res.status(500).json({ success: false, error: 'Could not verify booking. Please try again.' });
     }
@@ -881,23 +914,63 @@ export async function saveFacePhoto(req, res) {
 
     logger.info('Dedicated face photo uploaded', { userId, packageId, key: facePhoto.key });
 
-    // Patch only the face photo fields — never touch the verification fields.
-    const { error: upErr } = await supabaseAdmin
+    // Patch only the targeted traveler's face photo fields.
+    const patch = {
+      face_photo_url: facePhoto.url,
+      face_photo_key: facePhoto.key,
+      booking_id: booking.id,
+      updated_at: new Date().toISOString(),
+    };
+
+    const { data: updatedRows, error: upErr } = await supabaseAdmin
       .from('passport_verifications')
-      .update({
-        face_photo_url: facePhoto.url,
-        face_photo_key: facePhoto.key,
-      })
+      .update(patch)
       .eq('user_id', userId)
-      .eq('package_id', packageId);
+      .eq('package_id', packageId)
+      .eq('traveler_index', travelerIndex)
+      .select('id');
 
     if (upErr) {
+      if (parseMissingColumn(upErr) === 'traveler_index') {
+        return res.status(500).json({
+          success: false,
+          error: 'Database schema is missing traveler_index. Apply the multi-traveler onboarding migration first.',
+        });
+      }
       logger.error('saveFacePhoto update failed', { error: upErr.message, userId, packageId });
       return res.status(500).json({ success: false, error: 'Could not save photo. Please try again.' });
     }
 
+    if (!updatedRows?.length) {
+      const insertRow = {
+        user_id: userId,
+        package_id: packageId,
+        booking_id: booking.id,
+        traveler_index: travelerIndex,
+        face_photo_url: facePhoto.url,
+        face_photo_key: facePhoto.key,
+      };
+
+      const { error: insertErr } = await supabaseAdmin
+        .from('passport_verifications')
+        .insert(insertRow);
+
+      if (insertErr) {
+        if (parseMissingColumn(insertErr) === 'traveler_index') {
+          return res.status(500).json({
+            success: false,
+            error: 'Database schema is missing traveler_index. Apply the multi-traveler onboarding migration first.',
+          });
+        }
+        logger.error('saveFacePhoto insert failed', { error: insertErr.message, userId, packageId, travelerIndex });
+        return res.status(500).json({ success: false, error: 'Could not save photo. Please try again.' });
+      }
+    }
+
     return res.json({
       success: true,
+      bookingId: booking.id,
+      travelerIndex,
       facePhotoUrl: facePhoto.url,
       message: 'Face photo saved successfully.',
     });
