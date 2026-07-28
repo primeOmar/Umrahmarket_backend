@@ -3,8 +3,8 @@ import axios             from 'axios';
 import crypto            from 'crypto';
 import { supabaseAdmin } from '../config/supabase.js';
 import { createBookingMessage } from './messagesController.js';
-import { getUsdKesRate, usdToKes } from '../services/currency.service.js'; // <-- NEW
-import { computeBookingAmount } from '../services/pricing.service.js'; // <-- travelers → total price
+import { getUsdKesRate, usdToKes } from '../services/currency.service.js'; 
+import { computeBookingAmount } from '../services/pricing.service.js'; 
 
 const KES_RATE   = Number(process.env.KES_PER_USD) || 130; // kept for fallback
 const IS_SANDBOX = (process.env.PESAPAL_ENV || 'sandbox') !== 'production';

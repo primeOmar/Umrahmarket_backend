@@ -3,6 +3,7 @@ import config from '../config/security.config.js';
 import logger from '../config/logger.js';
 import { extractPassport, compareWithInput } from '../lib/passportOcr.js';
 import { uploadPassportBuffer, uploadFacePhotoBuffer } from '../middleware/uploads/PassportUpload.js';
+import { evaluatePassportStatusForBooking } from '../services/passportStatus.service.js';
 
 const MAX_ATTEMPTS = 3;
 const MIN_VALIDITY_MONTHS = 6;
@@ -587,40 +588,26 @@ export const getPassportStatusBatch = async (req, res) => {
     const totalTravelers = Math.max(1, Math.min(MAX_TRAVELERS_PER_BOOKING, Number.parseInt(req.query.totalTravelers, 10) || 1));
     if (!packageId) return res.status(400).json({ success: false, error: 'packageId is required.' });
 
-    const indices = Array.from({ length: totalTravelers }, (_, i) => i);
     const { data, error } = await supabaseAdmin
       .from('passport_verifications')
       .select('traveler_index, verification_status, verified, attempts, face_photo_url')
       .eq('user_id', userId)
       .eq('package_id', packageId)
-      .in('traveler_index', indices);
+      .order('traveler_index', { ascending: true });
 
     if (error) throw error;
 
-    const byIndex = new Map((data || []).map((row) => [row.traveler_index, row]));
-    const travelers = indices.map((i) => {
-      const row = byIndex.get(i);
-      return {
-        travelerIndex:     i,
-        exists:            !!row,
-        status:            row?.verification_status || null,
-        verified:          row?.verified || false,
-        canProceed:        !!row && ['verified', 'manual_review'].includes(row.verification_status),
-        attemptsUsed:      row?.attempts || 0,
-        attemptsRemaining: Math.max(0, MAX_ATTEMPTS - (row?.attempts || 0)),
-        facePhotoUrl:      row?.face_photo_url || null,
-      };
+    const evaluation = evaluatePassportStatusForBooking({
+      passportRows: data || [],
+      totalTravelers,
     });
-
-    const allCanProceed = travelers.every((t) => t.canProceed);
-    const nextIncompleteIndex = travelers.findIndex((t) => !t.canProceed);
 
     return res.json({
       success: true,
-      totalTravelers,
-      travelers,
-      allCanProceed,
-      nextIncompleteIndex: nextIncompleteIndex === -1 ? null : nextIncompleteIndex,
+      totalTravelers: evaluation.totalTravelers,
+      travelers: evaluation.travelers,
+      allCanProceed: evaluation.allCanProceed,
+      nextIncompleteIndex: evaluation.nextIncompleteIndex === -1 ? null : evaluation.nextIncompleteIndex,
     });
   } catch (error) {
     logger.error('getPassportStatusBatch failed', { error: error.message, code: error.code });
