@@ -317,13 +317,8 @@ export const getPassportStatus = async (req, res) => {
       facePhotoUrl: data?.face_photo_url || null,
     });
   } catch (error) {
-    console.error('[getPassportStatus] RAW ERROR:', error); // ← guaranteed stdout, bypasses logger entirely
-    logger.error('getPassportStatus failed', { error: error.message });
-    return res.status(500).json({
-      success: false,
-      error: 'Could not load verification status.',
-      debug: error.message, // ← TEMPORARY: remove once diagnosed
-    });
+    logger.error('getPassportStatus failed', { error: error.message, code: error.code });
+    return res.status(500).json({ success: false, error: 'Could not load verification status.' });
   }
 };
 
@@ -380,13 +375,8 @@ export const getPassportStatusBatch = async (req, res) => {
       nextIncompleteIndex: nextIncompleteIndex === -1 ? null : nextIncompleteIndex,
     });
   } catch (error) {
-    console.error('[getPassportStatusBatch] RAW ERROR:', error); // ← guaranteed stdout, bypasses logger entirely
-    logger.error('getPassportStatusBatch failed', { error: error.message });
-    return res.status(500).json({
-      success: false,
-      error: 'Could not load verification status.',
-      debug: error.message, // ← TEMPORARY: remove once diagnosed
-    });
+    logger.error('getPassportStatusBatch failed', { error: error.message, code: error.code });
+    return res.status(500).json({ success: false, error: 'Could not load verification status.' });
   }
 };
 
