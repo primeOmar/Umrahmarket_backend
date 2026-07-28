@@ -1,4 +1,3 @@
-
 import { supabaseAdmin } from '../config/supabase.js';
 import config from '../config/security.config.js';
 import logger from '../config/logger.js';
@@ -296,13 +295,15 @@ export const getPassportStatus = async (req, res) => {
     const travelerIndex = sanitizeTravelerIndex(req.query.travelerIndex);
     if (!packageId) return res.status(400).json({ success: false, error: 'packageId is required.' });
 
-    const { data } = await supabaseAdmin
+    const { data, error } = await supabaseAdmin
       .from('passport_verifications')
       .select('verification_status, verified, attempts, match_score, face_photo_url, updated_at')
       .eq('user_id', userId)
       .eq('package_id', packageId)
       .eq('traveler_index', travelerIndex)
       .maybeSingle();
+
+    if (error) throw error; // ← was silently swallowed before (destructured but never checked)
 
     return res.json({
       success: true,
@@ -316,8 +317,13 @@ export const getPassportStatus = async (req, res) => {
       facePhotoUrl: data?.face_photo_url || null,
     });
   } catch (error) {
+    console.error('[getPassportStatus] RAW ERROR:', error); // ← guaranteed stdout, bypasses logger entirely
     logger.error('getPassportStatus failed', { error: error.message });
-    return res.status(500).json({ success: false, error: 'Could not load verification status.' });
+    return res.status(500).json({
+      success: false,
+      error: 'Could not load verification status.',
+      debug: error.message, // ← TEMPORARY: remove once diagnosed
+    });
   }
 };
 
@@ -346,7 +352,7 @@ export const getPassportStatusBatch = async (req, res) => {
       .eq('package_id', packageId)
       .in('traveler_index', indices);
 
-    if (error) throw new Error(error.message);
+    if (error) throw error;
 
     const byIndex = new Map((data || []).map((row) => [row.traveler_index, row]));
     const travelers = indices.map((i) => {
@@ -374,8 +380,13 @@ export const getPassportStatusBatch = async (req, res) => {
       nextIncompleteIndex: nextIncompleteIndex === -1 ? null : nextIncompleteIndex,
     });
   } catch (error) {
+    console.error('[getPassportStatusBatch] RAW ERROR:', error); // ← guaranteed stdout, bypasses logger entirely
     logger.error('getPassportStatusBatch failed', { error: error.message });
-    return res.status(500).json({ success: false, error: 'Could not load verification status.' });
+    return res.status(500).json({
+      success: false,
+      error: 'Could not load verification status.',
+      debug: error.message, // ← TEMPORARY: remove once diagnosed
+    });
   }
 };
 
