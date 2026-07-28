@@ -24,6 +24,7 @@ import {
   checkPassportValidity,
   verifyPassportImage,
   getPassportStatus,
+  getPassportStatusBatch,
   getFacePhotoStatus,
   saveFacePhoto,
 } from '../controllers/passport.controller.js';
@@ -76,6 +77,19 @@ router.get(
   query('packageId').trim().notEmpty().withMessage('packageId is required'),
   handleValidationErrors,
   getPassportStatus,
+);
+
+// ── GET /api/passport/status-batch ───────────────────────────────────────────
+// Returns verification status for every traveler slot (0..totalTravelers-1)
+// on a booking in one call — lets BookingFlow check everyone up front instead
+// of gating on just the account holder's own passport.
+router.get(
+  '/status-batch',
+  requireAuth,
+  query('packageId').trim().notEmpty().withMessage('packageId is required'),
+  query('totalTravelers').optional().isInt({ min: 1, max: 30 }).withMessage('totalTravelers must be between 1 and 30'),
+  handleValidationErrors,
+  getPassportStatusBatch,
 );
 
 // ── GET /api/passport/face-photo-status ──────────────────────────────────────
