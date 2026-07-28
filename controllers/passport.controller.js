@@ -9,6 +9,84 @@ const MIN_VALIDITY_MONTHS = 6;
 const MIN_OCR_CONFIDENCE = 45; // below this the read is too noisy to trust a match
 const MAX_TRAVELERS_PER_BOOKING = 30; // mirrors services/pricing.service.js
 
+function errText(err) {
+  return [err?.message, err?.details, err?.hint].filter(Boolean).join(' | ');
+}
+
+function parseMissingColumn(err) {
+  const text = errText(err);
+  let m = text.match(/Could not find the '([^']+)' column/i);
+  if (m?.[1]) return m[1];
+  m = text.match(/column\s+\"?(?:[A-Za-z0-9_]+\.)?([A-Za-z0-9_]+)\"?\s+does not exist/i);
+  if (m?.[1]) return m[1];
+  return null;
+}
+
+function isOnConflictSpecError(err) {
+  const text = errText(err);
+  return err?.code === '42P10'
+    || /no unique or exclusion constraint/i.test(text)
+    || /on conflict/i.test(text);
+}
+
+async function selectMaybeSingleWithFallback({ table, baseFilters, primarySelect, fallbackSelects }) {
+  const tries = [primarySelect, ...(fallbackSelects || [])];
+  let lastError = null;
+  for (const fields of tries) {
+    let q = supabaseAdmin.from(table).select(fields);
+    baseFilters.forEach(({ op, col, val }) => {
+      if (op === 'eq') q = q.eq(col, val);
+      if (op === 'in') q = q.in(col, val);
+    });
+    const { data, error } = await q.maybeSingle();
+    if (!error) return { data, usedFields: fields };
+
+    const missing = parseMissingColumn(error);
+    if (missing) {
+      lastError = error;
+      continue;
+    }
+    throw error;
+  }
+  if (lastError) throw lastError;
+  return { data: null, usedFields: primarySelect };
+}
+
+async function upsertWithCompatibility({ row, onConflictCandidates }) {
+  const workingRow = { ...row };
+  let lastError = null;
+
+  for (let i = 0; i < 12; i++) {
+    for (const onConflict of onConflictCandidates) {
+      const { error } = await supabaseAdmin
+        .from('passport_verifications')
+        .upsert(workingRow, { onConflict });
+
+      if (!error) {
+        return { ok: true, onConflict, rowKeys: Object.keys(workingRow) };
+      }
+
+      const missing = parseMissingColumn(error);
+      if (missing && Object.prototype.hasOwnProperty.call(workingRow, missing)) {
+        delete workingRow[missing];
+        logger.warn('passport upsert fallback: dropping unknown column', { missing, onConflict });
+        lastError = error;
+        break;
+      }
+
+      if (isOnConflictSpecError(error)) {
+        lastError = error;
+        continue;
+      }
+
+      throw error;
+    }
+  }
+
+  if (lastError) throw lastError;
+  throw new Error('Could not save verification record.');
+}
+
 // Every traveler needs their own passport verified, regardless of age tier —
 // defaults to 0 (the lead/account-holder traveler) so this stays backward
 // compatible with any caller that doesn't send travelerIndex at all.
@@ -106,6 +184,7 @@ export const checkPassportValidity = async (req, res) => {
 // =============================================================================
 export const verifyPassportImage = async (req, res) => {
   const userId = req.userId;
+  const debugRef = `PV-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   try {
     const {
       packageId, passportNumber, passportCountry,
@@ -126,13 +205,42 @@ export const verifyPassportImage = async (req, res) => {
     });
 
     // Don't re-verify an already-verified passport for this traveler slot.
-    const { data: existing } = await supabaseAdmin
-      .from('passport_verifications')
-      .select('id, attempts, verification_status, face_photo_url')
-      .eq('user_id', userId)
-      .eq('package_id', packageId)
-      .eq('traveler_index', travelerIndex)
-      .maybeSingle();
+    let existing = null;
+    try {
+      const withTraveler = await supabaseAdmin
+        .from('passport_verifications')
+        .select('id, attempts, verification_status, face_photo_url')
+        .eq('user_id', userId)
+        .eq('package_id', packageId)
+        .eq('traveler_index', travelerIndex)
+        .maybeSingle();
+
+      if (!withTraveler.error) {
+        existing = withTraveler.data;
+      } else if (parseMissingColumn(withTraveler.error) === 'traveler_index') {
+        logger.warn('passport verify fallback: traveler_index missing, using legacy row lookup');
+        const legacy = await supabaseAdmin
+          .from('passport_verifications')
+          .select('id, attempts, verification_status, face_photo_url')
+          .eq('user_id', userId)
+          .eq('package_id', packageId)
+          .maybeSingle();
+        if (legacy.error) throw legacy.error;
+        existing = legacy.data;
+      } else {
+        throw withTraveler.error;
+      }
+    } catch (lookupErr) {
+      logger.error('passport existing-row lookup failed', {
+        debugRef,
+        error: lookupErr.message,
+        code: lookupErr.code,
+        userId,
+        packageId,
+        travelerIndex,
+      });
+      throw lookupErr;
+    }
 
     if (existing?.verification_status === 'verified') {
       logger.info('Passport already verified for this traveler', { userId, packageId, travelerIndex });
@@ -266,6 +374,7 @@ export const verifyPassportImage = async (req, res) => {
       : 'Verification failed. Please try again.';
 
     logger.error('verifyPassportImage failed', {
+      debugRef,
       error: error.message,
       stack: error.stack,
       userId,
@@ -281,7 +390,7 @@ export const verifyPassportImage = async (req, res) => {
         nationality: req.body?.nationality,
       },
     });
-    return res.status(500).json({ success: false, error: errorMessage });
+    return res.status(500).json({ success: false, error: errorMessage, ref: debugRef });
   }
 };
 
@@ -424,10 +533,35 @@ async function upsertVerification({ userId, packageId, travelerIndex = 0, status
   // attempt already has one stored, keep it rather than clearing it.
   let resolvedFacePhotoUrl = facePhoto?.url || null;
   if (!row.passport_image_url || !row.face_photo_url) {
-    const { data: prev } = await supabaseAdmin
-      .from('passport_verifications')
-      .select('passport_image_url, image_key, face_photo_url, face_photo_key')
-      .eq('user_id', userId).eq('package_id', packageId).eq('traveler_index', travelerIndex).maybeSingle();
+    let prev = null;
+    try {
+      const primary = await selectMaybeSingleWithFallback({
+        table: 'passport_verifications',
+        baseFilters: [
+          { op: 'eq', col: 'user_id', val: userId },
+          { op: 'eq', col: 'package_id', val: packageId },
+          { op: 'eq', col: 'traveler_index', val: travelerIndex },
+        ],
+        primarySelect: 'passport_image_url, image_key, face_photo_url, face_photo_key',
+        fallbackSelects: ['passport_image_url, face_photo_url'],
+      });
+      prev = primary.data;
+    } catch (err) {
+      if (parseMissingColumn(err) === 'traveler_index') {
+        const legacy = await selectMaybeSingleWithFallback({
+          table: 'passport_verifications',
+          baseFilters: [
+            { op: 'eq', col: 'user_id', val: userId },
+            { op: 'eq', col: 'package_id', val: packageId },
+          ],
+          primarySelect: 'passport_image_url, image_key, face_photo_url, face_photo_key',
+          fallbackSelects: ['passport_image_url, face_photo_url'],
+        });
+        prev = legacy.data;
+      } else {
+        throw err;
+      }
+    }
 
     if (!row.passport_image_url) {
       if (prev?.passport_image_url) {
@@ -444,11 +578,29 @@ async function upsertVerification({ userId, packageId, travelerIndex = 0, status
     }
   }
 
-  const { error } = await supabaseAdmin
-    .from('passport_verifications')
-    .upsert(row, { onConflict: 'user_id,package_id,traveler_index' });
-  if (error) {
-    logger.error('passport_verifications upsert failed', { error: error.message, userId, packageId });
+  try {
+    const result = await upsertWithCompatibility({
+      row,
+      onConflictCandidates: ['user_id,package_id,traveler_index', 'user_id,package_id'],
+    });
+    logger.info('passport_verifications upsert success', {
+      userId,
+      packageId,
+      travelerIndex,
+      onConflict: result.onConflict,
+      rowKeys: result.rowKeys,
+    });
+  } catch (error) {
+    logger.error('passport_verifications upsert failed', {
+      error: error.message,
+      code: error.code,
+      details: error.details,
+      hint: error.hint,
+      userId,
+      packageId,
+      travelerIndex,
+      rowKeys: Object.keys(row),
+    });
     throw new Error('Could not save verification record.');
   }
 
