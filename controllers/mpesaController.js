@@ -2,6 +2,7 @@
 import { supabaseAdmin } from '../config/supabase.js';
 import { stkPush, stkQuery } from '../services/Mpesaservice.js';
 import { createBookingMessage } from './messagesController.js';
+import { sendBookingReceiptEmail } from '../services/bookingReceipt.service.js';
 import { getUsdKesRate, usdToKes } from '../services/currency.service.js'; // <-- NEW
 import { computeBookingAmount } from '../services/pricing.service.js'; // <-- travelers → total price
 
@@ -337,6 +338,12 @@ export const callback = async (req, res) => {
       } catch (msgErr) {
         console.error('[M-Pesa callback] Failed to send auto-message:', msgErr.message);
       }
+
+      try {
+        await sendBookingReceiptEmail({ paymentId: payment.id, bookingId: booking.id });
+      } catch (mailErr) {
+        console.error('[M-Pesa callback] Failed to send booking receipt email:', mailErr.message);
+      }
     }
 
     return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
@@ -426,6 +433,14 @@ export const getStatus = async (req, res) => {
               console.error('[M-Pesa status] Failed to send auto-message:', msgErr.message);
             }
           }
+        }
+      }
+
+      if (booking?.id) {
+        try {
+          await sendBookingReceiptEmail({ paymentId: payment.id, bookingId: booking.id });
+        } catch (mailErr) {
+          console.error('[M-Pesa status] Failed to send booking receipt email:', mailErr.message);
         }
       }
 

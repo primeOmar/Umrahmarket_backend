@@ -2,6 +2,7 @@ import axios             from 'axios';
 import crypto            from 'crypto';
 import { supabaseAdmin } from '../config/supabase.js';
 import { createBookingMessage } from './messagesController.js';
+import { sendBookingReceiptEmail } from '../services/bookingReceipt.service.js';
 import { getUsdKesRate, usdToKes } from '../services/currency.service.js'; 
 import { computeBookingAmount } from '../services/pricing.service.js'; 
 
@@ -425,6 +426,14 @@ export const verify = async (req, res) => {
         }
       }
 
+      if (booking?.id) {
+        try {
+          await sendBookingReceiptEmail({ paymentId: payment.id, bookingId: booking.id });
+        } catch (mailErr) {
+          console.error('[Card verify] Failed to send booking receipt email:', mailErr.message);
+        }
+      }
+
       return res.json({ success: true, alreadyProcessed: true, booking });
     }
 
@@ -536,6 +545,12 @@ export const verify = async (req, res) => {
       // Don't fail the response if messaging fails
     }
 
+    try {
+      await sendBookingReceiptEmail({ paymentId: payment.id, bookingId: booking.id });
+    } catch (mailErr) {
+      console.error('[Card verify] Failed to send booking receipt email:', mailErr.message);
+    }
+
     return res.json({ success: true, status: 'SUCCESS', booking });
 
   } catch (err) {
@@ -642,6 +657,12 @@ export const ipn = async (req, res) => {
         console.log(`[Card IPN] Auto-message sent for booking ${booking.id}`);
       } catch (msgErr) {
         console.error('[Card IPN] Failed to send auto-message:', msgErr.message);
+      }
+
+      try {
+        await sendBookingReceiptEmail({ paymentId: payment.id, bookingId: booking.id });
+      } catch (mailErr) {
+        console.error('[Card IPN] Failed to send booking receipt email:', mailErr.message);
       }
     }
 
