@@ -30,8 +30,6 @@ export const initiate = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Invalid Safaricom number (must start 2547... or 2541...)' });
 
     // ── Fail fast on missing M-Pesa config — clearer than a mystery 500 ──────
-    // NOTE: confirm these env var names actually match what
-    // services/Mpesaservice.js reads before relying on this check.
     const missingEnv = ['MPESA_CONSUMER_KEY', 'MPESA_CONSUMER_SECRET', 'MPESA_SHORTCODE', 'MPESA_PASSKEY', 'MPESA_CALLBACK_URL']
       .filter(k => !process.env[k]);
     if (missingEnv.length) {
@@ -101,28 +99,39 @@ export const initiate = async (req, res) => {
       return res.status(400).json({ success: false, message: 'You have already booked this package. You cannot book the same package twice.' });
     }
 
-    // ── Require passport verification for THIS package before payment ────
-    // The frontend BookingFlow already gates the UI on this, but that's not
-    // enforcement — a request made directly against this endpoint must not be
-    // able to skip verification just because it never went through the modal.
-    const { data: passport, error: passportErr } = await supabaseAdmin
+    // ── Require passport verification for EVERY traveler on this booking ────
+    // A booking with N travelers has N passport_verifications rows — one per
+    // traveler_index — so this must NOT be a .maybeSingle() lookup on just
+    // (user_id, package_id). Doing that threw "JSON object requested,
+    // multiple (or no) rows returned" for any 2+-traveler booking, which was
+    // the exact 500 seen in production. Instead, fetch every traveler's row
+    // and confirm each one individually passed verification.
+    const travelerIndices = Array.from({ length: totalTravelers }, (_, i) => i);
+    const { data: passportRows, error: passportErr } = await supabaseAdmin
       .from('passport_verifications')
-      .select('verification_status, verified')
+      .select('traveler_index, verification_status, verified')
       .eq('user_id', userId)
       .eq('package_id', packageId)
-      .maybeSingle();
+      .in('traveler_index', travelerIndices);
 
     if (passportErr) {
       console.error('[M-Pesa initiate] Passport verification check error:', passportErr.message);
       return res.status(500).json({ success: false, message: 'Failed to verify passport status' });
     }
 
-    const passportVerified = passport?.verification_status === 'verified' || passport?.verified === true;
-    if (!passportVerified) {
+    const verifiedByIndex = new Map(
+      (passportRows || []).map(r => [
+        r.traveler_index,
+        r.verification_status === 'verified' || r.verification_status === 'manual_review' || r.verified === true,
+      ])
+    );
+    const allVerified = travelerIndices.every(i => verifiedByIndex.get(i) === true);
+
+    if (!allVerified) {
       return res.status(403).json({
         success: false,
         code:    'PASSPORT_NOT_VERIFIED',
-        message: 'Please complete passport verification for this package before paying.',
+        message: 'Please complete passport verification for every traveler on this booking before paying.',
       });
     }
 
@@ -216,7 +225,7 @@ export const callback = async (req, res) => {
   const ip = (req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '')
     .split(',')[0].trim();
 
-  const isSandbox = (process.env.MPESA_ENV || 'sandbox') !== 'production';
+  const isSandbox = (process.env.MPESA_ENV || 'sandbox').toLowerCase() !== 'production';
   if (!isSandbox && !SAFARICOM_IPS.has(ip)) {
     console.warn(`[M-Pesa callback] Blocked unknown IP: ${ip}`);
     return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
