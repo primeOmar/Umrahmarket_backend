@@ -1,4 +1,3 @@
-
 import axios             from 'axios';
 import crypto            from 'crypto';
 import { supabaseAdmin } from '../config/supabase.js';
@@ -100,6 +99,14 @@ export const initiate = async (req, res) => {
     if (!isUUID && !isObjectId && !isNumericId)
       return res.status(400).json({ success: false, message: 'Invalid packageId' });
 
+    // ── Fail fast on missing Pesapal config — clearer than a mystery 500 ─────
+    const missingEnv = ['PESAPAL_CONSUMER_KEY', 'PESAPAL_CONSUMER_SECRET', 'PESAPAL_IPN_URL', 'PESAPAL_CALLBACK_URL']
+      .filter(k => !process.env[k]);
+    if (missingEnv.length) {
+      console.error('[Card initiate] Missing required env vars:', missingEnv.join(', '));
+      return res.status(500).json({ success: false, message: 'Payment provider misconfigured. Contact support.' });
+    }
+
     // ── 1. Fetch package price from DB — NEVER trust frontend ────────────────
     const { data: pkg, error: pkgErr } = await supabaseAdmin
       .from('packages')
@@ -133,7 +140,14 @@ export const initiate = async (req, res) => {
     }
 
     // ── Get live FX rate and convert to KES ──────────────────────────────────
-    const rate = await getUsdKesRate();
+    let rate;
+    try {
+      rate = await getUsdKesRate();
+      if (!rate || isNaN(rate) || rate <= 0) throw new Error(`Invalid rate returned: ${rate}`);
+    } catch (fxErr) {
+      console.error('[Card initiate] FX rate fetch failed, using static fallback:', fxErr.message);
+      rate = KES_RATE; // module-level fallback, defined at top of file
+    }
     const amountKes = usdToKes(priceUSD, rate);
 
     // ── Check if user already has a confirmed booking for this package ──
@@ -374,7 +388,7 @@ export const verify = async (req, res) => {
         } else {
           booking = restoredBooking;
           console.info(`[Card verify] Recovered missing booking ${booking?.id}`);
-          
+
           // ─────────────────────────────────────────────────────────────
           // SEND AUTOMATED MESSAGE TO CLIENT AND AGENT
           // ─────────────────────────────────────────────────────────────
@@ -383,7 +397,7 @@ export const verify = async (req, res) => {
               const pkgName = booking.package?.name || 'Your booked package';
               const agentId = booking.package?.created_by || null;
               const agentName = booking.package?.agent_name || 'Travel Agency';
-              
+
               await createBookingMessage(
                 booking.id,      // bookingId
                 payment.user_id, // clientId
@@ -489,7 +503,7 @@ export const verify = async (req, res) => {
     }
 
     console.info(`[Card] Booking ${booking.id} created | tracking: ${orderTrackingId} | ref: ${confirmationCode}`);
-    
+
     // ─────────────────────────────────────────────────────────────────────────
     // SEND AUTOMATED MESSAGE TO CLIENT AND AGENT
     // ─────────────────────────────────────────────────────────────────────────
@@ -497,7 +511,7 @@ export const verify = async (req, res) => {
       const pkgName = booking.package?.name || 'Your booked package';
       const agentId = booking.package?.created_by || null;
       const agentName = booking.package?.agent_name || 'Travel Agency';
-      
+
       await createBookingMessage(
         booking.id,      // bookingId
         payment.user_id, // clientId
@@ -598,7 +612,7 @@ export const ipn = async (req, res) => {
       console.error('[Card IPN] Booking creation failed:', bookErr.message);
     } else {
       console.info(`[Card IPN] Booking ${booking.id} created | tracking: ${orderTrackingId}`);
-      
+
       // ─────────────────────────────────────────────────────────────────────────
       // SEND AUTOMATED MESSAGE TO CLIENT AND AGENT (IPN path)
       // ─────────────────────────────────────────────────────────────────────────
@@ -606,7 +620,7 @@ export const ipn = async (req, res) => {
         const pkgName = booking.package?.name || 'Your booked package';
         const agentId = booking.package?.created_by || null;
         const agentName = booking.package?.agent_name || 'Travel Agency';
-        
+
         await createBookingMessage(
           booking.id,
           payment.user_id,

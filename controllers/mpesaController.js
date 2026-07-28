@@ -5,7 +5,7 @@ import { createBookingMessage } from './messagesController.js';
 import { getUsdKesRate, usdToKes } from '../services/currency.service.js'; // <-- NEW
 import { computeBookingAmount } from '../services/pricing.service.js'; // <-- travelers → total price
 
-const KES_RATE       = Number(process.env.KES_PER_USD) || 130; // kept for backward compatibility, but now overridden by live rate
+const KES_RATE       = Number(process.env.KES_PER_USD) || 130; // fallback if live rate + service fallback both fail
 const MPESA_PHONE_RE = /^254[17]\d{8}$/;
 function maskPhone(p) { return p ? `${p.slice(0, 6)}****${p.slice(-2)}` : '?'; }
 
@@ -28,6 +28,16 @@ export const initiate = async (req, res) => {
 
     if (!MPESA_PHONE_RE.test(phone))
       return res.status(400).json({ success: false, message: 'Invalid Safaricom number (must start 2547... or 2541...)' });
+
+    // ── Fail fast on missing M-Pesa config — clearer than a mystery 500 ──────
+    // NOTE: confirm these env var names actually match what
+    // services/Mpesaservice.js reads before relying on this check.
+    const missingEnv = ['MPESA_CONSUMER_KEY', 'MPESA_CONSUMER_SECRET', 'MPESA_SHORTCODE', 'MPESA_PASSKEY', 'MPESA_CALLBACK_URL']
+      .filter(k => !process.env[k]);
+    if (missingEnv.length) {
+      console.error('[M-Pesa initiate] Missing required env vars:', missingEnv.join(', '));
+      return res.status(500).json({ success: false, message: 'Payment provider misconfigured. Contact support.' });
+    }
 
     // ── Fetch package from Supabase — NEVER trust FE price ──────────────
     const { data: pkg, error: pkgErr } = await supabaseAdmin
@@ -63,7 +73,14 @@ export const initiate = async (req, res) => {
     }
 
     // ── Get live FX rate and convert to KES ──────────────────────────────
-    const rate = await getUsdKesRate();
+    let rate;
+    try {
+      rate = await getUsdKesRate();
+      if (!rate || isNaN(rate) || rate <= 0) throw new Error(`Invalid rate returned: ${rate}`);
+    } catch (fxErr) {
+      console.error('[M-Pesa initiate] FX rate fetch failed, using static fallback:', fxErr.message);
+      rate = KES_RATE; // module-level fallback, defined at top of file
+    }
     const amountKes = usdToKes(priceUSD, rate);
 
     // ── Check if user already has a confirmed booking for this package ──
@@ -291,7 +308,7 @@ export const callback = async (req, res) => {
       console.error('[M-Pesa callback] Booking creation failed:', bookErr.message, bookErr.details);
     } else {
       console.info(`[M-Pesa callback] Booking ${booking.id} created — mpesa ref: ${mpesaRef}`);
-      
+
       // ─────────────────────────────────────────────────────────────────────────
       // SEND AUTOMATED MESSAGE TO CLIENT AND AGENT (Callback path)
       // ─────────────────────────────────────────────────────────────────────────
@@ -299,7 +316,7 @@ export const callback = async (req, res) => {
         const pkgName = booking.package?.name || 'Your booked package';
         const agentId = booking.package?.created_by || null;
         const agentName = booking.package?.agent_name || 'Travel Agency';
-        
+
         await createBookingMessage(
           booking.id,
           payment.user_id,
@@ -378,7 +395,7 @@ export const getStatus = async (req, res) => {
         } else {
           booking = newBooking;
           console.info(`[M-Pesa status] Recovered missing booking ${booking?.id}`);
-          
+
           // ─────────────────────────────────────────────────────────────────────
           // SEND AUTOMATED MESSAGE TO CLIENT AND AGENT (Status polling path)
           // ─────────────────────────────────────────────────────────────────────
@@ -387,7 +404,7 @@ export const getStatus = async (req, res) => {
               const pkgName = booking.package?.name || 'Your booked package';
               const agentId = booking.package?.created_by || null;
               const agentName = booking.package?.agent_name || 'Travel Agency';
-              
+
               await createBookingMessage(
                 booking.id,
                 payment.user_id,
