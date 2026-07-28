@@ -33,21 +33,32 @@ async function selectFirstWithFallback({ table, baseFilters, primarySelect, fall
   const tries = [primarySelect, ...(fallbackSelects || [])];
   let lastError = null;
   for (const fields of tries) {
-    let q = supabaseAdmin.from(table).select(fields);
-    baseFilters.forEach(({ op, col, val }) => {
-      if (op === 'eq') q = q.eq(col, val);
-      if (op === 'in') q = q.in(col, val);
-    });
+    for (const useOrder of [true, false]) {
+      let q = supabaseAdmin.from(table).select(fields);
+      baseFilters.forEach(({ op, col, val }) => {
+        if (op === 'eq') q = q.eq(col, val);
+        if (op === 'in') q = q.in(col, val);
+      });
 
-    const { data, error } = await q.order(orderBy, { ascending: false }).limit(1);
-    if (!error) return { data: Array.isArray(data) ? (data[0] || null) : null, usedFields: fields };
+      if (useOrder && orderBy) {
+        q = q.order(orderBy, { ascending: false });
+      }
+      const { data, error } = await q.limit(1);
+      if (!error) return { data: Array.isArray(data) ? (data[0] || null) : null, usedFields: fields };
 
-    const missing = parseMissingColumn(error);
-    if (missing) {
+      const missing = parseMissingColumn(error);
+      if (!missing) throw error;
+
+      // If the ORDER BY column is missing, retry once without ordering.
+      if (useOrder && orderBy && missing === orderBy) {
+        lastError = error;
+        continue;
+      }
+
+      // Missing selected/filter column — try the next field projection.
       lastError = error;
-      continue;
+      break;
     }
-    throw error;
   }
   if (lastError) throw lastError;
   return { data: null, usedFields: primarySelect };

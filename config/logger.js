@@ -2,6 +2,7 @@ import winston from 'winston';
 import DailyRotateFile from 'winston-daily-rotate-file';
 import config from './security.config.js';
 import path from 'path';
+import fs from 'fs';
 
 /**
  * Security-focused logging system
@@ -26,6 +27,14 @@ const sanitizeFormat = winston.format((info) => {
 
 // Create logs directory if it doesn't exist
 const logDir = config.logging.filePath;
+try {
+  fs.mkdirSync(logDir, { recursive: true });
+} catch (e) {
+  // Keep booting even if file logging cannot initialize; console transport
+  // below guarantees logs are still visible on Render.
+  // eslint-disable-next-line no-console
+  console.error('Failed to create log directory:', logDir, e.message);
+}
 
 // Define log format
 const logFormat = winston.format.combine(
@@ -112,12 +121,11 @@ const logger = winston.createLogger({
   ],
 });
 
-// Add console transport in development
-if (config.env !== 'production') {
-  logger.add(new winston.transports.Console({
-    format: consoleFormat,
-  }));
-}
+// Always emit to stdout/stderr so container platforms (Render) can capture
+// logs even when file logs are inaccessible.
+logger.add(new winston.transports.Console({
+  format: consoleFormat,
+}));
 
 // Security-specific logger
 export const securityLogger = winston.createLogger({
