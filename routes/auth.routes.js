@@ -432,7 +432,7 @@ router.post(
   async (req, res) => {
     try {
       const { email, password } = req.body;
-      
+
       const lockoutStatus = await checkAccountLockout(email);
       if (lockoutStatus.locked) {
         return res.status(423).json({
@@ -441,46 +441,83 @@ router.post(
           code: 'ACCOUNT_LOCKED',
         });
       }
-      
+
       const { data, error } = await supabase.auth.signInWithPassword({
         email,
         password,
       });
-      
+
       if (error) {
         recordFailedLogin(email, req.ip);
-        
+
         logAuthAttempt(false, null, req.ip, req.get('user-agent'), {
           type: 'login',
           email,
           error: error.message,
         });
-        
+
         return res.status(401).json({
           success: false,
           error: 'Invalid email or password',
         });
       }
-      
+
       resetLoginAttempts(email);
 
       // FIX Bug 1: always fetch role from DB — user_metadata.role can be undefined
       // at login time (Supabase sync lag) and causes the dummy-user bug
-      const { data: dbProfile, error: dbProfileError } = await supabaseAdmin
+      let { data: profile, error: profileError } = await supabaseAdmin
         .from('profiles')
         .select('role, agent_number, company_name, first_name, last_name, approved')
         .eq('id', data.user.id)
-        .single();
+        .maybeSingle(); // ← never throws on 0 rows (unlike .single())
 
-      if (dbProfileError || !dbProfile) {
-        logger.error('Profile not found at login', { userId: data.user.id, error: dbProfileError?.message });
+      if (profileError) {
+        logger.error('Profile lookup failed at login', {
+          userId: data.user.id,
+          code: profileError.code,
+          message: profileError.message,
+        });
         return res.status(500).json({ success: false, error: 'Login failed. Please try again later.' });
       }
 
-      const userRole = dbProfile.role;
-      const accessToken = generateAccessToken(data.user.id, userRole);
-      const refreshToken = generateRefreshToken(data.user.id, userRole);
-      
+      // Self-heal: auth user exists but has no profiles row (can happen from
+      // legacy signups or manual Supabase Auth users). Auto-create instead of
+      // permanently locking the account out.
+      if (!profile) {
+        logger.warn('Missing profiles row at login — auto-creating', { userId: data.user.id });
+
+        const meta = data.user.user_metadata || {};
+        const { data: created, error: createError } = await supabaseAdmin
+          .from('profiles')
+          .upsert({
+            id:         data.user.id,
+            email:      data.user.email,
+            first_name: meta.firstName || meta.first_name || '',
+            last_name:  meta.lastName || meta.last_name || '',
+            phone:      meta.phone || null,
+            role:       meta.role || 'client',
+            approved:   meta.approved ?? true,
+            created_at: new Date().toISOString(),
+          }, { onConflict: 'id' })
+          .select('role, agent_number, company_name, first_name, last_name, approved')
+          .single();
+
+        if (createError || !created) {
+          logger.error('Failed to auto-create missing profile at login', {
+            userId: data.user.id,
+            error: createError?.message,
+          });
+          return res.status(500).json({ success: false, error: 'Login failed. Please try again later.' });
+        }
+
+        profile = created;
+      }
+
+      const userRole = profile.role;
+      const accessToken = generateAccessToken(data.user.id, userRole, data.user.email);
+      const refreshToken = generateRefreshToken(data.user.id, userRole, data.user.email);
+
       const isProd = process.env.NODE_ENV === 'production';
       const cookieOpts = {
         httpOnly: true,
@@ -492,12 +529,12 @@ router.post(
         ...cookieOpts,
         maxAge: 15 * 60 * 1000,
       });
-      
+
       res.cookie('refresh_token', refreshToken, {
         ...cookieOpts,
         maxAge: 7 * 24 * 60 * 60 * 1000,
       });
-      
+
       logAuthAttempt(true, data.user.id, req.ip, req.get('user-agent'), {
         type: 'login',
         role: userRole,
@@ -511,12 +548,12 @@ router.post(
             id: data.user.id,
             email: data.user.email,
             role: userRole,
-            firstName: dbProfile.first_name,
-            lastName: dbProfile.last_name,
-            approved: dbProfile.approved,
+            firstName: profile.first_name,
+            lastName: profile.last_name,
+            approved: profile.approved,
             ...(userRole === 'agent' && {
-              agentNumber: dbProfile.agent_number || null,
-              agentName:   dbProfile.company_name || null,
+              agentNumber: profile.agent_number || null,
+              agentName:   profile.company_name || null,
             }),
           },
           accessToken,
@@ -526,10 +563,11 @@ router.post(
     } catch (error) {
       logger.error('Login error', {
         error: error.message,
+        code: error.code,
         stack: error.stack,
         ip: req.ip,
       });
-      
+
       res.status(500).json({
         success: false,
         error: 'Login failed. Please try again later.',
@@ -659,18 +697,17 @@ router.post('/google', authRateLimiter, async (req, res) => {
 // ===========================================
 router.post('/refresh', async (req, res) => {
   try {
-    // ← Accept from cookie (httpOnly) OR request body (localStorage fallback)
     const token = req.cookies.refresh_token || req.body.refreshToken;
-    
+
     if (!token) {
       return res.status(401).json({
         success: false,
         error: 'Refresh token is required',
       });
     }
-    
+
     const decoded = verifyRefreshToken(token);
-    
+
     if (!decoded) {
       return res.status(401).json({
         success: false,
@@ -689,9 +726,9 @@ router.post('/refresh', async (req, res) => {
       return res.status(401).json({ success: false, error: 'User not found' });
     }
 
-    const accessToken = generateAccessToken(decoded.userId, profile.role);
+    const accessToken = generateAccessToken(decoded.userId, profile.role, decoded.email);
     // Issue a fresh refresh token so the role stays current in it too
-    const newRefreshToken = generateRefreshToken(decoded.userId, profile.role);
+    const newRefreshToken = generateRefreshToken(decoded.userId, profile.role, decoded.email);
 
     const isProd = process.env.NODE_ENV === 'production';
     res.cookie('refresh_token', newRefreshToken, {
@@ -713,7 +750,7 @@ router.post('/refresh', async (req, res) => {
       error: error.message,
       ip: req.ip,
     });
-    
+
     res.status(500).json({
       success: false,
       error: 'Token refresh failed',

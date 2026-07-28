@@ -1,4 +1,4 @@
-import supabase from '../../config/supabase.js';
+import { supabaseAdmin } from '../../config/supabase.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Toggle favourite  POST /api/favourites/toggle
@@ -6,7 +6,7 @@ import supabase from '../../config/supabase.js';
 // Returns: { favourited: true|false }
 // ─────────────────────────────────────────────────────────────────────────────
 export const toggleFavourite = async (req, res) => {
-  const userId    = req.user.id;
+  const userId = req.user.id;
   const { packageId } = req.body;
 
   if (!packageId) {
@@ -15,25 +15,32 @@ export const toggleFavourite = async (req, res) => {
 
   try {
     // Check if already favourited
-    const { data: existing } = await supabase
+    const { data: existing, error: lookupError } = await supabaseAdmin
       .from('favourites')
       .select('id')
       .eq('user_id', userId)
       .eq('package_id', packageId)
       .maybeSingle();
 
+    if (lookupError) throw lookupError;
+
     if (existing) {
       // Remove favourite
-      await supabase.from('favourites').delete().eq('id', existing.id);
+      const { error: deleteError } = await supabaseAdmin
+        .from('favourites')
+        .delete()
+        .eq('id', existing.id);
+
+      if (deleteError) throw deleteError;
       return res.json({ success: true, favourited: false });
     }
 
     // Add favourite
-    const { error } = await supabase
+    const { error: insertError } = await supabaseAdmin
       .from('favourites')
       .insert({ user_id: userId, package_id: packageId, created_at: new Date().toISOString() });
 
-    if (error) throw error;
+    if (insertError) throw insertError;
 
     return res.json({ success: true, favourited: true });
   } catch (error) {
@@ -50,7 +57,7 @@ export const getFavourites = async (req, res) => {
   const userId = req.user.id;
 
   try {
-    const { data, error } = await supabase
+    const { data, error } = await supabaseAdmin
       .from('favourites')
       .select(`
         id,
