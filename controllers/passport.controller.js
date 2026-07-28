@@ -29,6 +29,30 @@ function isOnConflictSpecError(err) {
     || /on conflict/i.test(text);
 }
 
+async function selectFirstWithFallback({ table, baseFilters, primarySelect, fallbackSelects, orderBy = 'last_attempt_at' }) {
+  const tries = [primarySelect, ...(fallbackSelects || [])];
+  let lastError = null;
+  for (const fields of tries) {
+    let q = supabaseAdmin.from(table).select(fields);
+    baseFilters.forEach(({ op, col, val }) => {
+      if (op === 'eq') q = q.eq(col, val);
+      if (op === 'in') q = q.in(col, val);
+    });
+
+    const { data, error } = await q.order(orderBy, { ascending: false }).limit(1);
+    if (!error) return { data: Array.isArray(data) ? (data[0] || null) : null, usedFields: fields };
+
+    const missing = parseMissingColumn(error);
+    if (missing) {
+      lastError = error;
+      continue;
+    }
+    throw error;
+  }
+  if (lastError) throw lastError;
+  return { data: null, usedFields: primarySelect };
+}
+
 async function selectMaybeSingleWithFallback({ table, baseFilters, primarySelect, fallbackSelects }) {
   const tries = [primarySelect, ...(fallbackSelects || [])];
   let lastError = null;
@@ -81,6 +105,72 @@ async function upsertWithCompatibility({ row, onConflictCandidates }) {
 
       throw error;
     }
+  }
+
+  // If conflict/index assumptions are wrong in production, fall back to a
+  // manual update/insert flow that does not depend on ON CONFLICT.
+  let idRow = null;
+  try {
+    const byTraveler = await selectFirstWithFallback({
+      table: 'passport_verifications',
+      baseFilters: [
+        { op: 'eq', col: 'user_id', val: workingRow.user_id },
+        { op: 'eq', col: 'package_id', val: workingRow.package_id },
+        { op: 'eq', col: 'traveler_index', val: workingRow.traveler_index ?? 0 },
+      ],
+      primarySelect: 'id',
+      fallbackSelects: [],
+    });
+    idRow = byTraveler.data;
+  } catch (findErr) {
+    if (parseMissingColumn(findErr) === 'traveler_index') {
+      const legacy = await selectFirstWithFallback({
+        table: 'passport_verifications',
+        baseFilters: [
+          { op: 'eq', col: 'user_id', val: workingRow.user_id },
+          { op: 'eq', col: 'package_id', val: workingRow.package_id },
+        ],
+        primarySelect: 'id',
+        fallbackSelects: [],
+      });
+      idRow = legacy.data;
+      delete workingRow.traveler_index;
+    } else {
+      throw findErr;
+    }
+  }
+
+  for (let i = 0; i < 12; i++) {
+    if (idRow?.id) {
+      const { error: updateErr } = await supabaseAdmin
+        .from('passport_verifications')
+        .update(workingRow)
+        .eq('id', idRow.id);
+      if (!updateErr) {
+        return { ok: true, onConflict: 'manual-update', rowKeys: Object.keys(workingRow) };
+      }
+      const missing = parseMissingColumn(updateErr);
+      if (missing && Object.prototype.hasOwnProperty.call(workingRow, missing)) {
+        delete workingRow[missing];
+        logger.warn('passport update fallback: dropping unknown column', { missing, mode: 'manual-update' });
+        continue;
+      }
+      throw updateErr;
+    }
+
+    const { error: insertErr } = await supabaseAdmin
+      .from('passport_verifications')
+      .insert(workingRow);
+    if (!insertErr) {
+      return { ok: true, onConflict: 'manual-insert', rowKeys: Object.keys(workingRow) };
+    }
+    const missing = parseMissingColumn(insertErr);
+    if (missing && Object.prototype.hasOwnProperty.call(workingRow, missing)) {
+      delete workingRow[missing];
+      logger.warn('passport insert fallback: dropping unknown column', { missing, mode: 'manual-insert' });
+      continue;
+    }
+    throw insertErr;
   }
 
   if (lastError) throw lastError;
@@ -207,29 +297,54 @@ export const verifyPassportImage = async (req, res) => {
     // Don't re-verify an already-verified passport for this traveler slot.
     let existing = null;
     try {
-      const withTraveler = await supabaseAdmin
-        .from('passport_verifications')
-        .select('id, attempts, verification_status, face_photo_url')
-        .eq('user_id', userId)
-        .eq('package_id', packageId)
-        .eq('traveler_index', travelerIndex)
-        .maybeSingle();
-
-      if (!withTraveler.error) {
-        existing = withTraveler.data;
-      } else if (parseMissingColumn(withTraveler.error) === 'traveler_index') {
+      const withTraveler = await selectFirstWithFallback({
+        table: 'passport_verifications',
+        baseFilters: [
+          { op: 'eq', col: 'user_id', val: userId },
+          { op: 'eq', col: 'package_id', val: packageId },
+          { op: 'eq', col: 'traveler_index', val: travelerIndex },
+        ],
+        primarySelect: 'id, attempts, verification_status, face_photo_url',
+        fallbackSelects: ['id, attempts, verification_status, face_photo_url'],
+      });
+      existing = withTraveler.data;
+    } catch (lookupErr) {
+      if (parseMissingColumn(lookupErr) === 'traveler_index') {
         logger.warn('passport verify fallback: traveler_index missing, using legacy row lookup');
-        const legacy = await supabaseAdmin
-          .from('passport_verifications')
-          .select('id, attempts, verification_status, face_photo_url')
-          .eq('user_id', userId)
-          .eq('package_id', packageId)
-          .maybeSingle();
-        if (legacy.error) throw legacy.error;
+        const legacy = await selectFirstWithFallback({
+          table: 'passport_verifications',
+          baseFilters: [
+            { op: 'eq', col: 'user_id', val: userId },
+            { op: 'eq', col: 'package_id', val: packageId },
+          ],
+          primarySelect: 'id, attempts, verification_status, face_photo_url',
+          fallbackSelects: ['id, attempts, verification_status, face_photo_url'],
+        });
         existing = legacy.data;
       } else {
-        throw withTraveler.error;
+        logger.error('passport existing-row lookup failed', {
+          debugRef,
+          error: lookupErr.message,
+          code: lookupErr.code,
+          userId,
+          packageId,
+          travelerIndex,
+        });
+        throw lookupErr;
       }
+    }
+
+    if (!existing) {
+      logger.info('No existing passport row found; creating fresh verification record', {
+        debugRef,
+        userId,
+        packageId,
+        travelerIndex,
+      });
+    }
+
+    try {
+      // no-op; keeps scope for catch logging consistency
     } catch (lookupErr) {
       logger.error('passport existing-row lookup failed', {
         debugRef,
@@ -535,7 +650,7 @@ async function upsertVerification({ userId, packageId, travelerIndex = 0, status
   if (!row.passport_image_url || !row.face_photo_url) {
     let prev = null;
     try {
-      const primary = await selectMaybeSingleWithFallback({
+      const primary = await selectFirstWithFallback({
         table: 'passport_verifications',
         baseFilters: [
           { op: 'eq', col: 'user_id', val: userId },
@@ -548,7 +663,7 @@ async function upsertVerification({ userId, packageId, travelerIndex = 0, status
       prev = primary.data;
     } catch (err) {
       if (parseMissingColumn(err) === 'traveler_index') {
-        const legacy = await selectMaybeSingleWithFallback({
+        const legacy = await selectFirstWithFallback({
           table: 'passport_verifications',
           baseFilters: [
             { op: 'eq', col: 'user_id', val: userId },
