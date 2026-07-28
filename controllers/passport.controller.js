@@ -400,7 +400,20 @@ export const verifyPassportImage = async (req, res) => {
 
     // 2) OCR the photo and compare against the typed details.
     logger.info('Starting OCR extraction', { userId, packageId, travelerIndex, bufferSize: req.passportFile.buffer.length });
-    const ocr = await extractPassport(req.passportFile.buffer);
+    let ocr;
+    try {
+      ocr = await extractPassport(req.passportFile.buffer);
+    } catch (ocrErr) {
+      // A crash/timeout in the OCR library shouldn't 500 the whole request —
+      // treat it the same as "could not read the passport" so the user gets
+      // a retry prompt (or manual review after MAX_ATTEMPTS) instead of a
+      // generic server error.
+      logger.error('extractPassport threw', {
+        debugRef, userId, packageId, travelerIndex,
+        error: ocrErr.message, stack: ocrErr.stack,
+      });
+      ocr = { ok: false, confidence: 0, reason: 'ocr_error', fields: {}, mrz: null };
+    }
     const attempts = (existing?.attempts || 0) + 1;
 
     logger.info('OCR extraction complete', {
