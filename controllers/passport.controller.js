@@ -197,6 +197,18 @@ function sanitizeTravelerIndex(v) {
   return Number.isFinite(n) && n >= 0 && n < MAX_TRAVELERS_PER_BOOKING ? n : 0;
 }
 
+// Stricter variant for saveFacePhoto only: unlike the other passport
+// endpoints (where an omitted travelerIndex legitimately means "the lead
+// traveler"), silently defaulting an invalid index to 0 here would mean a
+// client-side bug could quietly attach every photo to traveler 0 without
+// anyone noticing. This returns null on anything invalid so the caller can
+// reject the request instead of guessing.
+function strictTravelerIndex(v) {
+  if (v === undefined || v === null || v === '') return null;
+  const n = Number.parseInt(v, 10);
+  return Number.isFinite(n) && n >= 0 && n < MAX_TRAVELERS_PER_BOOKING ? n : null;
+}
+
 // ── date helpers (UTC, day-precision) ────────────────────────────────────────
 function parseDateOnly(s) {
   if (!s) return null;
@@ -802,12 +814,42 @@ export async function getFacePhotoStatus(req, res) {
 //   - the agent dashboard can embed it on the Umrah ID card PDF
 //   - getFacePhotoStatus no longer returns this booking as missing a photo
 //
-// multipart/form-data: field "face" (single image) + field "packageId"
+// multipart/form-data fields:
+//   face                    — the image (required)
+//   packageId               — (required)
+//   bookingId               — optional, disambiguates when a user has more
+//                             than one booking for the same package
+//   travelerIndex           — required if the booking has more than one
+//                             traveler; defaults to 0 for single-traveler
+//                             bookings (backward compatible with the older
+//                             FacePhotoModal flow, which never sends it)
+//   travelerVerificationId  — required if the booking has more than one
+//                             traveler; must equal the id of the
+//                             passport_verifications row actually at
+//                             travelerIndex right now. This is the
+//                             client's proof that it showed the user this
+//                             exact traveler's name/passport (fetched from
+//                             GET /api/onboarding/status) and had them
+//                             confirm it, so a photo can never be attached
+//                             to the wrong traveler on a multi-traveler
+//                             booking just because of a stale index.
 export async function saveFacePhoto(req, res) {
   const userId = req.user?.id ?? req.userId;
   try {
     const { packageId, bookingId } = req.body;
-    const travelerIndex = sanitizeTravelerIndex(req.body?.travelerIndex);
+    // travelerIndex is optional in the request — omitted entirely (as the
+    // single-traveler FacePhotoModal flow still does) is fine and resolved
+    // to 0 below once we know the booking only has one traveler. What's
+    // NOT fine is a garbage value (negative, non-numeric, out of range),
+    // which we reject outright rather than silently coercing to 0 — see
+    // strictTravelerIndex's comment.
+    const rawTravelerIndex = req.body?.travelerIndex;
+    let travelerIndex = rawTravelerIndex === undefined || rawTravelerIndex === null || rawTravelerIndex === ''
+      ? null
+      : strictTravelerIndex(rawTravelerIndex);
+    if (rawTravelerIndex !== undefined && rawTravelerIndex !== null && rawTravelerIndex !== '' && travelerIndex === null) {
+      return res.status(400).json({ success: false, error: 'A valid travelerIndex is required.' });
+    }
     if (!packageId) {
       return res.status(400).json({ success: false, error: 'packageId is required.' });
     }
@@ -864,6 +906,21 @@ export async function saveFacePhoto(req, res) {
     // check before payment. Enforce it here too so this endpoint can't be
     // hit directly to bypass verification for any traveler on the booking.
     const totalTravelers = Math.max(1, booking.traveler_count || 1);
+
+    if (travelerIndex === null) {
+      if (totalTravelers > 1) {
+        // No ambiguity is acceptable here — guessing which of several
+        // travelers this photo belongs to is exactly the bug we're
+        // preventing. Callers on multi-traveler bookings must send an
+        // explicit travelerIndex (the PostBookingModal flow does).
+        return res.status(400).json({
+          success: false,
+          error: 'This booking has more than one traveler — travelerIndex is required.',
+        });
+      }
+      travelerIndex = 0; // single-traveler booking, no ambiguity possible
+    }
+
     if (travelerIndex >= totalTravelers) {
       return res.status(400).json({
         success: false,
@@ -873,7 +930,7 @@ export async function saveFacePhoto(req, res) {
     const travelerIndices = Array.from({ length: totalTravelers }, (_, i) => i);
     const { data: existingRows, error: existErr } = await supabaseAdmin
       .from('passport_verifications')
-      .select('traveler_index, verification_status')
+      .select('id, traveler_index, verification_status, full_name, given_names, surname, passport_number')
       .eq('user_id', userId)
       .eq('package_id', packageId)
       .in('traveler_index', travelerIndices);
@@ -889,19 +946,75 @@ export async function saveFacePhoto(req, res) {
       return res.status(500).json({ success: false, error: 'Could not verify booking. Please try again.' });
     }
 
-    const verifiedByIndex = new Map((existingRows || []).map((r) => [r.traveler_index, r.verification_status]));
-    const allVerified = travelerIndices.every((i) => ['verified', 'manual_review'].includes(verifiedByIndex.get(i)));
+    const rowsByIndex = new Map((existingRows || []).map((r) => [r.traveler_index, r]));
+    const allVerified = travelerIndices.every((i) => ['verified', 'manual_review'].includes(rowsByIndex.get(i)?.verification_status));
 
     if (!allVerified) {
       logger.warn('saveFacePhoto rejected — not every traveler on this booking has a verified passport', {
         userId, packageId, totalTravelers,
-        statuses: travelerIndices.map((i) => verifiedByIndex.get(i) || 'none'),
+        statuses: travelerIndices.map((i) => rowsByIndex.get(i)?.verification_status || 'none'),
       });
       return res.status(403).json({
         success: false,
         error: 'Please complete passport verification for every traveler on this booking before submitting your ID photo.',
       });
     }
+
+    // ── identity binding ──────────────────────────────────────────────────
+    // The client is expected to have shown the user this exact traveler's
+    // name/passport (from GET /api/onboarding/status → travelers[]) and had
+    // them explicitly confirm it before capturing/uploading a photo. It must
+    // echo back that record's id here as travelerVerificationId. If it's
+    // missing or doesn't match what's actually in the DB for this index —
+    // e.g. the booking's traveler list changed between page-load and
+    // upload, or the client is bypassing the confirmation UI — we refuse
+    // the write rather than silently attaching the photo to whichever
+    // record happens to sit at that index right now. This is what actually
+    // prevents "photo attached to the wrong traveler" on multi-traveler
+    // bookings; the travelerIndex bounds check above only prevents writing
+    // outside the booking entirely, not writing to the wrong slot within it.
+    const targetRow = rowsByIndex.get(travelerIndex);
+    if (!targetRow?.id) {
+      return res.status(409).json({
+        success: false,
+        error: 'This traveler\u2019s passport details were not found. Please refresh and try again.',
+      });
+    }
+    const claimedVerificationId = req.body?.travelerVerificationId;
+    if (totalTravelers > 1) {
+      // Multi-traveler booking: there IS a wrong-slot to attach to, so the
+      // client must prove it showed the user this exact record and had
+      // them confirm it (see PostBookingModal's identity confirmation
+      // card). No echo, or an echo that doesn't match what's actually in
+      // the DB right now, means we can't trust that the person looking at
+      // the camera is who this upload claims to be for.
+      if (!claimedVerificationId) {
+        return res.status(400).json({
+          success: false,
+          error: 'Missing traveler confirmation. Please confirm the traveler\u2019s identity before uploading a photo.',
+        });
+      }
+      if (String(claimedVerificationId) !== String(targetRow.id)) {
+        logger.warn('saveFacePhoto rejected — traveler confirmation mismatch', {
+          userId, packageId, travelerIndex, claimedVerificationId, actualId: targetRow.id,
+        });
+        return res.status(409).json({
+          success: false,
+          error: 'Traveler details for this slot have changed. Please refresh and confirm the correct traveler before uploading again.',
+        });
+      }
+    } else if (claimedVerificationId && String(claimedVerificationId) !== String(targetRow.id)) {
+      // Single-traveler booking with an echo that was sent anyway (e.g. a
+      // future FacePhotoModal update) but doesn't match — still reject,
+      // since a mismatch here means the client's view of the record is
+      // stale for some other reason.
+      return res.status(409).json({
+        success: false,
+        error: 'Traveler details have changed. Please refresh and try again.',
+      });
+    }
+
+    const targetName = targetRow.full_name || [targetRow.given_names, targetRow.surname].filter(Boolean).join(' ').trim() || null;
 
     // Upload to R2 (public-read, just the headshot — no PII baked in).
     const facePhoto = await uploadFacePhotoBuffer({
@@ -912,7 +1025,11 @@ export async function saveFacePhoto(req, res) {
       packageId,
     });
 
-    logger.info('Dedicated face photo uploaded', { userId, packageId, key: facePhoto.key });
+    logger.info('Dedicated face photo uploaded', {
+      userId, packageId, key: facePhoto.key, travelerIndex,
+      boundToVerificationId: targetRow.id,
+      boundToName: targetName, // audit trail: exactly who this photo was attached to
+    });
 
     // Patch only the targeted traveler's face photo fields.
     const patch = {
@@ -922,57 +1039,44 @@ export async function saveFacePhoto(req, res) {
       updated_at: new Date().toISOString(),
     };
 
+    // Update by primary key (targetRow.id), not just user/package/index —
+    // the id was already verified above to belong to userId+packageId+
+    // travelerIndex, and matching on it directly (rather than re-matching
+    // the same three columns again) removes any window in which a
+    // concurrent request could have changed which row sits at this index
+    // between the check above and this write.
     const { data: updatedRows, error: upErr } = await supabaseAdmin
       .from('passport_verifications')
       .update(patch)
+      .eq('id', targetRow.id)
       .eq('user_id', userId)
-      .eq('package_id', packageId)
-      .eq('traveler_index', travelerIndex)
       .select('id');
 
     if (upErr) {
-      if (parseMissingColumn(upErr) === 'traveler_index') {
-        return res.status(500).json({
-          success: false,
-          error: 'Database schema is missing traveler_index. Apply the multi-traveler onboarding migration first.',
-        });
-      }
-      logger.error('saveFacePhoto update failed', { error: upErr.message, userId, packageId });
+      logger.error('saveFacePhoto update failed', { error: upErr.message, userId, packageId, travelerIndex });
       return res.status(500).json({ success: false, error: 'Could not save photo. Please try again.' });
     }
 
     if (!updatedRows?.length) {
-      const insertRow = {
-        user_id: userId,
-        package_id: packageId,
-        booking_id: booking.id,
-        traveler_index: travelerIndex,
-        face_photo_url: facePhoto.url,
-        face_photo_key: facePhoto.key,
-      };
-
-      const { error: insertErr } = await supabaseAdmin
-        .from('passport_verifications')
-        .insert(insertRow);
-
-      if (insertErr) {
-        if (parseMissingColumn(insertErr) === 'traveler_index') {
-          return res.status(500).json({
-            success: false,
-            error: 'Database schema is missing traveler_index. Apply the multi-traveler onboarding migration first.',
-          });
-        }
-        logger.error('saveFacePhoto insert failed', { error: insertErr.message, userId, packageId, travelerIndex });
-        return res.status(500).json({ success: false, error: 'Could not save photo. Please try again.' });
-      }
+      // Row disappeared between the check and the write (e.g. deleted
+      // concurrently) — do not fall back to inserting a fresh row here,
+      // since that would silently create an unconfirmed identity slot and
+      // defeat the whole point of the check above.
+      logger.error('saveFacePhoto: confirmed row vanished before update', { userId, packageId, travelerIndex, verificationId: targetRow.id });
+      return res.status(409).json({
+        success: false,
+        error: 'Traveler details changed while saving. Please refresh and try again.',
+      });
     }
 
     return res.json({
       success: true,
       bookingId: booking.id,
       travelerIndex,
+      travelerVerificationId: targetRow.id,
+      travelerName: targetName,
       facePhotoUrl: facePhoto.url,
-      message: 'Face photo saved successfully.',
+      message: `Photo saved for ${targetName || 'this traveler'}.`,
     });
   } catch (err) {
     logger.error('saveFacePhoto unexpected error', { error: err.message, userId });

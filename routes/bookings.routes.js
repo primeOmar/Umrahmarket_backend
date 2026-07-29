@@ -2,6 +2,7 @@
 import express from 'express';
 import { supabaseAdmin } from '../config/supabase.js';
 import { requireAuth } from '../middleware/auth.middleware.js';
+import { sendBookingReceiptEmail } from '../services/bookingReceipt.service.js';
 
 const router = express.Router();
 
@@ -209,6 +210,57 @@ router.get('/agent-clients', requireAuth, async (req, res) => {
     return res.json({ success: true, clients });
   } catch (err) {
     console.error('[getAgentClients] Unexpected error:', err.message);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// POST /api/bookings/:id/resend-receipt
+// Sends booking receipt email again for the authenticated booking owner.
+router.post('/:id/resend-receipt', requireAuth, async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    const bookingId = req.params.id;
+    if (!userId) return res.status(401).json({ success: false, message: 'Unauthorised' });
+    if (!bookingId) return res.status(400).json({ success: false, message: 'booking id is required' });
+
+    const { data: booking, error: bookErr } = await supabaseAdmin
+      .from('bookings')
+      .select('id, user_id, payment_id')
+      .eq('id', bookingId)
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (bookErr || !booking) {
+      return res.status(404).json({ success: false, message: 'Booking not found' });
+    }
+
+    if (!booking.payment_id) {
+      return res.status(422).json({ success: false, message: 'Booking has no payment record yet' });
+    }
+
+    const result = await sendBookingReceiptEmail({
+      paymentId: booking.payment_id,
+      bookingId: booking.id,
+      force: true,
+    });
+
+    if (!result?.success) {
+      return res.status(422).json({
+        success: false,
+        message: 'Receipt email not sent',
+        reason: result?.reason || 'unknown',
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: `Receipt email sent to ${result.recipient}`,
+      recipient: result.recipient,
+      messageId: result.messageId || null,
+      reason: result.reason || null,
+    });
+  } catch (err) {
+    console.error('[resend-receipt] Unexpected error:', err.message);
     return res.status(500).json({ success: false, message: 'Server error' });
   }
 });
