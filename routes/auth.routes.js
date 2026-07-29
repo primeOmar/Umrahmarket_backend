@@ -1,7 +1,9 @@
 import express from 'express';
+import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
 import { supabase, supabaseAdmin } from '../config/supabase.js';
 import config from '../config/security.config.js';
+import { sendVerificationEmail } from '../services/email.service.js';
 import logger, { 
   logAuthAttempt, 
   logSecurityEvent,
@@ -92,6 +94,46 @@ const recordFailedLogin = (email, ip) => {
 
 const resetLoginAttempts = (email) => {
   loginAttempts.delete(email);
+};
+
+// ===========================================
+// Email Confirmation Helpers
+// ===========================================
+// Independent of Supabase Auth's own "confirm email" mechanism — we
+// auto-confirm the Supabase side (see registration handlers) so login is
+// never blocked by an unclicked link, and track our own verification state
+// on `profiles.email_verified`, gated by a hashed, expiring token.
+const EMAIL_VERIFY_TOKEN_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const EMAIL_VERIFY_RESEND_COOLDOWN_MS = 60 * 1000; // 60 seconds between resends
+
+const hashToken = (rawToken) => crypto.createHash('sha256').update(rawToken).digest('hex');
+
+// Generates a fresh verification token, stores its hash on the profile, and
+// fires off the branded confirmation email. Never throws — email delivery
+// failures are logged but must not block registration/login.
+const issueVerificationEmail = async ({ userId, email, firstName }) => {
+  try {
+    const rawToken = crypto.randomBytes(32).toString('hex');
+
+    const { error } = await supabaseAdmin
+      .from('profiles')
+      .update({
+        email_verify_token_hash: hashToken(rawToken),
+        email_verify_expires_at: new Date(Date.now() + EMAIL_VERIFY_TOKEN_TTL_MS).toISOString(),
+        email_verify_last_sent_at: new Date().toISOString(),
+      })
+      .eq('id', userId);
+
+    if (error) {
+      logger.error('Failed to store email verification token', { error: error.message, userId });
+      return;
+    }
+
+    const verifyUrl = `${config.cors.allowedOrigins[0]}/verify-email?token=${rawToken}`;
+    await sendVerificationEmail({ to: email, firstName, verifyUrl });
+  } catch (err) {
+    logger.error('Failed to send verification email', { error: err.message, userId, email });
+  }
 };
 
 // ===========================================
@@ -189,6 +231,11 @@ router.post(
         email,
         ip: req.ip,
       });
+
+      // ── Send confirmation email ─────────────────────────────────────
+      // Fire-and-forget: registration must stay fast, and email delivery
+      // failures shouldn't block a client from getting into the app.
+      issueVerificationEmail({ userId: authData.user.id, email, firstName });
 
       // ── Establish a real session immediately ──────────────────────────
       // The frontend treats a successful registration as an instant login
@@ -323,9 +370,9 @@ router.post(
             role: 'agent', approved: false,
             createdAt: new Date().toISOString(),
           },
-          emailRedirectTo: process.env.NODE_ENV === 'development' 
-            ? undefined 
-            : `${config.cors.allowedOrigins[0]}/verify-email`,
+          // No emailRedirectTo — we no longer rely on Supabase's own
+          // confirmation email/template. Our own branded email (below)
+          // handles confirmation via profiles.email_verified instead.
         },
       });
 
@@ -339,6 +386,20 @@ router.post(
         return res.status(400).json({
           success: false,
           error: authError.message,
+        });
+      }
+
+      // Auto-confirm on the Supabase Auth side so login is never blocked by
+      // an unclicked Supabase confirmation link — our own email_verified
+      // flag (sent via issueVerificationEmail below) tracks confirmation.
+      const { error: agentConfirmError } = await supabaseAdmin.auth.admin.updateUserById(
+        authData.user.id,
+        { email_confirm: true },
+      );
+      if (agentConfirmError) {
+        logger.error('Failed to auto-confirm new agent email at Supabase level', {
+          error: agentConfirmError.message,
+          userId: authData.user.id,
         });
       }
       
@@ -390,7 +451,12 @@ router.post(
         agentNumber,
         ip: req.ip,
       });
-      
+
+      // ── Send confirmation email ─────────────────────────────────────
+      // Fire-and-forget — same as client registration. Independent of the
+      // separate admin-approval workflow (approved: false above).
+      issueVerificationEmail({ userId: authData.user.id, email, firstName });
+
       res.status(201).json({
         success: true,
         message: 'Registration successful. Your account is pending approval. You will receive an email once approved.',
@@ -468,7 +534,7 @@ router.post(
       // at login time (Supabase sync lag) and causes the dummy-user bug
       let { data: profile, error: profileError } = await supabaseAdmin
         .from('profiles')
-        .select('role, agent_number, company_name, first_name, last_name, approved')
+        .select('role, agent_number, company_name, first_name, last_name, approved, email_verified')
         .eq('id', data.user.id)
         .maybeSingle(); // ← never throws on 0 rows (unlike .single())
 
@@ -498,9 +564,10 @@ router.post(
             phone:      meta.phone || null,
             role:       meta.role || 'client',
             approved:   meta.approved ?? true,
+            email_verified: true, // legacy/pre-existing account — don't retroactively nag
             created_at: new Date().toISOString(),
           }, { onConflict: 'id' })
-          .select('role, agent_number, company_name, first_name, last_name, approved')
+          .select('role, agent_number, company_name, first_name, last_name, approved, email_verified')
           .single();
 
         if (createError || !created) {
@@ -551,6 +618,7 @@ router.post(
             firstName: profile.first_name,
             lastName: profile.last_name,
             approved: profile.approved,
+            emailVerified: profile.email_verified ?? false,
             ...(userRole === 'agent' && {
               agentNumber: profile.agent_number || null,
               agentName:   profile.company_name || null,
@@ -622,9 +690,10 @@ router.post('/google', authRateLimiter, async (req, res) => {
           last_name:  nameParts.slice(1).join(' ') || '',
           role:       meta.role || 'client',
           approved:   true,
+          email_verified: true, // Google already verified this address
           created_at: new Date().toISOString(),
         }, { onConflict: 'id' })
-        .select('role, agent_number, company_name, first_name, last_name, approved')
+        .select('role, agent_number, company_name, first_name, last_name, approved, email_verified')
         .single();
 
       if (googleProfileError) {
@@ -675,6 +744,7 @@ router.post('/google', authRateLimiter, async (req, res) => {
           firstName: dbProfile?.first_name || '',
           lastName:  dbProfile?.last_name || '',
           approved:  dbProfile?.approved ?? true,
+          emailVerified: dbProfile?.email_verified ?? true,
           ...(googleRole === 'agent' && {
             agentNumber: dbProfile?.agent_number || null,
             agentName:   dbProfile?.company_name || null,
@@ -879,22 +949,63 @@ router.post(
 // ===========================================
 // 9. VERIFY EMAIL
 // ===========================================
-router.post('/verify-email', async (req, res) => {
+router.post('/verify-email', authRateLimiter, async (req, res) => {
   try {
     const { token } = req.body;
-    
-    const { error } = await supabase.auth.verifyOtp({
-      token_hash: token,
-      type: 'email',
-    });
-    
-    if (error) {
+
+    if (!token || typeof token !== 'string') {
+      return res.status(400).json({ success: false, error: 'A verification token is required' });
+    }
+
+    const tokenHash = hashToken(token);
+
+    const { data: profile, error: lookupError } = await supabaseAdmin
+      .from('profiles')
+      .select('id, email_verified, email_verify_expires_at')
+      .eq('email_verify_token_hash', tokenHash)
+      .maybeSingle();
+
+    if (lookupError) {
+      logger.error('Email verification lookup failed', { error: lookupError.message });
+      return res.status(500).json({ success: false, error: 'Email verification failed. Please try again.' });
+    }
+
+    if (!profile) {
       return res.status(400).json({
         success: false,
-        error: error.message,
+        error: 'This verification link is invalid. Please request a new one.',
+        code: 'INVALID_TOKEN',
       });
     }
-    
+
+    if (profile.email_verified) {
+      return res.json({ success: true, message: 'Email already verified' });
+    }
+
+    if (!profile.email_verify_expires_at || new Date(profile.email_verify_expires_at) < new Date()) {
+      return res.status(400).json({
+        success: false,
+        error: 'This verification link has expired. Please request a new one.',
+        code: 'EXPIRED_TOKEN',
+      });
+    }
+
+    const { error: updateError } = await supabaseAdmin
+      .from('profiles')
+      .update({
+        email_verified: true,
+        email_verify_token_hash: null,
+        email_verify_expires_at: null,
+      })
+      .eq('id', profile.id);
+
+    if (updateError) {
+      logger.error('Failed to mark email as verified', { error: updateError.message, userId: profile.id });
+      return res.status(500).json({ success: false, error: 'Email verification failed. Please try again.' });
+    }
+
+    logSecurityEvent('Email verified', { userId: profile.id, ip: req.ip });
+
     res.json({
       success: true,
       message: 'Email verified successfully',
@@ -913,14 +1024,72 @@ router.post('/verify-email', async (req, res) => {
 });
 
 // ===========================================
+// 9b. RESEND VERIFICATION EMAIL
+// ===========================================
+router.post('/verify-email/resend', authRateLimiter, validateEmail, async (req, res) => {
+  // Always return the same generic message whether or not the account
+  // exists / is already verified — avoids leaking which emails are
+  // registered (same pattern as password-reset/request below).
+  const genericResponse = () =>
+    res.json({
+      success: true,
+      message: 'If an account with this email exists and needs verification, a new link has been sent.',
+    });
+
+  try {
+    const { email } = req.body;
+
+    const { data: profile, error: lookupError } = await supabaseAdmin
+      .from('profiles')
+      .select('id, first_name, email_verified, email_verify_last_sent_at')
+      .eq('email', email)
+      .maybeSingle();
+
+    if (lookupError) {
+      logger.error('Resend verification lookup failed', { error: lookupError.message });
+      return genericResponse();
+    }
+
+    if (!profile || profile.email_verified) {
+      return genericResponse();
+    }
+
+    const lastSent = profile.email_verify_last_sent_at ? new Date(profile.email_verify_last_sent_at).getTime() : 0;
+    if (Date.now() - lastSent < EMAIL_VERIFY_RESEND_COOLDOWN_MS) {
+      return genericResponse(); // silently swallow rapid re-clicks rather than erroring
+    }
+
+    await issueVerificationEmail({ userId: profile.id, email, firstName: profile.first_name });
+
+    logSecurityEvent('Verification email resent', { userId: profile.id, ip: req.ip });
+
+    return genericResponse();
+  } catch (error) {
+    logger.error('Resend verification error', { error: error.message, ip: req.ip });
+    return genericResponse();
+  }
+});
+
+// ===========================================
 // 10. GET CURRENT USER
 // ===========================================
 router.get('/me', verifyToken, async (req, res) => {
   try {
+    // Fetch fresh so emailVerified (and other fast-changing flags) reflect
+    // the current DB state rather than whatever was baked into the JWT.
+    const { data: profile } = await supabaseAdmin
+      .from('profiles')
+      .select('email_verified')
+      .eq('id', req.user?.id || req.userId)
+      .maybeSingle();
+
     res.json({
       success: true,
       data: {
-        user: req.user,
+        user: {
+          ...req.user,
+          emailVerified: profile?.email_verified ?? req.user?.emailVerified ?? false,
+        },
       },
     });
   } catch (error) {
