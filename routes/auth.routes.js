@@ -989,7 +989,7 @@ router.post('/verify-email', authRateLimiter, async (req, res) => {
 
     const { data: profile, error: lookupError } = await supabaseAdmin
       .from('profiles')
-      .select('id, email_verified, email_verify_expires_at')
+      .select('id, role, email_verified, email_verify_expires_at')
       .eq('email_verify_token_hash', tokenHash)
       .maybeSingle();
 
@@ -1007,7 +1007,7 @@ router.post('/verify-email', authRateLimiter, async (req, res) => {
     }
 
     if (profile.email_verified) {
-      return res.json({ success: true, message: 'Email already verified' });
+      return res.json({ success: true, message: 'Email already verified', role: profile.role });
     }
 
     if (!profile.email_verify_expires_at || new Date(profile.email_verify_expires_at) < new Date()) {
@@ -1037,6 +1037,7 @@ router.post('/verify-email', authRateLimiter, async (req, res) => {
     res.json({
       success: true,
       message: 'Email verified successfully',
+      role: profile.role,
     });
   } catch (error) {
     logger.error('Email verification error', {
