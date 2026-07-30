@@ -45,6 +45,27 @@ export const verifyEmailTransport = async () => {
 const FROM_NAME = process.env.EMAIL_FROM_NAME || 'UmrahMarket';
 const FROM_ADDRESS = process.env.EMAIL_FROM_ADDRESS || process.env.SMTP_USER;
 
+// ── Logo ─────────────────────────────────────────────────────────────────
+// Email clients render this HTML with no "current page" to resolve a
+// relative path against, so this needs one full, publicly-reachable URL.
+//
+// IMPORTANT: Header.jsx imports the logo via `import logoImage from
+// '../assets/umramarket.png'` — a JS import, not a public/ file — so Vite
+// content-hashes it at build time (e.g. /assets/umramarket-a1b2c3.png,
+// which changes every deploy). That path can't be hardcoded here. Instead,
+// place a copy of the same file at frontend/public/umramarket.png so it's
+// served at a fixed, unhashed URL. Override via EMAIL_LOGO_URL if the
+// deployed filename/path differs.
+// NOTE: keep this a PNG/JPG, not SVG — Outlook and most webmail clients
+// don't render inline SVG.
+const FRONTEND_BASE_URL_FOR_ASSETS = (
+  process.env.FRONTEND_URL ||
+  process.env.APP_URL ||
+  process.env.WEB_APP_URL ||
+  'https://umrahmarket.net'
+).replace(/\/$/, '');
+const LOGO_URL = process.env.EMAIL_LOGO_URL || `${FRONTEND_BASE_URL_FOR_ASSETS}/umramarket.png`;
+
 // ===========================================
 // Brand shell — matches the emerald/teal UmrahMarket palette used across
 // the app's dashboards. Kept as inline styles/tables for email-client safety.
@@ -64,8 +85,13 @@ const brandShell = ({ preheader, bodyHtml }) => `
       <td align="center">
         <table role="presentation" width="100%" style="max-width:480px;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 1px 3px rgba(16,24,40,0.08);">
           <tr>
-            <td style="background:linear-gradient(135deg,#10b981,#0d9488);padding:28px 32px;">
-              <span style="color:#ffffff;font-size:20px;font-weight:700;letter-spacing:-0.02em;">UmrahMarket</span>
+            <td style="background:linear-gradient(135deg,#10b981,#0d9488);padding:24px 32px;">
+              <img
+                src="${LOGO_URL}"
+                alt="UmrahMarket"
+                width="140"
+                style="display:block;height:auto;max-width:140px;border:0;outline:none;text-decoration:none;color:#ffffff;font-size:20px;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;"
+              />
             </td>
           </tr>
           <tr>
