@@ -456,6 +456,37 @@ router.post(
       // separate admin-approval workflow (approved: false above).
       issueVerificationEmail({ userId: authData.user.id, email, firstName });
 
+      // ── Establish a real app session immediately ───────────────────────
+      // BUG FIX: this route used to return without ever calling res.cookie()
+      // or generating tokens, while the frontend unconditionally redirected
+      // new agents to /agent/dashboard as if they were logged in. Every
+      // subsequent dashboard call (getMe, getagentpackages, conversations,
+      // agent-clients, agent-documents/status) then hit verifyToken with no
+      // access_token cookie, got 401 "User not found", and the frontend's
+      // 401 handler treated that as an expired session and bounced them back
+      // to "/". Mint the same cookie-based session client registration and
+      // login use, so `approved: false` only gates package-posting /
+      // approval-specific features server-side — not basic dashboard access.
+      const accessToken = generateAccessToken(authData.user.id, 'agent', authData.user.email);
+      const refreshToken = generateRefreshToken(authData.user.id, 'agent', authData.user.email);
+
+      const isProd = process.env.NODE_ENV === 'production';
+      const cookieOpts = {
+        httpOnly: true,
+        secure: isProd,
+        sameSite: isProd ? 'none' : 'lax',
+      };
+
+      res.cookie('access_token', accessToken, {
+        ...cookieOpts,
+        maxAge: 15 * 60 * 1000,
+      });
+
+      res.cookie('refresh_token', refreshToken, {
+        ...cookieOpts,
+        maxAge: 7 * 24 * 60 * 60 * 1000,
+      });
+
       res.status(201).json({
         success: true,
         message: 'Registration successful. Your account is pending approval. You will receive an email once approved.',
@@ -470,6 +501,9 @@ router.post(
             agentNumber,
             agentName: companyName,
           },
+          accessToken,
+          refreshToken,
+          emailVerified: false,
         },
       });
     } catch (error) {
