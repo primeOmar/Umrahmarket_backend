@@ -989,7 +989,7 @@ router.post('/verify-email', authRateLimiter, async (req, res) => {
 
     const { data: profile, error: lookupError } = await supabaseAdmin
       .from('profiles')
-      .select('id, role, email_verified, email_verify_expires_at')
+      .select('id, email, first_name, last_name, role, approved, agent_number, company_name, email_verified, email_verify_expires_at')
       .eq('email_verify_token_hash', tokenHash)
       .maybeSingle();
 
@@ -1006,8 +1006,55 @@ router.post('/verify-email', authRateLimiter, async (req, res) => {
       });
     }
 
+    // ── Mint a real session for the browser confirming the email ───────────
+    // Verifying doesn't imply this browser is already logged in — the link
+    // is very often opened on a different device/browser than the one that
+    // registered. Without cookies + a stored user here, the post-verify
+    // redirect to /agent/dashboard or /client/dashboard gets bounced back to
+    // "/" by ProtectedAgentRoute/ProtectedClientRoute, which require a
+    // matching user in localStorage. Same cookie shape as /login and
+    // /register/* so the dashboard route guards succeed either way.
+    const mintSession = () => {
+      const accessToken = generateAccessToken(profile.id, profile.role, profile.email);
+      const refreshToken = generateRefreshToken(profile.id, profile.role, profile.email);
+
+      const isProd = process.env.NODE_ENV === 'production';
+      const cookieOpts = {
+        httpOnly: true,
+        secure: isProd,
+        sameSite: isProd ? 'none' : 'lax',
+      };
+
+      res.cookie('access_token', accessToken, { ...cookieOpts, maxAge: 15 * 60 * 1000 });
+      res.cookie('refresh_token', refreshToken, { ...cookieOpts, maxAge: 7 * 24 * 60 * 60 * 1000 });
+
+      return {
+        accessToken,
+        refreshToken,
+        user: {
+          id: profile.id,
+          email: profile.email,
+          role: profile.role,
+          firstName: profile.first_name,
+          lastName: profile.last_name,
+          approved: profile.approved,
+          emailVerified: true,
+          ...(profile.role === 'agent' && {
+            agentNumber: profile.agent_number || null,
+            agentName: profile.company_name || null,
+          }),
+        },
+      };
+    };
+
     if (profile.email_verified) {
-      return res.json({ success: true, message: 'Email already verified', role: profile.role });
+      const session = mintSession();
+      return res.json({
+        success: true,
+        message: 'Email already verified',
+        role: profile.role,
+        ...session,
+      });
     }
 
     if (!profile.email_verify_expires_at || new Date(profile.email_verify_expires_at) < new Date()) {
@@ -1034,10 +1081,13 @@ router.post('/verify-email', authRateLimiter, async (req, res) => {
 
     logSecurityEvent('Email verified', { userId: profile.id, ip: req.ip });
 
+    const session = mintSession();
+
     res.json({
       success: true,
       message: 'Email verified successfully',
       role: profile.role,
+      ...session,
     });
   } catch (error) {
     logger.error('Email verification error', {
