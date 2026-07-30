@@ -56,26 +56,23 @@ async function _fetchRate() {
     try {
       const result = await fn();
       cache = { rate: result.rate, fetchedAt: Date.now(), source: result.source };
-      console.info(`[FX] USD/KES = ${result.rate} via ${result.source}`);
+      
       return { rate: result.rate, source: result.source, cached: false };
     } catch (err) {
-      console.warn(`[FX] Source failed: ${err.message}`);
+      
     }
   }
 
   if (cache.rate) {
     const ageMin = Math.round((Date.now() - cache.fetchedAt) / 60_000);
-    console.warn(`[FX] All sources failed — stale cache: ${cache.rate} (${ageMin}m old)`);
+    
     return { rate: cache.rate, source: `${cache.source}:stale`, cached: true };
   }
 
   // No live source and no cache (e.g. fresh cold-start instance). Never
   // throw here — a checkout must not 500 because an FX API hiccupped.
   // Use the static fallback and log loudly so it's visible in Render logs.
-  console.error(
-    `[FX] ALL sources failed and no cache exists — using static fallback rate ${FALLBACK_RATE}. ` +
-    `Check network egress / API status ASAP, this rate will not reflect the live market.`
-  );
+  
   return { rate: FALLBACK_RATE, source: 'static-fallback', cached: false };
 }
 

@@ -108,6 +108,29 @@ const EMAIL_VERIFY_RESEND_COOLDOWN_MS = 60 * 1000; // 60 seconds between resends
 
 const hashToken = (rawToken) => crypto.createHash('sha256').update(rawToken).digest('hex');
 
+const getFrontendBaseUrl = () => {
+  const explicit = (
+    process.env.FRONTEND_URL ||
+    process.env.APP_URL ||
+    process.env.WEB_APP_URL ||
+    ''
+  ).trim();
+
+  if (explicit) return explicit.replace(/\/$/, '');
+
+  const origins = (config.cors.allowedOrigins || []).map((o) => String(o).trim()).filter(Boolean);
+  if (!origins.length) return 'http://localhost:5173';
+
+  if (process.env.NODE_ENV === 'production') {
+    const nonLocal = origins.find((o) => !/localhost|127\.0\.0\.1/i.test(o));
+    if (nonLocal) return nonLocal.replace(/\/$/, '');
+  }
+
+  return origins[0].replace(/\/$/, '');
+};
+
+const FRONTEND_BASE_URL = getFrontendBaseUrl();
+
 // Generates a fresh verification token, stores its hash on the profile, and
 // fires off the branded confirmation email. Never throws — email delivery
 // failures are logged but must not block registration/login.
@@ -129,7 +152,7 @@ const issueVerificationEmail = async ({ userId, email, firstName }) => {
       return;
     }
 
-    const verifyUrl = `${config.cors.allowedOrigins[0]}/verify-email?token=${rawToken}`;
+    const verifyUrl = `${FRONTEND_BASE_URL}/verify-email?token=${rawToken}`;
     await sendVerificationEmail({ to: email, firstName, verifyUrl });
   } catch (err) {
     logger.error('Failed to send verification email', { error: err.message, userId, email });
@@ -173,7 +196,7 @@ router.post(
       };
 
       if (process.env.NODE_ENV !== 'development') {
-        signUpOptions.emailRedirectTo = `${config.cors.allowedOrigins[0]}/verify-email`;
+        signUpOptions.emailRedirectTo = `${FRONTEND_BASE_URL}/verify-email`;
       }
 
       const { data: authData, error: authError } = await supabase.auth.signUp({
@@ -237,13 +260,11 @@ router.post(
       // failures shouldn't block a client from getting into the app.
       issueVerificationEmail({ userId: authData.user.id, email, firstName });
 
-      // ── Establish a real session immediately ──────────────────────────
-      // The frontend treats a successful registration as an instant login
-      // and sends the client straight into the booking flow — so it needs
-      // real tokens back here, not just a user record. signUp() above
-      // withholds a session until the email-confirmation link is clicked,
-      // so mark the account confirmed via the admin API and sign in
-      // server-side to get one now.
+      // ── Establish a real app session immediately ───────────────────────
+      // Registration should behave like login in this app, so we mint the
+      // same backend JWT token types used by /auth/login and /auth/refresh.
+      // This avoids refresh-token format mismatches (Supabase token vs app JWT)
+      // that can otherwise cause an immediate "session expired" logout.
       const { error: confirmError } = await supabaseAdmin.auth.admin.updateUserById(
         authData.user.id,
         { email_confirm: true },
@@ -253,47 +274,27 @@ router.post(
           error: confirmError.message,
           userId: authData.user.id,
         });
-        // Account exists but couldn't be auto-confirmed — fail closed to
-        // login-required rather than silently leaving them unauthenticated.
-        return res.status(201).json({
-          success: true,
-          message: 'Registration successful. Please log in to continue.',
-          data: {
-            user: {
-              id: authData.user.id,
-              email: authData.user.email,
-              firstName,
-              lastName,
-              role: 'client',
-            },
-          },
-        });
       }
 
-      const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({
-        email,
-        password,
+      const accessToken = generateAccessToken(authData.user.id, 'client', authData.user.email);
+      const refreshToken = generateRefreshToken(authData.user.id, 'client', authData.user.email);
+
+      const isProd = process.env.NODE_ENV === 'production';
+      const cookieOpts = {
+        httpOnly: true,
+        secure: isProd,
+        sameSite: isProd ? 'none' : 'lax',
+      };
+
+      res.cookie('access_token', accessToken, {
+        ...cookieOpts,
+        maxAge: 15 * 60 * 1000,
       });
 
-      if (signInError || !signInData?.session) {
-        logger.error('Failed to sign in new client after registration', {
-          error: signInError?.message,
-          userId: authData.user.id,
-        });
-        return res.status(201).json({
-          success: true,
-          message: 'Registration successful. Please log in to continue.',
-          data: {
-            user: {
-              id: authData.user.id,
-              email: authData.user.email,
-              firstName,
-              lastName,
-              role: 'client',
-            },
-          },
-        });
-      }
+      res.cookie('refresh_token', refreshToken, {
+        ...cookieOpts,
+        maxAge: 7 * 24 * 60 * 60 * 1000,
+      });
 
       res.status(201).json({
         success: true,
@@ -306,8 +307,9 @@ router.post(
             lastName,
             role: 'client',
           },
-          accessToken:  signInData.session.access_token,
-          refreshToken: signInData.session.refresh_token,
+          accessToken,
+          refreshToken,
+          emailVerified: false,
         },
       });
     } catch (error) {
@@ -334,9 +336,6 @@ router.post(
   validateAgentRegistration,
   async (req, res) => {
     try {
-      if (process.env.NODE_ENV === 'development') {
-        console.log('Agent registration body:', JSON.stringify(req.body, null, 2));
-      }
       const { 
         email,
         password, 
@@ -658,15 +657,10 @@ router.post('/google', authRateLimiter, async (req, res) => {
       });
     }
 
-    console.log('[Google Auth] Received idToken, length:', idToken.length);
-
     const { data, error } = await supabase.auth.signInWithIdToken({
       provider: 'google',
       token: idToken,
     });
-
-    console.log('[Google Auth] Supabase error:', error);
-    console.log('[Google Auth] Supabase data:', data?.user?.id);
 
     if (error) {
       logger.error('Google login failed', { error: error.message, code: error.code, ip: req.ip });
@@ -874,7 +868,7 @@ router.post(
       const { email } = req.body;
       
       const { error } = await supabase.auth.resetPasswordForEmail(email, {
-        redirectTo: `${config.cors.allowedOrigins[0]}/reset-password`,
+        redirectTo: `${FRONTEND_BASE_URL}/reset-password`,
       });
       
       if (error) {

@@ -16,7 +16,7 @@ const recoverMissingBookings = async (userId) => {
     .not('payment_id', 'is', null);
 
   if (existingErr) {
-    console.error('[recoverMissingBookings] Existing bookings load failed:', existingErr.message);
+    
     return;
   }
 
@@ -60,7 +60,9 @@ const recoverMissingBookings = async (userId) => {
     .from('bookings')
     .upsert(bookingRecords, { onConflict: 'payment_id', ignoreDuplicates: true });
 
-  if (insertErr) console.error('[recoverMissingBookings] Insert failed:', insertErr.message);
+  if (insertErr) {
+    // Recovery is best-effort and should not fail request paths.
+  }
 };
 
 // GET /api/bookings/my
@@ -69,9 +71,7 @@ router.get('/my', requireAuth, async (req, res) => {
     const userId = req.user?.id;
     if (!userId) return res.status(401).json({ success: false, message: 'Unauthorised' });
 
-    recoverMissingBookings(userId).catch(err =>
-      console.error('[getMyBookings] Background recovery failed:', err)
-    );
+    recoverMissingBookings(userId).catch(() => {});
 
     const { data: rawBookings, error: bookingsError } = await supabaseAdmin
       .from('bookings')
@@ -107,7 +107,7 @@ router.get('/my', requireAuth, async (req, res) => {
 
     return res.json({ success: true, bookings: bookingsWithDetails, count: bookingsWithDetails.length });
   } catch (err) {
-    console.error('[getMyBookings] Unexpected error:', err.message);
+    
     return res.status(500).json({ success: false, message: 'Server error' });
   }
 });
@@ -165,7 +165,7 @@ router.get('/agent-clients', requireAuth, async (req, res) => {
     if (passErr) {
       // Don't fail the whole dashboard if this lookup has a problem —
       // clients just show as unverified, same as before this fix existed.
-      console.error('[getAgentClients] passport_verifications lookup failed:', passErr.message);
+      
     }
 
     const passportMap = Object.fromEntries(
@@ -209,7 +209,7 @@ router.get('/agent-clients', requireAuth, async (req, res) => {
 
     return res.json({ success: true, clients });
   } catch (err) {
-    console.error('[getAgentClients] Unexpected error:', err.message);
+    
     return res.status(500).json({ success: false, message: 'Server error' });
   }
 });
@@ -260,7 +260,7 @@ router.post('/:id/resend-receipt', requireAuth, async (req, res) => {
       reason: result.reason || null,
     });
   } catch (err) {
-    console.error('[resend-receipt] Unexpected error:', err.message);
+    
     return res.status(500).json({ success: false, message: 'Server error' });
   }
 });

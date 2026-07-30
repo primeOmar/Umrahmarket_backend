@@ -49,7 +49,7 @@ export const saveItinerary = async (req, res) => {
     .eq('id', id);
 
   if (updateErr) {
-    console.error('[saveItinerary]', updateErr);
+    
     return res.status(500).json({ success: false, message: 'Failed to save itinerary.' });
   }
 

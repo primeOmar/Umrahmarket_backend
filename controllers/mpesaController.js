@@ -34,7 +34,7 @@ export const initiate = async (req, res) => {
     const missingEnv = ['MPESA_CONSUMER_KEY', 'MPESA_CONSUMER_SECRET', 'MPESA_SHORTCODE', 'MPESA_PASSKEY', 'MPESA_CALLBACK_URL']
       .filter(k => !process.env[k]);
     if (missingEnv.length) {
-      console.error('[M-Pesa initiate] Missing required env vars:', missingEnv.join(', '));
+      
       return res.status(500).json({ success: false, message: 'Payment provider misconfigured. Contact support.' });
     }
 
@@ -46,7 +46,7 @@ export const initiate = async (req, res) => {
       .maybeSingle();
 
     if (pkgErr) {
-      console.error('[M-Pesa initiate] Package fetch error:', pkgErr.message);
+      
       return res.status(500).json({ success: false, message: 'Failed to fetch package details' });
     }
     if (!pkg) {
@@ -77,7 +77,7 @@ export const initiate = async (req, res) => {
       rate = await getUsdKesRate();
       if (!rate || isNaN(rate) || rate <= 0) throw new Error(`Invalid rate returned: ${rate}`);
     } catch (fxErr) {
-      console.error('[M-Pesa initiate] FX rate fetch failed, using static fallback:', fxErr.message);
+      
       rate = KES_RATE; // module-level fallback, defined at top of file
     }
     const amountKes = usdToKes(priceUSD, rate);
@@ -92,7 +92,7 @@ export const initiate = async (req, res) => {
       .maybeSingle();
 
     if (bookingErr) {
-      console.error('[M-Pesa initiate] Booking check error:', bookingErr.message);
+      
       return res.status(500).json({ success: false, message: 'Failed to verify booking status' });
     }
 
@@ -116,7 +116,7 @@ export const initiate = async (req, res) => {
       .in('traveler_index', travelerIndices);
 
     if (passportErr) {
-      console.error('[M-Pesa initiate] Passport verification check error:', passportErr.message);
+      
       return res.status(500).json({ success: false, message: 'Failed to verify passport status' });
     }
 
@@ -167,7 +167,7 @@ export const initiate = async (req, res) => {
         description: `Umrah Package (${totalTravelers} traveler${totalTravelers === 1 ? '' : 's'})`,
       });
     } catch (darajaErr) {
-      console.error('[M-Pesa initiate] Daraja STK push failed:', darajaErr.message);
+      
       return res.status(502).json({ success: false, message: `M-Pesa error: ${darajaErr.message}` });
     }
 
@@ -175,7 +175,7 @@ export const initiate = async (req, res) => {
     const merchantRequestId = darajaRes.MerchantRequestID ?? darajaRes.merchantRequestId;
 
     if (!checkoutRequestId) {
-      console.error('[M-Pesa initiate] No checkoutRequestId in Daraja response:', JSON.stringify(darajaRes));
+      
       return res.status(502).json({ success: false, message: 'Invalid M-Pesa response — please try again.' });
     }
 
@@ -199,18 +199,18 @@ export const initiate = async (req, res) => {
       });
 
     if (insertErr) {
-      console.error('[M-Pesa initiate] DB insert failed:', insertErr.message, insertErr.details);
+      
       return res.status(500).json({
         success: false,
         message: 'Payment prompt sent but could not be recorded. Contact support if you are charged.',
       });
     }
 
-    console.info(`[M-Pesa] STK sent → ${maskPhone(phone)} | pkg: ${packageId} | checkout: ${checkoutRequestId} | rate: ${rate} | KES: ${amountKes}`);
+    
     return res.json({ success: true, checkoutRequestId });
 
   } catch (err) {
-    console.error('[M-Pesa initiate] Unexpected error:', err.message, err.stack);
+    
     return res.status(500).json({ success: false, message: 'Payment initiation failed. Please try again.' });
   }
 };
@@ -228,14 +228,14 @@ export const callback = async (req, res) => {
 
   const isSandbox = (process.env.MPESA_ENV || 'sandbox').toLowerCase() !== 'production';
   if (!isSandbox && !SAFARICOM_IPS.has(ip)) {
-    console.warn(`[M-Pesa callback] Blocked unknown IP: ${ip}`);
+    
     return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
   }
 
   try {
     const body = req.body?.Body?.stkCallback;
     if (!body) {
-      console.warn('[M-Pesa callback] Malformed body:', JSON.stringify(req.body));
+      
       return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
     }
 
@@ -248,11 +248,11 @@ export const callback = async (req, res) => {
       .maybeSingle();
 
     if (payErr) {
-      console.error('[M-Pesa callback] Payment lookup error:', payErr.message);
+      
       return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
     }
     if (!payment) {
-      console.warn(`[M-Pesa callback] Unknown payment — checkout: ${CheckoutRequestID}`);
+      
       return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
     }
     if (payment.status !== 'PENDING') {
@@ -266,7 +266,7 @@ export const callback = async (req, res) => {
         .update({ status: 'FAILED', result_code: String(ResultCode), result_desc: ResultDesc })
         .eq('id', payment.id);
 
-      console.info(`[M-Pesa callback] FAILED — code: ${ResultCode} | ${ResultDesc}`);
+      
       return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
     }
 
@@ -277,7 +277,7 @@ export const callback = async (req, res) => {
     const paidAmount = Number(meta.Amount) || payment.amount_kes;
 
     if (Math.abs(paidAmount - payment.amount_kes) > 1) {
-      console.error(`[M-Pesa callback] Amount mismatch — expected ${payment.amount_kes}, got ${paidAmount}`);
+      
       await supabaseAdmin
         .from('payments')
         .update({ status: 'FAILED', result_desc: 'Amount mismatch' })
@@ -315,9 +315,9 @@ export const callback = async (req, res) => {
       .single();
 
     if (bookErr) {
-      console.error('[M-Pesa callback] Booking creation failed:', bookErr.message, bookErr.details);
+      
     } else {
-      console.info(`[M-Pesa callback] Booking ${booking.id} created — mpesa ref: ${mpesaRef}`);
+      
 
       // ─────────────────────────────────────────────────────────────────────────
       // SEND AUTOMATED MESSAGE TO CLIENT AND AGENT (Callback path)
@@ -334,22 +334,22 @@ export const callback = async (req, res) => {
           pkgName,
           agentName
         );
-        console.log(`[M-Pesa callback] Auto-message sent for booking ${booking.id}`);
+        
       } catch (msgErr) {
-        console.error('[M-Pesa callback] Failed to send auto-message:', msgErr.message);
+        
       }
 
       try {
         await sendBookingReceiptEmail({ paymentId: payment.id, bookingId: booking.id });
       } catch (mailErr) {
-        console.error('[M-Pesa callback] Failed to send booking receipt email:', mailErr.message);
+        
       }
     }
 
     return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
 
   } catch (err) {
-    console.error('[M-Pesa callback] Unexpected:', err.message, err.stack);
+    
     return res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
   }
 };
@@ -374,7 +374,7 @@ export const getStatus = async (req, res) => {
       .maybeSingle();
 
     if (payErr) {
-      console.error('[M-Pesa status] DB error:', payErr.message);
+      
       return res.status(500).json({ success: false, message: 'Server error' });
     }
     if (!payment)
@@ -407,10 +407,10 @@ export const getStatus = async (req, res) => {
           .maybeSingle();
 
         if (createErr) {
-          console.error('[M-Pesa status] Missing booking creation failed:', createErr.message, createErr.details);
+          
         } else {
           booking = newBooking;
-          console.info(`[M-Pesa status] Recovered missing booking ${booking?.id}`);
+          
 
           // ─────────────────────────────────────────────────────────────────────
           // SEND AUTOMATED MESSAGE TO CLIENT AND AGENT (Status polling path)
@@ -428,9 +428,9 @@ export const getStatus = async (req, res) => {
                 pkgName,
                 agentName
               );
-              console.log(`[M-Pesa status] Auto-message sent for booking ${booking.id}`);
+              
             } catch (msgErr) {
-              console.error('[M-Pesa status] Failed to send auto-message:', msgErr.message);
+              
             }
           }
         }
@@ -440,7 +440,7 @@ export const getStatus = async (req, res) => {
         try {
           await sendBookingReceiptEmail({ paymentId: payment.id, bookingId: booking.id });
         } catch (mailErr) {
-          console.error('[M-Pesa status] Failed to send booking receipt email:', mailErr.message);
+          
         }
       }
 
@@ -469,13 +469,13 @@ export const getStatus = async (req, res) => {
         return res.json({ success: true, status: 'FAILED', resultDesc: darajaRes.ResultDesc ?? darajaRes.resultDesc });
       }
     } catch (qErr) {
-      console.warn('[M-Pesa status] Daraja query failed (non-fatal):', qErr.message);
+      
     }
 
     return res.json({ success: true, status: 'PENDING' });
 
   } catch (err) {
-    console.error('[M-Pesa status] Unexpected:', err.message, err.stack);
+    
     return res.status(500).json({ success: false, message: 'Server error' });
   }
 };

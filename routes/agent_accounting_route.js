@@ -17,7 +17,7 @@ async function resolveFallbackRate() {
   try {
     return await getUsdKesRate();
   } catch (err) {
-    console.warn('[agent-accounting] Fallback FX rate unavailable:', err.message);
+    
     return null;
   }
 }
@@ -73,7 +73,7 @@ router.get('/summary', requireAuth, async (req, res) => {
       },
     });
   } catch (err) {
-    console.error('[agent-accounting] Summary error:', err);
+    
     return res.status(500).json({ success: false, message: 'Failed to fetch summary' });
   }
 });
@@ -151,7 +151,7 @@ router.get('/transactions', requireAuth, async (req, res) => {
 
     return res.json({ success: true, data: results });
   } catch (err) {
-    console.error('[agent-accounting] Transactions error:', err);
+    
     return res.status(500).json({ success: false, message: 'Failed to fetch transactions' });
   }
 });

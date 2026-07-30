@@ -2,7 +2,7 @@ import supabase from '../../config/supabase.js';
 import { deleteImagesFromR2 } from '../../middleware/uploads/Uploadtocloudflare.js';
 
 export const handleDatabaseError = (res, error) => {
-  console.error('Database error:', error);
+  
   return res.status(500).json({ success: false, message: 'An internal server error occurred.' });
 };
 
@@ -230,7 +230,7 @@ const madinah_hotel_distance = sanitizeText(req.body.madinah_hotel_distance, 30)
       updated_at: currentTime,
     };
 
-    console.log('[createPackage] Inserting package:', { name, type, location, price, duration });
+    
 
     const { data, error } = await supabase
       .from('packages')
@@ -238,18 +238,13 @@ const madinah_hotel_distance = sanitizeText(req.body.madinah_hotel_distance, 30)
       .select('id, name, type, location, price, price_tiers, duration, status, created_by, agent_name, agent_number');
 
     if (error) {
-      console.error('[createPackage] Supabase insert error:', error);
-      console.error('[createPackage] Error details:', {
-        message: error.message,
-        code: error.code,
-        details: error.details,
-        hint: error.hint,
-      });
+      
+      
       throw error;
     }
 
     const record = data?.[0] ?? null;
-    console.log('Package created successfully:', record);
+    
 
     return res.status(201).json({
       success:      true,
@@ -388,7 +383,7 @@ export const updatePackage = async (req, res) => {
       .select('id, name, type, location, price, price_tiers, duration, status, created_by, agent_name, agent_number, image_urls');
 
     if (error) {
-      console.error('[updatePackage] Supabase update error:', error);
+      
       throw error;
     }
 
@@ -401,9 +396,7 @@ export const updatePackage = async (req, res) => {
     const previousUrls = Array.isArray(existing.image_urls) ? existing.image_urls : [];
     const removedUrls = previousUrls.filter((u) => !image_urls.includes(u));
     if (removedUrls.length > 0) {
-      deleteImagesFromR2(removedUrls).catch((err) =>
-        console.error('[updatePackage] R2 cleanup failed:', err.message)
-      );
+      deleteImagesFromR2(removedUrls).catch(() => {});
     }
 
     return res.status(200).json({
@@ -456,16 +449,14 @@ export const deletePackage = async (req, res) => {
       .eq('id', id);
 
     if (error) {
-      console.error('[deletePackage] Supabase delete error:', error);
+      
       throw error;
     }
 
     // Row is gone either way at this point — cleanup is best-effort and
     // shouldn't turn into a failed response if R2 hiccups.
     if (Array.isArray(existing.image_urls) && existing.image_urls.length > 0) {
-      deleteImagesFromR2(existing.image_urls).catch((err) =>
-        console.error('[deletePackage] R2 cleanup failed:', err.message)
-      );
+      deleteImagesFromR2(existing.image_urls).catch(() => {});
     }
 
     return res.status(200).json({

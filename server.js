@@ -70,7 +70,7 @@ const allowedOrigins = [
   ...(process.env.ALLOWED_ORIGINS?.split(',').map(o => o.trim()) || [])
 ].filter(Boolean);
 
-console.log('🌐 CORS enabled for origins:', allowedOrigins);
+logger.info('CORS enabled for origins', { allowedOrigins });
 
 app.use(cors({
   origin: function (origin, callback) {
@@ -80,7 +80,7 @@ app.use(cors({
     if (allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
-      console.warn('❌ CORS blocked:', origin);
+      logger.warn('CORS blocked origin', { origin });
       callback(new Error('Not allowed by CORS'));
     }
   },
@@ -327,9 +327,10 @@ const server = app.listen(PORT, '0.0.0.0', async () => {
     nodeVersion: process.version,
   });
   
-  console.log('\n🌐 CORS Configuration:');
-  console.log('   Allowed origins:', allowedOrigins);
-  console.log('   Credentials:', true);
+  logger.info('CORS configuration', {
+    allowedOrigins,
+    credentials: true,
+  });
   
   const supabaseConnected = await verifySupabaseConnection();
   if (!supabaseConnected) {

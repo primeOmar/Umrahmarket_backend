@@ -3,7 +3,7 @@ import { supabaseAdmin } from '../config/supabase.js';
 
 const recoverMissingBookings = async (userId) => {
   if (!supabaseAdmin) {
-    console.warn('[recoverMissingBookings] Supabase admin client not configured');
+    
     return;
   }
 
@@ -15,7 +15,7 @@ const recoverMissingBookings = async (userId) => {
     .not('payment_id', 'is', null);    // Only get bookings with payment_id
 
   if (existingErr) {
-    console.error('[recoverMissingBookings] Existing bookings load failed:', existingErr.message);
+    
     return;
   }
 
@@ -48,7 +48,7 @@ const recoverMissingBookings = async (userId) => {
   const { data: successfulPayments, error: paymentsErr } = await paymentsQuery;
 
   if (paymentsErr) {
-    console.error('[recoverMissingBookings] Successful payments load failed:', paymentsErr.message);
+    
     return;
   }
 
@@ -87,9 +87,9 @@ const recoverMissingBookings = async (userId) => {
     });
 
   if (insertErr) {
-    console.error('[recoverMissingBookings] Booking recovery insert failed:', insertErr.message);
+    
   } else if (bookingRecords.length > 0) {
-    console.info(`[recoverMissingBookings] Recovered ${bookingRecords.length} new booking(s) for user ${userId}`);
+    
   }
 };
 
@@ -153,7 +153,7 @@ export const getAgentClients = async (req, res) => {
 
     return res.json({ success: true, clients });
   } catch (err) {
-    console.error('[getAgentClients] Unexpected error:', err.message);
+    
     return res.status(500).json({ success: false, message: 'Server error' });
   }
 };
@@ -166,9 +166,7 @@ export const getMyBookings = async (req, res) => {
 
     // Run recovery but don't wait for it - let it run in background
     // This prevents blocking the main request if recovery takes time
-    recoverMissingBookings(userId).catch(err => 
-      console.error('[getMyBookings] Background recovery failed:', err)
-    );
+    recoverMissingBookings(userId).catch(() => {});
 
     // Simple query first to get unique bookings
     const { data: rawBookings, error: bookingsError } = await supabaseAdmin
@@ -178,7 +176,7 @@ export const getMyBookings = async (req, res) => {
       .order('created_at', { ascending: false });
 
     if (bookingsError) {
-      console.error('[getMyBookings] DB error:', bookingsError);
+      
       return res.status(500).json({ success: false, message: bookingsError.message });
     }
 
@@ -228,7 +226,7 @@ export const getMyBookings = async (req, res) => {
       count: bookingsWithDetails.length
     });
   } catch (err) {
-    console.error('[getMyBookings] Unexpected error:', err.message);
+    
     return res.status(500).json({ success: false, message: 'Server error' });
   }
 };

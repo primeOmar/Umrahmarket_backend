@@ -132,7 +132,7 @@ router.get('/', requireAuth, async (req, res) => {
           continue;
         }
       } catch (r2Error) {
-        console.warn(`R2 read failed for ${docKey} (${agentId}):`, r2Error.message);
+        
       }
 
       if (docKey === 'office_photo') {
@@ -172,14 +172,14 @@ router.get('/', requireAuth, async (req, res) => {
     return res.json({ success: true, data: result });
 
   } catch (error) {
-    console.error('GET /api/documents error:', error);
+    
     return res.status(500).json({ success: false, error: 'Failed to fetch documents.' });
   }
 });
 
 router.get('/debug/status', async (req, res) => {
   try {
-    console.log('[DEBUG] Checking agent_documents table...');
+    
 
     // Check table existence
     const { data: tableInfo, error: tableError } = await supabaseAdmin
@@ -238,7 +238,7 @@ router.get('/debug/status', async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('[DEBUG] Error:', error);
+    
     res.status(500).json({
       success: false,
       error: error.message,
@@ -262,8 +262,8 @@ router.post('/',
 
     try {
       const userId = req.userId;
-      console.log(`[POST /api/documents] Starting upload for user: ${userId}`);
-      console.log(`[POST /api/documents] Uploaded files:`, Object.keys(uploaded));
+      
+      
 
       const documentPayload = {
         user_id:          userId,
@@ -276,7 +276,7 @@ router.post('/',
         submitted_at:      new Date().toISOString(),
       };
 
-      console.log(`[POST /api/documents] Payload:`, JSON.stringify(documentPayload, null, 2));
+      
 
       // Check if record exists
       const { data: existing, error: selectError } = await supabaseAdmin
@@ -286,16 +286,16 @@ router.post('/',
         .maybeSingle();
 
       if (selectError) {
-        console.error(`[POST /api/documents] SELECT error:`, selectError);
+        
         throw new Error(`Database select failed: ${selectError.message}`);
       }
 
-      console.log(`[POST /api/documents] Existing record:`, existing ? 'Found' : 'Not found');
+      
 
       let savedDoc;
 
       if (existing) {
-        console.log(`[POST /api/documents] Updating existing record (id: ${existing.id})`);
+        
         const { data, error } = await supabaseAdmin
           .from('agent_documents')
           .update({
@@ -313,13 +313,13 @@ router.post('/',
           .single();
 
         if (error) {
-          console.error(`[POST /api/documents] UPDATE error:`, error);
+          
           throw new Error(`Database update failed: ${error.message}`);
         }
-        console.log(`[POST /api/documents] Update successful:`, data);
+        
         savedDoc = data;
       } else {
-        console.log(`[POST /api/documents] Inserting new record`);
+        
         const { data, error } = await supabaseAdmin
           .from('agent_documents')
           .insert(documentPayload)
@@ -327,14 +327,14 @@ router.post('/',
           .single();
 
         if (error) {
-          console.error(`[POST /api/documents] INSERT error:`, error);
+          
           throw new Error(`Database insert failed: ${error.message}`);
         }
-        console.log(`[POST /api/documents] Insert successful:`, data);
+        
         savedDoc = data;
       }
 
-      console.log(`[POST /api/documents] Completed successfully`);
+      
       return res.json({
         success: true,
         message: 'Documents uploaded successfully.',
@@ -344,7 +344,7 @@ router.post('/',
         },
       });
     } catch (error) {
-      console.error('[POST /api/documents] Fatal error:', error);
+      
       return res.status(500).json({ success: false, error: error.message || 'Failed to save documents.' });
     }
   }
@@ -376,7 +376,7 @@ router.patch('/office-location', requireAuth, async (req, res) => {
 
     return res.json({ success: true, message: 'Office location saved.' });
   } catch (error) {
-    console.error('PATCH /api/documents/office-location error:', error);
+    
     return res.status(500).json({ success: false, error: 'Failed to save office location.' });
   }
 });

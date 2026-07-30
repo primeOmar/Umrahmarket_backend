@@ -114,7 +114,7 @@ router.get('/status', requireAuth, async (req, res) => {
       items,
     });
   } catch (err) {
-    console.error('[agent-documents/status] error:', err);
+    
     res.status(500).json({ success: false, message: 'Failed to load verification status' });
   }
 });
@@ -184,7 +184,7 @@ router.post(
 
       res.json({ success: true, message: 'Review requested. Our team will prioritize your documents shortly.' });
     } catch (err) {
-      console.error('[agent-documents/request-review] error:', err);
+      
       res.status(500).json({ success: false, message: 'Failed to request review' });
     }
   },

@@ -31,7 +31,7 @@ const logAudit = async (superadminId, action, resourceType, resourceId, reason =
       user_agent:    req ? (req.get('user-agent') || 'unknown') : 'unknown',
     });
   } catch (err) {
-    console.error('[accounting] Failed to log audit action:', err);
+    
   }
 };
 
@@ -77,7 +77,7 @@ const authenticateSuperadmin = async (req, res, next) => {
     req.session    = session;
     next();
   } catch (err) {
-    console.error('[accounting] Auth middleware error:', err);
+    
     res.status(401).json({ success: false, message: 'Authentication failed' });
   }
 };
@@ -123,7 +123,7 @@ router.get('/summary', authenticateSuperadmin, async (req, res) => {
       },
     });
   } catch (err) {
-    console.error('[accounting] Summary error:', err);
+    
     res.status(500).json({ success: false, message: 'Failed to fetch accounting summary' });
   }
 });
@@ -217,7 +217,7 @@ router.get('/transactions', authenticateSuperadmin, async (req, res) => {
 
     res.json({ success: true, data: results, total: count ?? results.length });
   } catch (err) {
-    console.error('[accounting] Transactions error:', err);
+    
     res.status(500).json({ success: false, message: 'Failed to fetch transactions' });
   }
 });
@@ -255,7 +255,7 @@ router.post('/transactions/:id/disburse', authenticateSuperadmin, async (req, re
     await logAudit(req.superadmin.id, 'DISBURSE_TRANSACTION', 'transaction', id, `Disbursed KES ${agentShare.toLocaleString()} to agent. Package: ${payment.package?.name ?? id}`, 'success', '', req);
     res.json({ success: true, message: 'Transaction marked as disbursed', data: { id, disbursedAt: new Date().toISOString(), disbursedBy: req.superadmin.id, agentShare } });
   } catch (err) {
-    console.error('[accounting] Disburse error:', err);
+    
     await logAudit(req.superadmin.id, 'DISBURSE_TRANSACTION', 'transaction', id, '', 'failed', err.message, req);
     res.status(500).json({ success: false, message: 'Failed to mark as disbursed' });
   }
@@ -377,7 +377,7 @@ router.get('/transactions/:id/receipt', authenticateSuperadmin, async (req, res)
     supabase.from('payments').update({ receipt_generated: true }).eq('id', id).then(() => {}).catch(() => {});
     await logAudit(req.superadmin.id, 'GENERATE_RECEIPT', 'transaction', id, `Receipt ${inline ? 'previewed' : 'downloaded'}`, 'success', '', req);
   } catch (err) {
-    console.error('[accounting] Receipt error:', err);
+    
     if (!res.headersSent) res.status(500).json({ success: false, message: 'Failed to generate receipt' });
   }
 });
@@ -465,7 +465,7 @@ router.post('/transactions/:id/email', authenticateSuperadmin, async (req, res) 
     await logAudit(req.superadmin.id, 'EMAIL_RECEIPT', 'transaction', id, `Emailed to ${recipient}`, 'success', '', req);
     res.json({ success: true, message: `Receipt emailed to ${recipient}` });
   } catch (err) {
-    console.error('[accounting] Email receipt error:', err);
+    
     await logAudit(req.superadmin.id, 'EMAIL_RECEIPT', 'transaction', id, '', 'failed', err.message, req);
     res.status(500).json({ success: false, message: 'Failed to send receipt email' });
   }
@@ -538,7 +538,7 @@ router.get('/export', authenticateSuperadmin, async (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename="accounting-export-${Date.now()}.csv"`);
     res.send(csv);
   } catch (err) {
-    console.error('[accounting] Export error:', err);
+    
     res.status(500).json({ success: false, message: 'Export failed' });
   }
 });

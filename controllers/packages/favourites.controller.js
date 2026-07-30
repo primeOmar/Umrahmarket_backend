@@ -44,7 +44,7 @@ export const toggleFavourite = async (req, res) => {
 
     return res.json({ success: true, favourited: true });
   } catch (error) {
-    console.error('[toggleFavourite]', error.message);
+    
     return res.status(500).json({ success: false, message: 'Failed to update favourite' });
   }
 };
@@ -83,7 +83,7 @@ export const getFavourites = async (req, res) => {
 
     return res.json({ success: true, favourites, packageIds });
   } catch (error) {
-    console.error('[getFavourites]', error.message);
+    
     return res.status(500).json({ success: false, message: 'Failed to fetch favourites' });
   }
 };

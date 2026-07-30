@@ -152,7 +152,7 @@ export const validateConfig = () => {
   
   // Validate Supabase URL format
   if (config.supabase.url && !config.supabase.url.includes('supabase.co')) {
-    console.warn('Warning: SUPABASE_URL format looks incorrect');
+    
   }
   
   return true;

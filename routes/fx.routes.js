@@ -19,7 +19,7 @@ router.get('/rate', async (req, res) => {
       fetchedAt:   new Date().toISOString(),
     });
   } catch (err) {
-    console.error('[FX] /rate error:', err.message);
+    
     return res.status(503).json({
       success: false,
       message: 'Exchange rate temporarily unavailable. Please retry.',

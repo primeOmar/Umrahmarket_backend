@@ -70,10 +70,10 @@ export const createBookingMessage = async (bookingId, clientId, agentId, package
 
     if (agentMsgError) throw agentMsgError;
 
-    console.log(`[BookingMessage] Created automated messages for booking ${bookingId}`);
+    
     return true;
   } catch (err) {
-    console.error('[createBookingMessage]', err.message);
+    
     return false;
   }
 };
@@ -109,7 +109,7 @@ export const sendMessage = async (req, res) => {
       .single();
 
     if (pkgErr || !pkg) {
-      console.error('[sendMessage] package lookup failed:', pkgErr?.message);
+      
       return res.status(404).json({ success: false, message: 'Package not found' });
     }
 
@@ -117,7 +117,7 @@ export const sendMessage = async (req, res) => {
     const isClient = booking.user_id === userId;
     const isAgent  = agentId === userId;
 
-    console.log('[sendMessage] userId:', userId, '| agentId:', agentId, '| clientId:', booking.user_id, '| isClient:', isClient, '| isAgent:', isAgent);
+    
 
     if (!isClient && !isAgent) {
       return res.status(403).json({ success: false, message: 'Unauthorized' });
@@ -142,7 +142,7 @@ export const sendMessage = async (req, res) => {
 
     return res.json({ success: true, message: newMessage });
   } catch (err) {
-    console.error('[sendMessage]', err.message);
+    
     return res.status(500).json({ success: false, message: 'Failed to send message' });
   }
 };
@@ -169,7 +169,7 @@ export const markMessagesAsRead = async (req, res) => {
 
     return res.json({ success: true });
   } catch (err) {
-    console.error('[markMessagesAsRead]', err.message);
+    
     return res.status(500).json({ success: false, message: 'Failed to mark as read' });
   }
 };
@@ -226,7 +226,7 @@ export const getMessages = async (req, res) => {
       packageName: pkg?.name || 'Package',
     });
   } catch (err) {
-    console.error('[getMessages]', err.message);
+    
     return res.status(500).json({ success: false, message: 'Failed to fetch messages' });
   }
 };
@@ -251,7 +251,7 @@ export const getUnreadCount = async (req, res) => {
 
     return res.json({ success: true, count: count || 0 });
   } catch (err) {
-    console.error('[getUnreadCount]', err.message);
+    
     return res.status(500).json({ success: false, count: 0 });
   }
 };
@@ -362,7 +362,7 @@ export const getAgentConversations = async (req, res) => {
 
     return res.json({ success: true, conversations: result });
   } catch (err) {
-    console.error('[getAgentConversations]', err.message);
+    
     return res.status(500).json({ success: false, conversations: [] });
   }
 };

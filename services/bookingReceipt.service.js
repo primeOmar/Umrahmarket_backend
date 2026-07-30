@@ -119,7 +119,7 @@ async function renderBookingReceiptPdf({ payment, booking, clientProfile }) {
 export async function sendBookingReceiptEmail({ paymentId, bookingId = null, force = false }) {
   if (!paymentId) return { success: false, reason: 'missing_payment_id' };
   if (!hasSmtpConfig()) {
-    console.warn('[booking-receipt] Skipped: SMTP not configured');
+    
     return { success: false, reason: 'smtp_not_configured' };
   }
 
@@ -132,7 +132,7 @@ export async function sendBookingReceiptEmail({ paymentId, bookingId = null, for
   if (payErr || !payment) return { success: false, reason: 'payment_not_found' };
   if (payment.status !== 'SUCCESS') return { success: false, reason: 'payment_not_success' };
   if (!force && payment.receipt_generated) {
-    console.info(`[booking-receipt] Skipped: already sent for payment ${payment.id}`);
+    
     return { success: true, skipped: true, reason: 'already_sent' };
   }
 
@@ -144,7 +144,7 @@ export async function sendBookingReceiptEmail({ paymentId, bookingId = null, for
 
   const recipient = String(clientProfile?.email || '').trim();
   if (!isValidEmail(recipient)) {
-    console.warn(`[booking-receipt] Skipped: invalid recipient email for payment ${payment.id}`);
+    
     return { success: false, reason: 'invalid_recipient_email' };
   }
 
@@ -180,6 +180,6 @@ export async function sendBookingReceiptEmail({ paymentId, bookingId = null, for
   });
 
   await supabaseAdmin.from('payments').update({ receipt_generated: true }).eq('id', payment.id);
-  console.info(`[booking-receipt] Sent to ${recipient} for payment ${payment.id} (messageId: ${info?.messageId || 'n/a'})`);
+  
   return { success: true, recipient, messageId: info?.messageId || null };
 }

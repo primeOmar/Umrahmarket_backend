@@ -33,7 +33,7 @@ try {
   // Keep booting even if file logging cannot initialize; console transport
   // below guarantees logs are still visible on Render.
   // eslint-disable-next-line no-console
-  console.error('Failed to create log directory:', logDir, e.message);
+  
 }
 
 // Define log format
