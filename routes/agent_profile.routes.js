@@ -102,7 +102,7 @@ router.get('/me/profile', requireAuth, async (req, res) => {
       },
     });
   } catch (err) {
-    console.error('[agent-profile] get error:', err);
+    
     res.status(500).json({ success: false, message: 'Failed to load profile' });
   }
 });
@@ -147,7 +147,7 @@ router.put('/me/profile', requireAuth, async (req, res) => {
       },
     });
   } catch (err) {
-    console.error('[agent-profile] update error:', err);
+    
     res.status(500).json({ success: false, message: 'Failed to update profile' });
   }
 });
@@ -184,7 +184,7 @@ router.post('/me/logo', requireAuth, upload.single('logo'), async (req, res) => 
 
     res.json({ success: true, logoUrl });
   } catch (err) {
-    console.error('[agent-profile] logo upload error:', err);
+    
     res.status(500).json({ success: false, message: 'Failed to upload logo' });
   }
 });

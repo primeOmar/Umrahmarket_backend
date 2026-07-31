@@ -63,7 +63,7 @@ router.get('/documents/:docId/signed-url', authenticateSuperadmin, async (req, r
 
     return res.json({ success: true, data: { url } });
   } catch (err) {
-    console.error('Signed URL error:', err);
+    
     return res.status(500).json({ success: false, message: 'Failed to obtain signed URL' });
   }
 });
@@ -99,7 +99,7 @@ const logAuditAction = async (
       user_agent:     req ? (req.get('user-agent') || 'unknown') : 'unknown',
     });
   } catch (err) {
-    console.error('Failed to log audit action:', err);
+    
   }
 };
 
@@ -153,7 +153,7 @@ const getAgentDocumentUrls = async (agentId) => {
 
     return result;
   } catch (err) {
-    console.error(`Failed to fetch R2 documents for agent ${agentId}:`, err);
+    
     return {};
   }
 };
@@ -203,7 +203,7 @@ const reconcileAgentDocumentsFromR2 = async () => {
       .in('user_id', r2AgentIds);
 
     if (existingError) {
-      console.error('Failed to read existing agent_documents for reconciliation:', existingError);
+      
       return 0;
     }
 
@@ -218,7 +218,7 @@ const reconcileAgentDocumentsFromR2 = async () => {
       .eq('role', 'agent');
 
     if (profileError) {
-      console.error('Failed to query agent profiles during reconciliation:', profileError);
+      
       return 0;
     }
 
@@ -263,13 +263,13 @@ const reconcileAgentDocumentsFromR2 = async () => {
 
     const { error: insertError } = await supabase.from('agent_documents').insert(insertPayload);
     if (insertError) {
-      console.error('Failed to insert reconciled agent_documents rows:', insertError);
+      
       return 0;
     }
 
     return insertPayload.length;
   } catch (err) {
-    console.error('Reconciliation error:', err);
+    
     return 0;
   }
 };
@@ -323,7 +323,7 @@ export async function authenticateSuperadmin(req, res, next) {
     req.session    = session;
     next();
   } catch (err) {
-    console.error('Auth middleware error:', err);
+    
     res.status(401).json({ success: false, message: 'Authentication failed' });
   }
 };
@@ -341,7 +341,7 @@ router.post('/register', async (req, res) => {
       return res.status(503).json({ success: false, message: 'Registration is disabled' });
     }
     if (!registerSecret || registerSecret !== expectedSecret) {
-      console.warn('Register warning: invalid registration secret attempt', { ip: req.ip });
+      
       return res.status(403).json({ success: false, message: 'Invalid registration secret' });
     }
 
@@ -372,14 +372,7 @@ router.post('/register', async (req, res) => {
       .maybeSingle();
 
     if (lookupError) {
-      console.error('Register error: failed to check existing admin', {
-        message: lookupError.message,
-        details: lookupError.details,
-        hint: lookupError.hint,
-        code: lookupError.code,
-        email,
-        username,
-      });
+      
       return res.status(500).json({ success: false, message: 'Registration failed' });
     }
 
@@ -402,14 +395,7 @@ router.post('/register', async (req, res) => {
       .single();
 
     if (error) {
-      console.error('Register error: failed to insert admin', {
-        message: error.message,
-        details: error.details,
-        hint: error.hint,
-        code: error.code,
-        email,
-        username,
-      });
+      
       throw error;
     }
 
@@ -426,13 +412,7 @@ router.post('/register', async (req, res) => {
     );
 
     if (permissionsError) {
-      console.error('Register error: failed to assign default permissions', {
-        message: permissionsError.message,
-        details: permissionsError.details,
-        hint: permissionsError.hint,
-        code: permissionsError.code,
-        superadminId: newAdmin.id,
-      });
+      
       // Not throwing here — admin account was created successfully;
       // permissions can be fixed manually. Adjust if this should be fatal.
     }
@@ -440,11 +420,7 @@ router.post('/register', async (req, res) => {
     try {
       await logAuditAction(newAdmin.id, 'REGISTER', 'superadmin', newAdmin.id, 'Initial registration', 'success', '', req);
     } catch (auditErr) {
-      console.error('Register error: failed to write audit log', {
-        message: auditErr.message,
-        stack: auditErr.stack,
-        superadminId: newAdmin.id,
-      });
+      
       // Non-fatal — don't block the response for an audit log failure
     }
 
@@ -459,13 +435,7 @@ router.post('/register', async (req, res) => {
       },
     });
   } catch (err) {
-    console.error('Register error:', {
-      message: err.message,
-      stack: err.stack,
-      code: err.code,
-      details: err.details,
-      hint: err.hint,
-    });
+    
     res.status(500).json({ success: false, message: 'Registration failed' });
   }
 });
@@ -607,7 +577,7 @@ router.post('/login', async (req, res) => {
       },
     });
   } catch (err) {
-    console.error('Login error:', err);
+    
     res.status(500).json({ success: false, message: 'Login failed' });
   }
 });
@@ -690,7 +660,7 @@ router.post('/verify-2fa', async (req, res) => {
       },
     });
   } catch (err) {
-    console.error('2FA error:', err);
+    
     res.status(500).json({ success: false, message: '2FA verification failed' });
   }
 });
@@ -738,7 +708,7 @@ router.post('/refresh', async (req, res) => {
 
     res.json({ success: true, data: { accessToken: newAccessToken } });
   } catch (err) {
-    console.error('Refresh error:', err);
+    
     res.status(401).json({ success: false, message: 'Token refresh failed' });
   }
 });
@@ -758,7 +728,7 @@ router.post('/logout', authenticateSuperadmin, async (req, res) => {
 
     res.json({ success: true, message: 'Logged out' });
   } catch (err) {
-    console.error('Logout error:', err);
+    
     res.status(500).json({ success: false, message: 'Logout failed' });
   }
 });
@@ -788,7 +758,7 @@ router.get('/stats', authenticateSuperadmin, async (req, res) => {
       docsTrend:        8,
     });
   } catch (err) {
-    console.error('Stats error:', err);
+    
     res.status(500).json({ success: false, message: 'Failed to fetch stats' });
   }
 });
@@ -825,7 +795,7 @@ router.get('/audit-logs', authenticateSuperadmin, async (req, res) => {
 
     res.json({ success: true, data: normalized, total: count || 0 });
   } catch (err) {
-    console.error('Audit logs error:', err);
+    
     res.status(500).json({ success: false, message: 'Failed to fetch audit logs' });
   }
 });
@@ -855,7 +825,7 @@ router.get('/clients', authenticateSuperadmin, async (req, res) => {
 
     res.json({ success: true, data: normalized });
   } catch (err) {
-    console.error('Clients error:', err);
+    
     res.status(500).json({ success: false, message: 'Failed to fetch clients' });
   }
 });
@@ -885,7 +855,7 @@ router.get('/agents', authenticateSuperadmin, async (req, res) => {
 
     res.json({ success: true, data: normalized });
   } catch (err) {
-    console.error('Agents error:', err);
+    
     res.status(500).json({ success: false, message: 'Failed to fetch agents' });
   }
 });
@@ -959,7 +929,7 @@ router.get('/chats', authenticateSuperadmin, async (req, res) => {
 
     res.json({ success: true, data: normalized });
   } catch (err) {
-    console.error('Chats error:', err);
+    
     res.status(500).json({ success: false, message: 'Failed to fetch chats' });
   }
 });
@@ -1010,7 +980,7 @@ router.get('/chats/:bookingId/messages', authenticateSuperadmin, async (req, res
 
     res.json({ success: true, data: normalized });
   } catch (err) {
-    console.error('Chat messages error:', err);
+    
     res.status(500).json({ success: false, message: 'Failed to fetch chat messages' });
   }
 });
@@ -1061,7 +1031,7 @@ router.post('/chats/:bookingId/close', authenticateSuperadmin, async (req, res) 
 
     res.json({ success: true, message: 'Chat closed' });
   } catch (err) {
-    console.error('Close chat error:', err);
+    
     await logAuditAction(req.superadmin?.id || null, AUDIT_ACTIONS.CLOSE_CHAT, 'chat', req.params.bookingId, '', 'failed', err.message, req);
     res.status(500).json({ success: false, message: 'Failed to close chat' });
   }
@@ -1104,7 +1074,7 @@ router.get('/debug/documents-status', authenticateSuperadmin, async (req, res) =
 
     res.json({ success: true, data: checks });
   } catch (err) {
-    console.error('Debug status error:', err);
+    
     res.status(500).json({ success: false, message: err.message });
   }
 });
@@ -1122,7 +1092,7 @@ router.post('/documents/reconcile', authenticateSuperadmin, async (req, res) => 
       reconciledCount,
     });
   } catch (err) {
-    console.error('Reconcile documents error:', err);
+    
     res.status(500).json({ success: false, message: 'Failed to reconcile documents' });
   }
 });
@@ -1204,7 +1174,7 @@ router.get('/documents', authenticateSuperadmin, async (req, res) => {
 
     res.json({ success: true, data: normalized });
   } catch (err) {
-    console.error('Documents error:', err);
+    
     res.status(500).json({ success: false, message: err.message || 'Failed to fetch documents' });
   }
 });
@@ -1396,7 +1366,7 @@ router.post('/documents/:docId/verify-item', authenticateSuperadmin, async (req,
       data: { docType: safeDocType, status: safeStatus, overallStatus: overall },
     });
   } catch (err) {
-    console.error('Per-document verify error:', err);
+    
     await logAuditAction(req.superadmin.id, auditAction, 'document', auditResourceId, `${safeDocType} verification failed`, 'failed', err.message || 'Unknown error', req);
     return res.status(500).json({ success: false, message: err?.message || 'Failed to verify document' });
   }
@@ -1502,7 +1472,7 @@ router.post('/documents/:docId/verify', authenticateSuperadmin, async (req, res)
     await logAuditAction(req.superadmin.id, auditAction, 'document', auditResourceId, notes || '', 'success', '', req);
     return res.json({ success: true, message: `Document ${safeStatus}` });
   } catch (err) {
-    console.error('Document verify error:', err);
+    
     await logAuditAction(req.superadmin.id, auditAction, 'document', auditResourceId, 'Document verification failed', 'failed', err.message || 'Unknown error', req);
     return res.status(500).json({ success: false, message: err?.message || 'Failed to verify document' });
   }
@@ -1547,9 +1517,9 @@ router.delete('/documents/:agentId/:docType', authenticateSuperadmin, async (req
             Key: key,
           }));
           deletedCount++;
-          console.log(`[DELETE] Deleted R2 object: ${key}`);
+          
         } catch (r2Err) {
-          console.error(`[DELETE] Failed to delete R2 object ${key}:`, r2Err);
+          
         }
       }
     }
@@ -1568,7 +1538,7 @@ router.delete('/documents/:agentId/:docType', authenticateSuperadmin, async (req
       .eq('user_id', agentId);
 
     if (dbError) {
-      console.error('Failed to update agent_documents after R2 delete:', dbError);
+      
       // Log but don't fail — R2 delete succeeded
     }
 
@@ -1580,7 +1550,7 @@ router.delete('/documents/:agentId/:docType', authenticateSuperadmin, async (req
       deletedCount,
     });
   } catch (err) {
-    console.error('Document delete error:', err);
+    
     await logAuditAction(req.superadmin.id, 'DELETE_DOCUMENT', 'document', req.params.agentId || 'unknown', 'Delete failed', 'failed', err.message, req);
     res.status(500).json({ success: false, message: err.message || 'Failed to delete document(s)' });
   }
@@ -1613,9 +1583,9 @@ router.delete('/documents/:agentId', authenticateSuperadmin, async (req, res) =>
             Key: key,
           }));
           deletedCount++;
-          console.log(`[DELETE] Deleted R2 object: ${key}`);
+          
         } catch (r2Err) {
-          console.error(`[DELETE] Failed to delete R2 object ${key}:`, r2Err);
+          
         }
       }
     }
@@ -1633,7 +1603,7 @@ router.delete('/documents/:agentId', authenticateSuperadmin, async (req, res) =>
       .eq('user_id', agentId);
 
     if (dbError) {
-      console.error('Failed to clear agent_documents after R2 delete:', dbError);
+      
     }
 
     await logAuditAction(req.superadmin.id, 'DELETE_DOCUMENT', 'document', agentId, `Deleted all agent documents: ${deletedCount} file(s)`, 'success', '', req);
@@ -1644,7 +1614,7 @@ router.delete('/documents/:agentId', authenticateSuperadmin, async (req, res) =>
       deletedCount,
     });
   } catch (err) {
-    console.error('Bulk document delete error:', err);
+    
     await logAuditAction(req.superadmin.id, 'DELETE_DOCUMENT', 'document', req.params.agentId || 'unknown', 'Bulk delete failed', 'failed', err.message, req);
     res.status(500).json({ success: false, message: err.message || 'Failed to delete all documents' });
   }
@@ -1679,7 +1649,7 @@ router.get('/packages', authenticateSuperadmin, async (req, res) => {
 
     res.json({ success: true, data: normalized });
   } catch (err) {
-    console.error('Packages error:', err);
+    
     res.status(500).json({ success: false, message: 'Failed to fetch packages' });
   }
 });
@@ -1709,7 +1679,7 @@ router.delete('/packages/:packageId', authenticateSuperadmin, async (req, res) =
 
     res.json({ success: true, message: 'Package deleted' });
   } catch (err) {
-    console.error('Delete package error:', err);
+    
     res.status(500).json({ success: false, message: 'Failed to delete package' });
   }
 });
@@ -1738,7 +1708,7 @@ router.post('/dashboards/close', authenticateSuperadmin, async (req, res) => {
 
     res.json({ success: true, message: 'Dashboard closed' });
   } catch (err) {
-    console.error('Close dashboard error:', err);
+    
     res.status(500).json({ success: false, message: 'Failed to close dashboard' });
   }
 });
@@ -1823,7 +1793,7 @@ router.get('/accounting/transactions', authenticateSuperadmin, async (req, res) 
 
     res.json({ success: true, data: results, total: results.length });
   } catch (err) {
-    console.error('[accounting] Transactions error:', err);
+    
     res.status(500).json({ success: false, message: 'Failed to fetch transactions' });
   }
 });
@@ -1856,7 +1826,7 @@ router.post('/accounting/transactions/:id/disburse', authenticateSuperadmin, asy
       `Disbursed KES ${agentShare.toLocaleString()} to agent`, 'success', '', req);
     res.json({ success: true, message: 'Transaction marked as disbursed', data: { id, disbursedAt: new Date().toISOString(), agentShare } });
   } catch (err) {
-    console.error('[accounting] Disburse error:', err);
+    
     res.status(500).json({ success: false, message: 'Failed to mark as disbursed' });
   }
 });
@@ -1961,7 +1931,7 @@ router.get('/accounting/transactions/:id/receipt', authenticateSuperadmin, async
     supabase.from('payments').update({ receipt_generated: true }).eq('id', id).then(() => {}).catch(() => {});
     await logAuditAction(req.superadmin.id, 'GENERATE_RECEIPT', 'transaction', id, `Receipt ${inline ? 'previewed' : 'downloaded'}`, 'success', '', req);
   } catch (err) {
-    console.error('[accounting] Receipt error:', err);
+    
     if (!res.headersSent) res.status(500).json({ success: false, message: 'Failed to generate receipt' });
   }
 });
@@ -2036,7 +2006,7 @@ router.post('/accounting/transactions/:id/email', authenticateSuperadmin, async 
     await logAuditAction(req.superadmin.id, 'EMAIL_RECEIPT', 'transaction', id, `Emailed to ${recipient}`, 'success', '', req);
     res.json({ success: true, message: `Receipt emailed to ${recipient}` });
   } catch (err) {
-    console.error('[accounting] Email receipt error:', err);
+    
     res.status(500).json({ success: false, message: 'Failed to send receipt email' });
   }
 });
@@ -2109,7 +2079,7 @@ router.get('/export/:dataType', authenticateSuperadmin, async (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename="export-${dataType}-${Date.now()}.csv"`);
     res.send(csv);
   } catch (err) {
-    console.error('Export error:', err);
+    
     res.status(500).json({ success: false, message: 'Export failed' });
   }
 });

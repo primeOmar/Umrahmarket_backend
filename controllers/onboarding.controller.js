@@ -23,6 +23,19 @@ import logger from '../config/logger.js';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+function errText(err) {
+  return [err?.message, err?.details, err?.hint].filter(Boolean).join(' | ');
+}
+
+function parseMissingColumn(err) {
+  const text = errText(err);
+  let m = text.match(/Could not find the '([^']+)' column/i);
+  if (m?.[1]) return m[1];
+  m = text.match(/column\s+"?(?:[A-Za-z0-9_]+\.)?([A-Za-z0-9_]+)"?\s+does not exist/i);
+  if (m?.[1]) return m[1];
+  return null;
+}
+
 // Accepts local Kenyan formats (07XXXXXXXX / 01XXXXXXXX), 254XXXXXXXXX, or
 // already-international +<country><number>. Normalises to +<digits>.
 function normalizePhone(raw) {
@@ -70,23 +83,206 @@ async function getNextOfKinState(userId, packageId) {
   return { data: data || null, complete: Boolean(data?.full_name && data?.phone) };
 }
 
+async function getActiveBookingState(userId, packageId) {
+  const { data, error } = await supabaseAdmin
+    .from('bookings')
+    .select('id, traveler_count, status, created_at')
+    .eq('user_id', userId)
+    .eq('package_id', packageId)
+    .in('status', ['confirmed', 'pending'])
+    .order('created_at', { ascending: false })
+    .limit(1);
+
+  if (error) throw new Error(error.message);
+  const booking = Array.isArray(data) ? data[0] : null;
+  if (!booking) return null;
+  return {
+    id: booking.id,
+    travelerCount: Math.max(1, Number(booking.traveler_count) || 1),
+    status: booking.status,
+  };
+}
+
 // This checks the DEDICATED Umrah ID photo (a plain-background, forward-facing
 // photo the client uploads/takes directly — no OCR, no cropping). It is
 // intentionally separate from passport *document* verification: that's a
 // different, pre-existing flow (checkPassportValidity / verifyPassportImage)
 // that this onboarding step does not gate on.
-async function getIdPhotoState(userId, packageId) {
+async function getIdPhotoState(userId, packageId, travelerCount = 1) {
   const { data, error } = await supabaseAdmin
     .from('passport_verifications')
-    .select('face_photo_url')
+    .select('traveler_index, face_photo_url')
     .eq('user_id', userId)
     .eq('package_id', packageId)
+    .order('traveler_index', { ascending: true });
+
+  if (error) {
+    // Legacy fallback where traveler_index may not exist yet.
+    if (parseMissingColumn(error) === 'traveler_index') {
+      const legacy = await supabaseAdmin
+        .from('passport_verifications')
+        .select('face_photo_url')
+        .eq('user_id', userId)
+        .eq('package_id', packageId);
+      if (legacy.error) throw new Error(legacy.error.message);
+
+      const url = (legacy.data || []).find((r) => r.face_photo_url && !r.face_photo_url.startsWith('pending://'))?.face_photo_url || null;
+      return {
+        url,
+        complete: Boolean(url),
+        totalTravelers: travelerCount,
+        completedTravelers: Boolean(url) ? 1 : 0,
+        travelerPhotos: url ? [{ travelerIndex: 0, url, complete: true }] : [],
+      };
+    }
+    throw new Error(error.message);
+  }
+
+  const rows = data || [];
+  const travelerPhotos = Array.from({ length: travelerCount }, (_, i) => {
+    const row = rows.find((r) => Number(r.traveler_index ?? 0) === i);
+    const url = row?.face_photo_url || null;
+    const complete = Boolean(url) && !String(url).startsWith('pending://');
+    return { travelerIndex: i, url: complete ? url : null, complete };
+  });
+
+  const completedTravelers = travelerPhotos.filter((p) => p.complete).length;
+  const firstUrl = travelerPhotos.find((p) => p.complete)?.url || null;
+
+  return {
+    url: firstUrl,
+    complete: completedTravelers >= travelerCount,
+    totalTravelers: travelerCount,
+    completedTravelers,
+    travelerPhotos,
+  };
+}
+
+// This is the authoritative traveler identity list for a package: name and
+// passport number as captured during the booking's passport scan (the
+// existing checkPassportValidity/verifyPassportImage flow in
+// passport.controller.js), keyed by traveler_index. It exists so the ID
+// photo step can show the client WHO they are about to attach a photo to —
+// sourced from the database, never from client-supplied labels — which is
+// what prevents "traveler 2's photo saved under traveler 1's slot" mistakes
+// on multi-traveler bookings.
+//
+// A traveler slot with no matching passport_verifications row means the
+// booking flow never captured that traveler's identity yet. We deliberately
+// do NOT let the client attach a photo to that slot (see
+// resolveTravelerForPhotoUpload below) — there would be nothing to bind the
+// photo to and no way to show the client whose photo they're taking.
+function maskPassportNumber(raw) {
+  const v = String(raw || '').trim();
+  if (v.length <= 4) return v ? '••••' : null;
+  return `${'•'.repeat(Math.max(0, v.length - 4))}${v.slice(-4)}`;
+}
+
+async function getTravelerIdentities(userId, packageId, travelerCount = 1) {
+  const { data, error } = await supabaseAdmin
+    .from('passport_verifications')
+    .select('id, traveler_index, given_names, surname, full_name, passport_number, date_of_birth, face_photo_url')
+    .eq('user_id', userId)
+    .eq('package_id', packageId)
+    .order('traveler_index', { ascending: true });
+
+  if (error) {
+    if (parseMissingColumn(error) === 'traveler_index') {
+      // Legacy single-traveler fallback, mirrors getIdPhotoState's fallback.
+      const legacy = await supabaseAdmin
+        .from('passport_verifications')
+        .select('given_names, surname, full_name, passport_number, date_of_birth, face_photo_url')
+        .eq('user_id', userId)
+        .eq('package_id', packageId)
+        .maybeSingle();
+      if (legacy.error) throw new Error(legacy.error.message);
+      const row = legacy.data;
+      const name = row?.full_name || [row?.given_names, row?.surname].filter(Boolean).join(' ') || null;
+      return Array.from({ length: travelerCount }, (_, i) => ({
+        travelerIndex: i,
+        hasIdentity: i === 0 && Boolean(name),
+        name: i === 0 && name ? name : null,
+        passportNumberMasked: i === 0 ? maskPassportNumber(row?.passport_number) : null,
+        dateOfBirth: i === 0 ? row?.date_of_birth || null : null,
+        photoAttached: i === 0 ? Boolean(row?.face_photo_url) && !String(row.face_photo_url).startsWith('pending://') : false,
+        // Legacy rows have no id selected in this fallback query — without a
+        // traveler_index column there's only ever one traveler anyway, so
+        // there's nothing to disambiguate and no verificationId is needed.
+        verificationId: null,
+      }));
+    }
+    throw new Error(error.message);
+  }
+
+  const rows = data || [];
+  return Array.from({ length: travelerCount }, (_, i) => {
+    const row = rows.find((r) => Number(r.traveler_index ?? 0) === i);
+    const name = row?.full_name || [row?.given_names, row?.surname].filter(Boolean).join(' ').trim() || null;
+    return {
+      travelerIndex: i,
+      hasIdentity: Boolean(row && name),
+      name: name || null,
+      passportNumberMasked: row ? maskPassportNumber(row.passport_number) : null,
+      dateOfBirth: row?.date_of_birth || null,
+      photoAttached: Boolean(row?.face_photo_url) && !String(row?.face_photo_url).startsWith('pending://'),
+      // Echoed back by the client on POST /api/passport/face-photo as
+      // travelerVerificationId — the server rejects the upload if it
+      // doesn't match the row actually at this index at write time. See
+      // resolveTravelerForPhotoUpload / saveFacePhoto's identity-binding
+      // check.
+      verificationId: row?.id || null,
+    };
+  });
+}
+
+// ── used by passport.controller.js (saveFacePhoto) ──────────────────────────
+// Server-side authority for "is this travelerIndex a legitimate target for
+// this user's photo upload, and who does it belong to". The upload handler
+// must call this — and must NOT trust a client-supplied traveler name or
+// passport number — before writing any file. Throws a typed error the
+// controller can map to the right HTTP status.
+export async function resolveTravelerForPhotoUpload(userId, packageId, travelerIndex) {
+  if (!packageId) {
+    const e = new Error('packageId is required.'); e.status = 400; throw e;
+  }
+  const idx = Number(travelerIndex);
+  if (!Number.isInteger(idx) || idx < 0) {
+    const e = new Error('A valid travelerIndex is required.'); e.status = 400; throw e;
+  }
+
+  const booking = await getActiveBookingState(userId, packageId);
+  if (!booking) {
+    const e = new Error('No active booking found for this package.'); e.status = 403; throw e;
+  }
+  if (idx >= booking.travelerCount) {
+    const e = new Error('travelerIndex is out of range for this booking.'); e.status = 400; throw e;
+  }
+
+  const { data: row, error } = await supabaseAdmin
+    .from('passport_verifications')
+    .select('id, traveler_index, given_names, surname, full_name, passport_number')
+    .eq('user_id', userId)
+    .eq('package_id', packageId)
+    .eq('traveler_index', idx)
     .maybeSingle();
-  if (error) throw new Error(error.message);
+  if (error && parseMissingColumn(error) !== 'traveler_index') throw new Error(error.message);
 
-  const hasPhoto = Boolean(data?.face_photo_url) && !data.face_photo_url.startsWith('pending://');
+  const name = row?.full_name || [row?.given_names, row?.surname].filter(Boolean).join(' ').trim() || null;
+  if (!row || !name) {
+    const e = new Error(
+      'This traveler\u2019s passport details have not been captured yet. Please complete their passport scan before adding a photo.'
+    );
+    e.status = 409;
+    throw e;
+  }
 
-  return { url: data?.face_photo_url || null, complete: hasPhoto };
+  return {
+    verificationId: row.id,
+    bookingId: booking.id,
+    travelerIndex: idx,
+    name,
+    passportNumberMasked: maskPassportNumber(row.passport_number),
+  };
 }
 
 // =============================================================================
@@ -98,17 +294,28 @@ export const getOnboardingStatus = async (req, res) => {
     const { packageId } = req.query;
     if (!packageId) return res.status(400).json({ success: false, message: 'packageId is required.' });
 
-    const [contact, nextOfKin, idPhoto] = await Promise.all([
+    const booking = await getActiveBookingState(userId, packageId);
+    if (!booking) {
+      return res.status(403).json({ success: false, message: 'No active booking found for this package.' });
+    }
+
+    const [contact, nextOfKin, idPhoto, travelers] = await Promise.all([
       getContactState(userId),
       getNextOfKinState(userId, packageId),
-      getIdPhotoState(userId, packageId),
+      getIdPhotoState(userId, packageId, booking.travelerCount),
+      getTravelerIdentities(userId, packageId, booking.travelerCount),
     ]);
 
     return res.json({
       success: true,
+      booking: { id: booking.id, travelerCount: booking.travelerCount, status: booking.status },
       contact,
       nextOfKin,
       idPhoto,
+      // DB-sourced identity per traveler slot (name + masked passport number),
+      // used by the client to show/confirm WHO a photo is being attached to
+      // before upload. Never derived from anything the client sent us.
+      travelers,
       allComplete: contact.complete && nextOfKin.complete && idPhoto.complete,
     });
   } catch (err) {
@@ -126,7 +333,7 @@ export const getMissingOnboarding = async (req, res) => {
 
     const { data: bookings, error: bErr } = await supabaseAdmin
       .from('bookings')
-      .select('id, package_id, status')
+      .select('id, package_id, traveler_count, status')
       .eq('user_id', userId)
       .in('status', ['confirmed', 'pending']);
     if (bErr) throw new Error(bErr.message);
@@ -138,18 +345,24 @@ export const getMissingOnboarding = async (req, res) => {
       getContactState(userId),
       supabaseAdmin.from('next_of_kin').select('package_id, full_name, phone')
         .eq('user_id', userId).in('package_id', packageIds),
-      supabaseAdmin.from('passport_verifications').select('package_id, face_photo_url')
+      supabaseAdmin.from('passport_verifications').select('package_id, traveler_index, face_photo_url')
         .eq('user_id', userId).in('package_id', packageIds),
     ]);
 
     const kinComplete = new Set(
       (kinRows.data || []).filter((k) => k.full_name && k.phone).map((k) => k.package_id)
     );
-    const idPhotoComplete = new Set(
-      (idPhotoRows.data || [])
-        .filter((p) => p.face_photo_url && !p.face_photo_url.startsWith('pending://'))
-        .map((p) => p.package_id)
-    );
+    const photoCoverage = new Map();
+    const indexColumnMissing = parseMissingColumn(idPhotoRows.error) === 'traveler_index';
+
+    if (!idPhotoRows.error) {
+      (idPhotoRows.data || []).forEach((row) => {
+        if (!row.face_photo_url || row.face_photo_url.startsWith('pending://')) return;
+        const pkg = row.package_id;
+        if (!photoCoverage.has(pkg)) photoCoverage.set(pkg, new Set());
+        photoCoverage.get(pkg).add(Number(row.traveler_index ?? 0));
+      });
+    }
 
     const bookingsMissingDetails = bookings
       .map((b) => ({
@@ -157,7 +370,18 @@ export const getMissingOnboarding = async (req, res) => {
         packageId: b.package_id,
         missingContact: !contact.complete,
         missingNextOfKin: !kinComplete.has(b.package_id),
-        missingIdPhoto: !idPhotoComplete.has(b.package_id),
+        missingIdPhoto: (() => {
+          const expected = Math.max(1, Number(b.traveler_count) || 1);
+          const covered = photoCoverage.get(b.package_id) || new Set();
+
+          if (indexColumnMissing) {
+            // Legacy mode: treat any uploaded photo as completion for single-traveler behavior.
+            return covered.size === 0;
+          }
+
+          if (covered.size === 0) return true;
+          return covered.size < expected;
+        })(),
       }))
       .filter((b) => b.missingContact || b.missingNextOfKin || b.missingIdPhoto);
 

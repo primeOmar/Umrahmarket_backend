@@ -11,7 +11,6 @@ const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 if (!supabaseUrl || !supabaseServiceKey) {
-  console.error('Missing Supabase environment variables');
   process.exit(1);
 }
 
@@ -67,8 +66,6 @@ async function populatePackages() {
     // Parse CSV
     const packages = parseCSV(csvText);
 
-    console.log(`Found ${packages.length} packages to insert`);
-
     // Insert packages
     for (const pkg of packages) {
       // Prepare package data for insertion
@@ -107,24 +104,18 @@ async function populatePackages() {
         status: 'Active'
       };
 
-      console.log(`Inserting package: ${pkg.name}`);
-
-      const { data, error } = await supabase
+      const { error } = await supabase
         .from('packages')
         .insert([packageData])
         .select();
 
       if (error) {
-        console.error(`Error inserting package ${pkg.name}:`, error);
-      } else {
-        console.log(`✅ Inserted package: ${pkg.name}`);
+        continue;
       }
     }
 
-    console.log('Package population completed');
-
   } catch (error) {
-    console.error('Error populating packages:', error);
+    process.exit(1);
   }
 }
 

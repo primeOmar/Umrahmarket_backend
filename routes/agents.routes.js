@@ -48,7 +48,7 @@ const getOfficePhotoUrls = async (agentId) => {
       .maybeSingle();
     docRow = data;
   } catch (err) {
-    console.warn(`[agents] office photo lookup failed for ${agentId}:`, err.message);
+    
     return [];
   }
 
@@ -64,7 +64,7 @@ const getOfficePhotoUrls = async (agentId) => {
           sorted.map((obj) =>
             getSignedUrl(R2, new GetObjectCommand({ Bucket: BUCKET, Key: obj.Key }), { expiresIn: 3600 })
               .catch((err) => {
-                console.warn(`[agents] signed URL failed for ${obj.Key}:`, err.message);
+                
                 return null;
               })
           )
@@ -73,7 +73,7 @@ const getOfficePhotoUrls = async (agentId) => {
       if (signed.length > 0) return signed;
     }
   } catch (err) {
-    console.warn(`[agents] office photo R2 listing failed for ${agentId}:`, err.message);
+    
   }
 
   // Fallback — nothing found under the R2 prefix; use the stored value(s)
@@ -131,7 +131,7 @@ router.get('/', async (req, res) => {
 
     res.json({ success: true, agents: result });
   } catch (err) {
-    console.error('[agents] list error:', err);
+    
     res.status(500).json({ success: false, message: 'Failed to load agents' });
   }
 });
@@ -196,7 +196,7 @@ router.get('/:id', async (req, res) => {
       },
     });
   } catch (err) {
-    console.error('[agents] detail error:', err);
+    
     res.status(500).json({ success: false, message: 'Failed to load agent' });
   }
 });

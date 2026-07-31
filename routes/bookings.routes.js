@@ -2,6 +2,7 @@
 import express from 'express';
 import { supabaseAdmin } from '../config/supabase.js';
 import { requireAuth } from '../middleware/auth.middleware.js';
+import { sendBookingReceiptEmail } from '../services/bookingReceipt.service.js';
 
 const router = express.Router();
 
@@ -15,7 +16,7 @@ const recoverMissingBookings = async (userId) => {
     .not('payment_id', 'is', null);
 
   if (existingErr) {
-    console.error('[recoverMissingBookings] Existing bookings load failed:', existingErr.message);
+    
     return;
   }
 
@@ -59,7 +60,9 @@ const recoverMissingBookings = async (userId) => {
     .from('bookings')
     .upsert(bookingRecords, { onConflict: 'payment_id', ignoreDuplicates: true });
 
-  if (insertErr) console.error('[recoverMissingBookings] Insert failed:', insertErr.message);
+  if (insertErr) {
+    // Recovery is best-effort and should not fail request paths.
+  }
 };
 
 // GET /api/bookings/my
@@ -68,9 +71,7 @@ router.get('/my', requireAuth, async (req, res) => {
     const userId = req.user?.id;
     if (!userId) return res.status(401).json({ success: false, message: 'Unauthorised' });
 
-    recoverMissingBookings(userId).catch(err =>
-      console.error('[getMyBookings] Background recovery failed:', err)
-    );
+    recoverMissingBookings(userId).catch(() => {});
 
     const { data: rawBookings, error: bookingsError } = await supabaseAdmin
       .from('bookings')
@@ -106,7 +107,7 @@ router.get('/my', requireAuth, async (req, res) => {
 
     return res.json({ success: true, bookings: bookingsWithDetails, count: bookingsWithDetails.length });
   } catch (err) {
-    console.error('[getMyBookings] Unexpected error:', err.message);
+    
     return res.status(500).json({ success: false, message: 'Server error' });
   }
 });
@@ -164,7 +165,7 @@ router.get('/agent-clients', requireAuth, async (req, res) => {
     if (passErr) {
       // Don't fail the whole dashboard if this lookup has a problem —
       // clients just show as unverified, same as before this fix existed.
-      console.error('[getAgentClients] passport_verifications lookup failed:', passErr.message);
+      
     }
 
     const passportMap = Object.fromEntries(
@@ -208,7 +209,58 @@ router.get('/agent-clients', requireAuth, async (req, res) => {
 
     return res.json({ success: true, clients });
   } catch (err) {
-    console.error('[getAgentClients] Unexpected error:', err.message);
+    
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// POST /api/bookings/:id/resend-receipt
+// Sends booking receipt email again for the authenticated booking owner.
+router.post('/:id/resend-receipt', requireAuth, async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    const bookingId = req.params.id;
+    if (!userId) return res.status(401).json({ success: false, message: 'Unauthorised' });
+    if (!bookingId) return res.status(400).json({ success: false, message: 'booking id is required' });
+
+    const { data: booking, error: bookErr } = await supabaseAdmin
+      .from('bookings')
+      .select('id, user_id, payment_id')
+      .eq('id', bookingId)
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (bookErr || !booking) {
+      return res.status(404).json({ success: false, message: 'Booking not found' });
+    }
+
+    if (!booking.payment_id) {
+      return res.status(422).json({ success: false, message: 'Booking has no payment record yet' });
+    }
+
+    const result = await sendBookingReceiptEmail({
+      paymentId: booking.payment_id,
+      bookingId: booking.id,
+      force: true,
+    });
+
+    if (!result?.success) {
+      return res.status(422).json({
+        success: false,
+        message: 'Receipt email not sent',
+        reason: result?.reason || 'unknown',
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: `Receipt email sent to ${result.recipient}`,
+      recipient: result.recipient,
+      messageId: result.messageId || null,
+      reason: result.reason || null,
+    });
+  } catch (err) {
+    
     return res.status(500).json({ success: false, message: 'Server error' });
   }
 });

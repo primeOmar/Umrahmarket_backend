@@ -163,25 +163,19 @@ const packages = [
 
 async function seedPackages() {
   try {
-    console.log('🌱 Starting package seeding...');
-    
     for (const pkg of packages) {
-      const { data, error } = await supabase
+      const { error } = await supabase
         .from('packages')
         .insert([pkg])
         .select();
-      
+
       if (error) {
-        console.error(`❌ Error inserting ${pkg.name}:`, error);
-      } else {
-        console.log(`✅ Inserted: ${pkg.name}`);
+        continue;
       }
     }
-    
-    console.log('✅ Seeding complete!');
+
     process.exit(0);
   } catch (err) {
-    console.error('❌ Seeding failed:', err);
     process.exit(1);
   }
 }

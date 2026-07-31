@@ -48,7 +48,7 @@ export const logAgentVisit = async (req, res) => {
 
     res.status(201).json('Thank you!');
   } catch (err) {
-    console.error('[logAgentVisit]', err);
+    
     res.status(500).json({ error: 'Failed to log agent visit' });
   }
 };
@@ -105,7 +105,7 @@ export const logPackageVisit = async (req, res) => {
 
     res.status(201).json('Thank you!');
   } catch (err) {
-    console.error('[logPackageVisit]', err);
+    
     res.status(500).json({ error: 'Failed to log package visit' });
   }
 }
@@ -170,7 +170,7 @@ export const getAgentVisits = async (req, res) => {
 
     res.json({ agents, totalVisits: data.length });
   } catch (err) {
-    console.error('[getAgentVisits]', err);
+    
     res.status(500).json({ error: 'Failed to fetch agent visits' });
   }
 };

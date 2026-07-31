@@ -54,6 +54,6 @@ export const notifyAgents = async (conversation, questionText) => {
         </div>`,
     });
   } catch (error) {
-    console.error('[chatMailer] agent notification failed:', error);
+    
   }
 };

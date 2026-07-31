@@ -2,7 +2,7 @@ import supabase from '../../config/supabase.js';
 import { deleteImagesFromR2 } from '../../middleware/uploads/Uploadtocloudflare.js';
 
 export const handleDatabaseError = (res, error) => {
-  console.error('Database error:', error);
+  
   return res.status(500).json({ success: false, message: 'An internal server error occurred.' });
 };
 
@@ -47,6 +47,38 @@ function sanitizeDatePair(inRaw, outRaw) {
 function sanitizeTags(arr, maxLen = 80, maxCount = 30) {
   if (!Array.isArray(arr)) return [];
   return arr.slice(0, maxCount).map((t) => sanitizeText(t, maxLen)).filter(Boolean);
+}
+
+// Age-tier pricing (stored as a single `price_tiers` jsonb column):
+//   adult       — 12+ yrs, required, mirrors the top-level `price` column
+//                 so every existing query/UI that reads pkg.price keeps working
+//   child       — 7-11 yrs
+//   minor_child — 2-6 yrs
+//   infant      — under 2 yrs
+// Any tier the agent leaves blank/invalid falls back to the adult price —
+// never null — so a booking for that age group always resolves to a real
+// amount instead of the booking modal having to guess.
+function sanitizePriceTiers(raw, adultPrice) {
+  let parsed = {};
+  if (raw) {
+    try {
+      parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (!parsed || typeof parsed !== 'object') parsed = {};
+    } catch {
+      parsed = {};
+    }
+  }
+  const adult = sanitizeNumber(parsed.adult) ?? adultPrice ?? 0;
+  const tierOrFallback = (key) => {
+    const n = sanitizeNumber(parsed[key]);
+    return (n !== null && n >= 0) ? n : adult;
+  };
+  return {
+    adult,
+    child: tierOrFallback('child'),
+    minor_child: tierOrFallback('minor_child'),
+    infant: tierOrFallback('infant'),
+  };
 }
 
 // Used by both create (duplicate carries photos over) and update (agent kept
@@ -95,6 +127,7 @@ export const createPackage = async (req, res) => {
   const original_price = sanitizeNumber(req.body.original_price);
   const discount       = sanitizeNumber(req.body.discount);
   const duration       = sanitizeNumber(req.body.duration);
+  const price_tiers    = sanitizePriceTiers(req.body.price_tiers, price);
 
   const min_group_size = sanitizeNumber(req.body.min_group_size) ?? 1;
   const max_group_size = sanitizeNumber(req.body.max_group_size) ?? 50;
@@ -131,7 +164,7 @@ const madinah_hotel_distance = sanitizeText(req.body.madinah_hotel_distance, 30)
 
   const newPackage = {
     name, type, location, description,
-    price, original_price, discount, duration,
+    price, original_price, discount, duration, price_tiers,
     available_from, available_to,
     min_group_size, max_group_size,
     makkah_hotel_name, makkah_hotel_rating, makkah_hotel_distance,
@@ -168,6 +201,7 @@ const madinah_hotel_distance = sanitizeText(req.body.madinah_hotel_distance, 30)
       original_price: original_price || null,
       discount: discount || null,
       duration,
+      price_tiers,
       available_from: available_from || null,
       available_to: available_to || null,
       min_group_size,
@@ -196,26 +230,21 @@ const madinah_hotel_distance = sanitizeText(req.body.madinah_hotel_distance, 30)
       updated_at: currentTime,
     };
 
-    console.log('[createPackage] Inserting package:', { name, type, location, price, duration });
+    
 
     const { data, error } = await supabase
       .from('packages')
       .insert([packageToInsert])
-      .select('id, name, type, location, price, duration, status, created_by, agent_name, agent_number');
+      .select('id, name, type, location, price, price_tiers, duration, status, created_by, agent_name, agent_number');
 
     if (error) {
-      console.error('[createPackage] Supabase insert error:', error);
-      console.error('[createPackage] Error details:', {
-        message: error.message,
-        code: error.code,
-        details: error.details,
-        hint: error.hint,
-      });
+      
+      
       throw error;
     }
 
     const record = data?.[0] ?? null;
-    console.log('Package created successfully:', record);
+    
 
     return res.status(201).json({
       success:      true,
@@ -278,6 +307,7 @@ export const updatePackage = async (req, res) => {
   const original_price = sanitizeNumber(req.body.original_price);
   const discount       = sanitizeNumber(req.body.discount);
   const duration       = sanitizeNumber(req.body.duration);
+  const price_tiers    = sanitizePriceTiers(req.body.price_tiers, price);
 
   const min_group_size = sanitizeNumber(req.body.min_group_size) ?? 1;
   const max_group_size = sanitizeNumber(req.body.max_group_size) ?? 50;
@@ -322,6 +352,7 @@ export const updatePackage = async (req, res) => {
       original_price: original_price || null,
       discount: discount || null,
       duration,
+      price_tiers,
       available_from: available_from || null,
       available_to: available_to || null,
       min_group_size,
@@ -349,10 +380,10 @@ export const updatePackage = async (req, res) => {
       .from('packages')
       .update(packageToUpdate)
       .eq('id', id)
-      .select('id, name, type, location, price, duration, status, created_by, agent_name, agent_number, image_urls');
+      .select('id, name, type, location, price, price_tiers, duration, status, created_by, agent_name, agent_number, image_urls');
 
     if (error) {
-      console.error('[updatePackage] Supabase update error:', error);
+      
       throw error;
     }
 
@@ -365,9 +396,7 @@ export const updatePackage = async (req, res) => {
     const previousUrls = Array.isArray(existing.image_urls) ? existing.image_urls : [];
     const removedUrls = previousUrls.filter((u) => !image_urls.includes(u));
     if (removedUrls.length > 0) {
-      deleteImagesFromR2(removedUrls).catch((err) =>
-        console.error('[updatePackage] R2 cleanup failed:', err.message)
-      );
+      deleteImagesFromR2(removedUrls).catch(() => {});
     }
 
     return res.status(200).json({
@@ -420,16 +449,14 @@ export const deletePackage = async (req, res) => {
       .eq('id', id);
 
     if (error) {
-      console.error('[deletePackage] Supabase delete error:', error);
+      
       throw error;
     }
 
     // Row is gone either way at this point — cleanup is best-effort and
     // shouldn't turn into a failed response if R2 hiccups.
     if (Array.isArray(existing.image_urls) && existing.image_urls.length > 0) {
-      deleteImagesFromR2(existing.image_urls).catch((err) =>
-        console.error('[deletePackage] R2 cleanup failed:', err.message)
-      );
+      deleteImagesFromR2(existing.image_urls).catch(() => {});
     }
 
     return res.status(200).json({

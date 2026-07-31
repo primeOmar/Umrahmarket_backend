@@ -2,7 +2,7 @@ import supabase from '../../config/supabase.js';
 import { deleteResourceFromR2 } from './r2ResourceUpload.js';
 
 export const handleDatabaseError = (res, error) => {
-  console.error('Database error:', error);
+  
   return res.status(500).json({ success: false, message: 'An internal server error occurred.' });
 };
 
@@ -61,7 +61,7 @@ export const createResource = async (req, res) => {
       .single();
 
     if (error) {
-      console.error('[createResource] Supabase insert error:', error);
+      
       // Roll back the uploaded file so we don't leave orphans in R2
       await deleteResourceFromR2(resourceFile.url);
       throw error;

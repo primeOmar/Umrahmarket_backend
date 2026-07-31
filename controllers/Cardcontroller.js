@@ -1,32 +1,10 @@
-// controllers/Cardcontroller.js
-// ─────────────────────────────────────────────────────────────────────────────
-// Card payment via Pesapal (PCI-DSS compliant — hosted payment page).
-// 
-// HOW IT WORKS (card data never touches your server):
-//   1. POST /api/payments/card/initiate  → backend gets Pesapal token,
-//      registers IPN, submits order → returns redirect_url to frontend
-//   2. Frontend redirects user to Pesapal hosted checkout page
-//      (user enters card / M-Pesa on Pesapal's PCI-certified servers)
-//   3. Pesapal redirects back to PESAPAL_CALLBACK_URL/:packageId with ?OrderTrackingId=xxx
-//   4. Frontend calls POST /api/payments/card/verify { orderTrackingId, packageId }
-//   5. Backend queries Pesapal transaction status server-to-server
-//   6. All security checks pass → booking created in Supabase
-//   7. POST /api/payments/card/ipn  ← Pesapal async notification (backup)
-//
-// Required env vars (Render dashboard):
-//   PESAPAL_CONSUMER_KEY      ← from Pesapal merchant dashboard
-//   PESAPAL_CONSUMER_SECRET   ← from Pesapal merchant dashboard
-//   PESAPAL_ENV               ← 'sandbox' or 'production'
-//   PESAPAL_CALLBACK_URL      ← https://umrahmarket.vercel.app/payment/callback
-//   PESAPAL_IPN_URL           ← https://umrahmarket-backend.onrender.com/api/payments/card/ipn
-//   KES_PER_USD               ← e.g. 130  (now overridden by live rate)
-// ─────────────────────────────────────────────────────────────────────────────
-
 import axios             from 'axios';
 import crypto            from 'crypto';
 import { supabaseAdmin } from '../config/supabase.js';
 import { createBookingMessage } from './messagesController.js';
-import { getUsdKesRate, usdToKes } from '../services/currency.service.js'; // <-- NEW
+import { sendBookingReceiptEmail } from '../services/bookingReceipt.service.js';
+import { getUsdKesRate, usdToKes } from '../services/currency.service.js'; 
+import { computeBookingAmount } from '../services/pricing.service.js'; 
 
 const KES_RATE   = Number(process.env.KES_PER_USD) || 130; // kept for fallback
 const IS_SANDBOX = (process.env.PESAPAL_ENV || 'sandbox') !== 'production';
@@ -108,7 +86,7 @@ async function queryTransaction(orderTrackingId, token) {
 export const initiate = async (req, res) => {
   try {
     const userId     = req.user?.id;
-    const { packageId, currency = 'KES' } = req.body; // <-- added currency
+    const { packageId, currency = 'KES', travelers: rawTravelers } = req.body; // <-- added currency + travelers
 
     if (!userId)
       return res.status(401).json({ success: false, message: 'Unauthorised' });
@@ -122,15 +100,23 @@ export const initiate = async (req, res) => {
     if (!isUUID && !isObjectId && !isNumericId)
       return res.status(400).json({ success: false, message: 'Invalid packageId' });
 
+    // ── Fail fast on missing Pesapal config — clearer than a mystery 500 ─────
+    const missingEnv = ['PESAPAL_CONSUMER_KEY', 'PESAPAL_CONSUMER_SECRET', 'PESAPAL_IPN_URL', 'PESAPAL_CALLBACK_URL']
+      .filter(k => !process.env[k]);
+    if (missingEnv.length) {
+      
+      return res.status(500).json({ success: false, message: 'Payment provider misconfigured. Contact support.' });
+    }
+
     // ── 1. Fetch package price from DB — NEVER trust frontend ────────────────
     const { data: pkg, error: pkgErr } = await supabaseAdmin
       .from('packages')
-      .select('id, name, price, status, created_by, agent_name')
+      .select('id, name, price, price_tiers, status, created_by, agent_name')
       .eq('id', packageId)
       .maybeSingle();
 
     if (pkgErr) {
-      console.error('[Card initiate] DB error:', pkgErr.message);
+      
       return res.status(500).json({ success: false, message: 'Failed to fetch package' });
     }
     if (!pkg)
@@ -140,12 +126,29 @@ export const initiate = async (req, res) => {
     if (!['active', 'published', 'approved'].includes(pkgStatus))
       return res.status(404).json({ success: false, message: 'Package not available for booking' });
 
-    const priceUSD = pkg.price ?? 0;
-    if (priceUSD <= 0)
+    if ((pkg.price ?? 0) <= 0)
       return res.status(400).json({ success: false, message: 'Package has no valid price' });
 
+    // ── Compute total from age-tier prices × requested traveler counts ───────
+    // NEVER trust a client-sent amount — only the traveler *counts* come from
+    // the request; every price comes from the package row fetched above.
+    let travelers, totalTravelers, priceUSD, priceBreakdown;
+    try {
+      ({ travelers, totalTravelers, totalUSD: priceUSD, breakdown: priceBreakdown } =
+        computeBookingAmount(pkg, rawTravelers));
+    } catch (calcErr) {
+      return res.status(calcErr.status || 400).json({ success: false, message: calcErr.message });
+    }
+
     // ── Get live FX rate and convert to KES ──────────────────────────────────
-    const rate = await getUsdKesRate();
+    let rate;
+    try {
+      rate = await getUsdKesRate();
+      if (!rate || isNaN(rate) || rate <= 0) throw new Error(`Invalid rate returned: ${rate}`);
+    } catch (fxErr) {
+      
+      rate = KES_RATE; // module-level fallback, defined at top of file
+    }
     const amountKes = usdToKes(priceUSD, rate);
 
     // ── Check if user already has a confirmed booking for this package ──
@@ -158,7 +161,7 @@ export const initiate = async (req, res) => {
       .maybeSingle();
 
     if (bookingErr) {
-      console.error('[Card initiate] Booking check error:', bookingErr.message);
+      
       return res.status(500).json({ success: false, message: 'Failed to verify booking status' });
     }
 
@@ -166,28 +169,39 @@ export const initiate = async (req, res) => {
       return res.status(400).json({ success: false, message: 'You have already booked this package. You cannot book the same package twice.' });
     }
 
-    // ── Require passport verification for THIS package before payment ────────
-    // The frontend BookingFlow already gates the UI on this, but that's not
-    // enforcement — a request made directly against this endpoint must not be
-    // able to skip verification just because it never went through the modal.
-    const { data: passport, error: passportErr } = await supabaseAdmin
+    // ── Require passport verification for EVERY traveler on this booking ────
+    // A booking with N travelers has N passport_verifications rows — one per
+    // traveler_index — so this must NOT be a .maybeSingle() lookup on just
+    // (user_id, package_id). Doing that threw "JSON object requested,
+    // multiple (or no) rows returned" for any 2+-traveler booking, which was
+    // the exact 500 seen in production. Instead, fetch every traveler's row
+    // and confirm each one individually passed verification.
+    const travelerIndices = Array.from({ length: totalTravelers }, (_, i) => i);
+    const { data: passportRows, error: passportErr } = await supabaseAdmin
       .from('passport_verifications')
-      .select('verification_status, verified')
+      .select('traveler_index, verification_status, verified')
       .eq('user_id', userId)
       .eq('package_id', packageId)
-      .maybeSingle();
+      .in('traveler_index', travelerIndices);
 
     if (passportErr) {
-      console.error('[Card initiate] Passport verification check error:', passportErr.message);
+      
       return res.status(500).json({ success: false, message: 'Failed to verify passport status' });
     }
 
-    const passportVerified = passport?.verification_status === 'verified' || passport?.verified === true;
-    if (!passportVerified) {
+    const verifiedByIndex = new Map(
+      (passportRows || []).map(r => [
+        r.traveler_index,
+        r.verification_status === 'verified' || r.verification_status === 'manual_review' || r.verified === true,
+      ])
+    );
+    const allVerified = travelerIndices.every(i => verifiedByIndex.get(i) === true);
+
+    if (!allVerified) {
       return res.status(403).json({
         success: false,
         code:    'PASSPORT_NOT_VERIFIED',
-        message: 'Please complete passport verification for this package before paying.',
+        message: 'Please complete passport verification for every traveler on this booking before paying.',
       });
     }
 
@@ -195,7 +209,7 @@ export const initiate = async (req, res) => {
     const tenMinAgo = new Date(Date.now() - 10 * 60_000).toISOString();
     const { data: existing } = await supabaseAdmin
       .from('payments')
-      .select('id, pesapal_order_tracking_id, pesapal_redirect_url')
+      .select('id, pesapal_order_tracking_id, pesapal_redirect_url, travelers')
       .eq('user_id', userId)
       .eq('package_id', packageId)
       .eq('method', 'CARD')
@@ -204,7 +218,13 @@ export const initiate = async (req, res) => {
       .not('pesapal_redirect_url', 'is', null)
       .maybeSingle();
 
-    if (existing?.pesapal_redirect_url) {
+    // Only resume the pending order if the traveler selection hasn't changed
+    // since it was created — otherwise a user who went back and added more
+    // people would silently be resumed into paying the OLD, smaller amount.
+    const sameTravelers = existing?.travelers &&
+      JSON.stringify(existing.travelers) === JSON.stringify(travelers);
+
+    if (existing?.pesapal_redirect_url && sameTravelers) {
       return res.json({
         success:         true,
         redirectUrl:     existing.pesapal_redirect_url,
@@ -218,7 +238,7 @@ export const initiate = async (req, res) => {
     try {
       token = await getPesapalToken();
     } catch (authErr) {
-      console.error('[Card initiate] Pesapal auth error:', authErr.message);
+      
       return res.status(502).json({ success: false, message: `Pesapal auth failed: ${authErr.message}` });
     }
 
@@ -227,7 +247,7 @@ export const initiate = async (req, res) => {
     try {
       ipnId = await getIpnId(token);
     } catch (ipnErr) {
-      console.error('[Card initiate] IPN registration error:', ipnErr.message);
+      
       return res.status(502).json({ success: false, message: 'Payment setup failed. Please try again.' });
     }
 
@@ -243,7 +263,7 @@ export const initiate = async (req, res) => {
       id:                    merchantRef,
       currency:              'KES',
       amount:                amountKes, // <-- use converted KES amount
-      description:           `Umrah Package: ${(pkg.name || '').slice(0, 100)}`,
+      description:           `Umrah Package: ${(pkg.name || '').slice(0, 90)} (${totalTravelers} traveler${totalTravelers === 1 ? '' : 's'})`,
       callback_url:          callbackUrl,
       notification_id:       ipnId,
       billing_address: {
@@ -270,12 +290,12 @@ export const initiate = async (req, res) => {
       orderRes = data;
     } catch (orderErr) {
       const detail = orderErr.response?.data ? JSON.stringify(orderErr.response.data) : orderErr.message;
-      console.error('[Card initiate] Pesapal order submit error:', detail);
+      
       return res.status(502).json({ success: false, message: `Payment initiation failed: ${detail}` });
     }
 
     if (!orderRes?.redirect_url || !orderRes?.order_tracking_id) {
-      console.error('[Card initiate] Invalid Pesapal response:', JSON.stringify(orderRes));
+      
       return res.status(502).json({ success: false, message: 'Invalid response from payment provider' });
     }
 
@@ -288,9 +308,11 @@ export const initiate = async (req, res) => {
         method:                     'CARD',
         status:                     'PENDING',
         amount_kes:                 amountKes,
-        amount_usd:                 priceUSD,        // <-- store USD price
-        fx_rate_used:               rate,            // <-- store rate used
-        currency:                   currency,        // <-- user's selected display currency
+        amount_usd:                 priceUSD,        
+        fx_rate_used:               rate,            
+        currency:                   currency,        
+        travelers:                  travelers,       
+        traveler_count:             totalTravelers,  
         phone:                      req.user?.phone || 'N/A',
         pesapal_merchant_ref:       merchantRef,
         pesapal_order_tracking_id:  orderRes.order_tracking_id,
@@ -298,11 +320,11 @@ export const initiate = async (req, res) => {
       });
 
     if (insertErr) {
-      console.error('[Card initiate] DB insert error:', insertErr.message);
+      
       return res.status(500).json({ success: false, message: 'Payment initiated but could not be recorded. Contact support.' });
     }
 
-    console.info(`[Card] Order submitted | ref: ${merchantRef} | tracking: ${orderRes.order_tracking_id} | rate: ${rate} | KES: ${amountKes}`);
+    
     return res.json({
       success:         true,
       redirectUrl:     orderRes.redirect_url,
@@ -310,7 +332,7 @@ export const initiate = async (req, res) => {
     });
 
   } catch (err) {
-    console.error('[Card initiate] Unexpected error:', err.message, err.stack);
+    
     return res.status(500).json({ success: false, message: 'Server error. Please try again.' });
   }
 };
@@ -338,7 +360,7 @@ export const verify = async (req, res) => {
     // ── 1. Find payment record — scoped to this user (IDOR prevention) ───────
     const { data: payment, error: payErr } = await supabaseAdmin
       .from('payments')
-      .select('id, user_id, package_id, amount_kes, status, pesapal_merchant_ref')
+      .select('id, user_id, package_id, amount_kes, status, pesapal_merchant_ref, travelers, traveler_count')
       .eq('pesapal_order_tracking_id', orderTrackingId)
       .eq('user_id', userId)
       .eq('package_id', packageId)
@@ -351,7 +373,7 @@ export const verify = async (req, res) => {
     if (payment.status === 'SUCCESS') {
       let { data: booking, error: bookingErr } = await supabaseAdmin
         .from('bookings')
-        .select('id, status, amount_paid, confirmed_at, package:package_id(id, name, price, image_urls, duration, created_by, agent_name)')
+        .select('id, status, amount_paid, confirmed_at, travelers, traveler_count, package:package_id(id, name, price, image_urls, duration, created_by, agent_name)')
         .eq('payment_id', payment.id)
         .maybeSingle();
 
@@ -365,18 +387,20 @@ export const verify = async (req, res) => {
             payment_method: 'CARD',
             amount_paid:    payment.amount_kes,
             currency:       'KES',
+            travelers:      payment.travelers ?? null,
+            traveler_count: payment.traveler_count ?? null,
             status:         'confirmed',
             confirmed_at:   new Date().toISOString(),
           })
-          .select('id, status, amount_paid, confirmed_at, package:package_id(id, name, price, image_urls, duration, created_by, agent_name)')
+          .select('id, status, amount_paid, confirmed_at, travelers, traveler_count, package:package_id(id, name, price, image_urls, duration, created_by, agent_name)')
           .maybeSingle();
 
         if (restoreErr) {
-          console.error('[Card verify] Missing booking restore failed:', restoreErr.message, restoreErr.details);
+          
         } else {
           booking = restoredBooking;
-          console.info(`[Card verify] Recovered missing booking ${booking?.id}`);
           
+
           // ─────────────────────────────────────────────────────────────
           // SEND AUTOMATED MESSAGE TO CLIENT AND AGENT
           // ─────────────────────────────────────────────────────────────
@@ -385,7 +409,7 @@ export const verify = async (req, res) => {
               const pkgName = booking.package?.name || 'Your booked package';
               const agentId = booking.package?.created_by || null;
               const agentName = booking.package?.agent_name || 'Travel Agency';
-              
+
               await createBookingMessage(
                 booking.id,      // bookingId
                 payment.user_id, // clientId
@@ -393,12 +417,20 @@ export const verify = async (req, res) => {
                 pkgName,         // packageName
                 agentName        // agentName
               );
-              console.log(`[Card verify] Auto-message sent for booking ${booking.id}`);
+              
             } catch (msgErr) {
-              console.error('[Card verify] Failed to send auto-message:', msgErr.message);
+              
               // Don't fail the response if messaging fails
             }
           }
+        }
+      }
+
+      if (booking?.id) {
+        try {
+          await sendBookingReceiptEmail({ paymentId: payment.id, bookingId: booking.id });
+        } catch (mailErr) {
+          
         }
       }
 
@@ -420,7 +452,7 @@ export const verify = async (req, res) => {
       token    = await getPesapalToken();
       txStatus = await queryTransaction(orderTrackingId, token);
     } catch (queryErr) {
-      console.error('[Card verify] Pesapal query error:', queryErr.message);
+      
       return res.status(502).json({ success: false, message: 'Could not verify payment. Contact support if charged.' });
     }
 
@@ -442,7 +474,7 @@ export const verify = async (req, res) => {
 
     // 3b. Currency must be KES
     if (txStatus.currency && txStatus.currency !== 'KES') {
-      console.error(`[Card verify] Currency mismatch — got ${txStatus.currency}`);
+      
       await supabaseAdmin.from('payments').update({ status: 'FAILED', result_desc: 'Currency mismatch' }).eq('id', payment.id);
       return res.status(400).json({ success: false, message: 'Currency mismatch. Contact support.' });
     }
@@ -450,7 +482,7 @@ export const verify = async (req, res) => {
     // 3c. Amount must match (allow 1 KES tolerance)
     const paidAmount = Number(txStatus.amount);
     if (!isNaN(paidAmount) && Math.abs(paidAmount - payment.amount_kes) > 1) {
-      console.error(`[Card verify] Amount mismatch — expected ${payment.amount_kes}, got ${paidAmount}`);
+      
       await supabaseAdmin.from('payments').update({ status: 'FAILED', result_desc: 'Amount mismatch' }).eq('id', payment.id);
       return res.status(400).json({ success: false, message: 'Amount mismatch. Contact support.' });
     }
@@ -477,19 +509,21 @@ export const verify = async (req, res) => {
         payment_method: 'CARD',
         amount_paid:    isNaN(paidAmount) ? payment.amount_kes : paidAmount,
         currency:       'KES',
+        travelers:      payment.travelers ?? null,
+        traveler_count: payment.traveler_count ?? null,
         status:         'confirmed',
         confirmed_at:   new Date().toISOString(),
       })
-      .select('id, status, amount_paid, confirmed_at, package:package_id(id, name, price, image_urls, duration, created_by, agent_name)')
+      .select('id, status, amount_paid, confirmed_at, travelers, traveler_count, package:package_id(id, name, price, image_urls, duration, created_by, agent_name)')
       .single();
 
     if (bookErr) {
-      console.error('[Card verify] Booking creation failed:', bookErr.message);
+      
       return res.json({ success: true, booking: null, warning: 'Payment confirmed but booking creation failed. Contact support.' });
     }
 
-    console.info(`[Card] Booking ${booking.id} created | tracking: ${orderTrackingId} | ref: ${confirmationCode}`);
     
+
     // ─────────────────────────────────────────────────────────────────────────
     // SEND AUTOMATED MESSAGE TO CLIENT AND AGENT
     // ─────────────────────────────────────────────────────────────────────────
@@ -497,7 +531,7 @@ export const verify = async (req, res) => {
       const pkgName = booking.package?.name || 'Your booked package';
       const agentId = booking.package?.created_by || null;
       const agentName = booking.package?.agent_name || 'Travel Agency';
-      
+
       await createBookingMessage(
         booking.id,      // bookingId
         payment.user_id, // clientId
@@ -505,16 +539,22 @@ export const verify = async (req, res) => {
         pkgName,         // packageName
         agentName        // agentName
       );
-      console.log(`[Card verify] Auto-message sent for booking ${booking.id}`);
+      
     } catch (msgErr) {
-      console.error('[Card verify] Failed to send auto-message:', msgErr.message);
+      
       // Don't fail the response if messaging fails
+    }
+
+    try {
+      await sendBookingReceiptEmail({ paymentId: payment.id, bookingId: booking.id });
+    } catch (mailErr) {
+      
     }
 
     return res.json({ success: true, status: 'SUCCESS', booking });
 
   } catch (err) {
-    console.error('[Card verify] Unexpected error:', err.message, err.stack);
+    
     return res.status(500).json({ success: false, message: 'Server error during payment verification.' });
   }
 };
@@ -530,15 +570,15 @@ export const ipn = async (req, res) => {
     const { orderTrackingId, orderMerchantReference } = req.body;
 
     if (!orderTrackingId) {
-      console.warn('[Card IPN] Missing orderTrackingId');
+      
       return res.status(200).json({ orderNotificationType: 'IPNCHANGE', orderTrackingId: '', orderMerchantReference: '', status: '200' });
     }
 
-    console.info(`[Card IPN] Received | tracking: ${orderTrackingId} | ref: ${orderMerchantReference}`);
+    
 
     const { data: payment } = await supabaseAdmin
       .from('payments')
-      .select('id, user_id, package_id, amount_kes, status')
+      .select('id, user_id, package_id, amount_kes, status, travelers, traveler_count')
       .eq('pesapal_order_tracking_id', orderTrackingId)
       .maybeSingle();
 
@@ -551,7 +591,7 @@ export const ipn = async (req, res) => {
       token    = await getPesapalToken();
       txStatus = await queryTransaction(orderTrackingId, token);
     } catch (qErr) {
-      console.error('[Card IPN] Query failed:', qErr.message);
+      
       return res.status(200).json({ orderNotificationType: 'IPNCHANGE', orderTrackingId, orderMerchantReference, status: '200' });
     }
 
@@ -568,7 +608,7 @@ export const ipn = async (req, res) => {
 
     const paidAmount = Number(txStatus.amount);
     if (!isNaN(paidAmount) && Math.abs(paidAmount - payment.amount_kes) > 1) {
-      console.error(`[Card IPN] Amount mismatch — expected ${payment.amount_kes}, got ${paidAmount}`);
+      
       await supabaseAdmin.from('payments').update({ status: 'FAILED', result_desc: 'IPN amount mismatch' }).eq('id', payment.id);
       return res.status(200).json({ orderNotificationType: 'IPNCHANGE', orderTrackingId, orderMerchantReference, status: '200' });
     }
@@ -586,6 +626,8 @@ export const ipn = async (req, res) => {
         payment_method: 'CARD',
         amount_paid:    isNaN(paidAmount) ? payment.amount_kes : paidAmount,
         currency:       'KES',
+        travelers:      payment.travelers ?? null,
+        traveler_count: payment.traveler_count ?? null,
         status:         'confirmed',
         confirmed_at:   new Date().toISOString(),
       })
@@ -593,10 +635,10 @@ export const ipn = async (req, res) => {
       .single();
 
     if (bookErr) {
-      console.error('[Card IPN] Booking creation failed:', bookErr.message);
-    } else {
-      console.info(`[Card IPN] Booking ${booking.id} created | tracking: ${orderTrackingId}`);
       
+    } else {
+      
+
       // ─────────────────────────────────────────────────────────────────────────
       // SEND AUTOMATED MESSAGE TO CLIENT AND AGENT (IPN path)
       // ─────────────────────────────────────────────────────────────────────────
@@ -604,7 +646,7 @@ export const ipn = async (req, res) => {
         const pkgName = booking.package?.name || 'Your booked package';
         const agentId = booking.package?.created_by || null;
         const agentName = booking.package?.agent_name || 'Travel Agency';
-        
+
         await createBookingMessage(
           booking.id,
           payment.user_id,
@@ -612,16 +654,22 @@ export const ipn = async (req, res) => {
           pkgName,
           agentName
         );
-        console.log(`[Card IPN] Auto-message sent for booking ${booking.id}`);
+        
       } catch (msgErr) {
-        console.error('[Card IPN] Failed to send auto-message:', msgErr.message);
+        
+      }
+
+      try {
+        await sendBookingReceiptEmail({ paymentId: payment.id, bookingId: booking.id });
+      } catch (mailErr) {
+        
       }
     }
 
     return res.status(200).json({ orderNotificationType: 'IPNCHANGE', orderTrackingId, orderMerchantReference, status: '200' });
 
   } catch (err) {
-    console.error('[Card IPN] Unexpected error:', err.message);
+    
     return res.status(200).json({ orderNotificationType: 'IPNCHANGE', orderTrackingId: '', orderMerchantReference: '', status: '200' });
   }
 };

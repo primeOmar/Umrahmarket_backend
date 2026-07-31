@@ -41,7 +41,7 @@ import { notifyAgents } from './chatMailer.js';
  */
 
 export const handleDatabaseError = (res, error) => {
-  console.error('Database error:', error);
+  
   return res.status(500).json({ success: false, message: 'An internal server error occurred.' });
 };
 
@@ -171,7 +171,7 @@ const broadcastOnce = (channelName, event, payload) =>
       settled = true;
       clearTimeout(timeout);
       supabase.removeChannel(channel);
-      if (!ok) console.error(`Realtime broadcast failed (${channelName}/${event}):`, err?.message || err);
+      if (!ok) ;
       resolve(ok);
     };
 

@@ -11,7 +11,7 @@ export const getAllActivePackages = async (req, res) => {
       .from('packages')
       .select(
         `id, name, type, location, description,
-         price, original_price, discount, duration,
+         price, price_tiers, original_price, discount, duration,
          available_from, available_to,
          makkah_hotel_rating, makkah_hotel_distance,
          makkah_check_in_date, makkah_check_out_date,
@@ -25,7 +25,7 @@ export const getAllActivePackages = async (req, res) => {
 
     if (error) {
       // Log but respond gracefully — never let a DB error become a 500 on a public route
-      console.error('[getAllActivePackages] Supabase error:', error.message, '| code:', error.code);
+      
       return res.status(200).json({
         success:  true,
         packages: [],
@@ -42,7 +42,7 @@ export const getAllActivePackages = async (req, res) => {
 
   } catch (error) {
     // Unexpected crash — log and return empty list, not a 500
-    console.error('[getAllActivePackages] Unexpected error:', error.message);
+    
     return res.status(200).json({
       success:  true,
       packages: [],
@@ -67,7 +67,7 @@ export const getAgentPackages = async (req, res) => {
       .from('packages')
       .select(
         `id, name, type, location, description,
-         price, original_price, discount, duration,
+         price, price_tiers, original_price, discount, duration,
          available_from, available_to, min_group_size, max_group_size,
          makkah_hotel_name, makkah_hotel_rating, makkah_hotel_distance,
          makkah_hotel_address, makkah_check_in_date, makkah_check_out_date,
@@ -84,7 +84,7 @@ export const getAgentPackages = async (req, res) => {
       .order('created_at', { ascending: false });
 
     if (error) {
-      console.error('Supabase select error:', error);
+      
       throw error;
     }
 

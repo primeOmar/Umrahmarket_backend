@@ -24,6 +24,7 @@ import {
   checkPassportValidity,
   verifyPassportImage,
   getPassportStatus,
+  getPassportStatusBatch,
   getFacePhotoStatus,
   saveFacePhoto,
 } from '../controllers/passport.controller.js';
@@ -78,6 +79,19 @@ router.get(
   getPassportStatus,
 );
 
+// ── GET /api/passport/status-batch ───────────────────────────────────────────
+// Returns verification status for every traveler slot (0..totalTravelers-1)
+// on a booking in one call — lets BookingFlow check everyone up front instead
+// of gating on just the account holder's own passport.
+router.get(
+  '/status-batch',
+  requireAuth,
+  query('packageId').trim().notEmpty().withMessage('packageId is required'),
+  query('totalTravelers').optional().isInt({ min: 1, max: 30 }).withMessage('totalTravelers must be between 1 and 30'),
+  handleValidationErrors,
+  getPassportStatusBatch,
+);
+
 // ── GET /api/passport/face-photo-status ──────────────────────────────────────
 // Returns which of the user's confirmed/pending bookings are missing a
 // face photo for their Umrah ID card.
@@ -116,6 +130,8 @@ router.post(
     });
   },
   body('packageId').trim().notEmpty().withMessage('packageId is required'),
+  body('bookingId').optional({ values: 'falsy' }).isUUID().withMessage('bookingId must be a valid UUID'),
+  body('travelerIndex').optional({ values: 'falsy' }).isInt({ min: 0, max: 29 }).withMessage('travelerIndex must be between 0 and 29'),
   handleValidationErrors,
   saveFacePhoto,
 );
