@@ -108,8 +108,7 @@ export const logPackageVisit = async (req, res) => {
     console.error('[logPackageVisit]', err);
     res.status(500).json({ error: 'Failed to log package visit' });
   }
-};
-
+}
 
 export const getAgentVisits = async (req, res) => {
   try {
@@ -129,21 +128,40 @@ export const getAgentVisits = async (req, res) => {
       return res.json({ visits: data, totalVisits: data.length });
     }
 
+    // Group by agent_name, not agent_id: "package"-type rows always have
+    // agent_id === null (packages aren't tied to a real agent record the
+    // way profile-page visits are), so keying the Map by agent_id collapses
+    // every agency's package visits into a single null-keyed bucket. Every
+    // row — package or agent type — carries a real agent_name, so that's
+    // the stable identity to group on. agent_id/verification/experience are
+    // then backfilled opportunistically from whichever row in the group
+    // actually has them (i.e. its "agent"-type rows).
     const byAgent = new Map();
     for (const row of data) {
-      if (!byAgent.has(row.agent_id)) {
-        byAgent.set(row.agent_id, {
-          agentId: row.agent_id,
+      const key = (row.agent_name || 'unknown').trim().toLowerCase();
+
+      if (!byAgent.has(key)) {
+        byAgent.set(key, {
+          agentId: null,
           agentName: row.agent_name,
-          verificationStatus: row.verification_status,
-          yearsExperience: row.years_experience,
+          verificationStatus: null,
+          yearsExperience: null,
           totalVisits: 0,
           visits: [],
         });
       }
-      const entry = byAgent.get(row.agent_id);
+
+      const entry = byAgent.get(key);
       entry.totalVisits += 1;
       entry.visits.push(row);
+
+      if (!entry.agentId && row.agent_id) entry.agentId = row.agent_id;
+      if (!entry.verificationStatus && row.verification_status) {
+        entry.verificationStatus = row.verification_status;
+      }
+      if (entry.yearsExperience == null && row.years_experience != null) {
+        entry.yearsExperience = row.years_experience;
+      }
     }
 
     const agents = [...byAgent.values()].sort(
