@@ -154,6 +154,11 @@ app.use(securityMiddleware.hpp);
 app.use(securityMiddleware.ipFilter);
 
 // ===========================================
+// STATIC ASSETS (backend-owned, e.g. receipt logo)
+// ===========================================
+app.use('/assets', express.static(path.join(__dirname, 'assets')));
+
+// ===========================================
 // HEALTH & DEBUG ENDPOINTS
 // ===========================================
 app.get('/health', (req, res) => {

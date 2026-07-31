@@ -2,7 +2,10 @@ import PDFDocument from 'pdfkit';
 import nodemailer from 'nodemailer';
 import fs from 'fs/promises';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { supabaseAdmin } from '../config/supabase.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const BRAND = {
   emerald: '#0B6B4E',
@@ -12,7 +15,15 @@ const BRAND = {
   muted: '#64748B',
 };
 
-const DEFAULT_LOGO_URL = process.env.BOOKING_RECEIPT_LOGO_URL || 'https://www.umrahmarket.net/umrahmarket.png';
+// 1) Logo bundled inside this backend repo (sibling of services/): assets/umrahmarket.png
+const BUNDLED_LOGO_PATH = path.resolve(__dirname, '..', 'assets', 'umrahmarket.png');
+
+// 2) Fallback: fetch over HTTP. Prefer the backend's own static route
+//    (set BACKEND_PUBLIC_URL to this backend's deployed domain) over the
+//    frontend's domain, since the backend controls its own uptime/deploys.
+const DEFAULT_LOGO_URL =
+  process.env.BOOKING_RECEIPT_LOGO_URL ||
+  `${process.env.BACKEND_PUBLIC_URL || 'http://localhost:5000'}/assets/umrahmarket.png`;
 
 const hasSmtpConfig = () => Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
 
@@ -20,20 +31,41 @@ const isValidEmail = (email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email |
 
 const fmtMoney = (n) => `KES ${Number(n || 0).toLocaleString('en-KE', { minimumFractionDigits: 2 })}`;
 
+// Cache across invocations so we don't hit disk/network on every receipt.
+let cachedLogoBuffer = null;
+let cachedLogoAttempted = false;
+
 async function loadLogoBuffer() {
-  const localLogoPath = path.resolve(process.cwd(), '..', 'umrah-market', 'src', 'assets', 'umrahmarket.png');
+  if (cachedLogoAttempted) return cachedLogoBuffer;
+  cachedLogoAttempted = true;
+
+  // 1) Logo bundled inside this backend repo — no dependency on a sibling
+  //    frontend folder or on process.cwd(), so it works regardless of
+  //    deploy layout or working directory.
   try {
-    return await fs.readFile(localLogoPath);
-  } catch {
-    // Fallback to URL when backend is deployed without sibling frontend files.
+    cachedLogoBuffer = await fs.readFile(BUNDLED_LOGO_PATH);
+    return cachedLogoBuffer;
+  } catch (err) {
+    console.warn(`[bookingReceipt] bundled logo not found at ${BUNDLED_LOGO_PATH}: ${err.message}`);
   }
 
+  // 2) Fallback: fetch from the backend's own static route (or an
+  //    explicit override), with a timeout so a slow/broken host never
+  //    stalls receipt generation.
   try {
-    const resp = await fetch(DEFAULT_LOGO_URL);
-    if (!resp.ok) return null;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    const resp = await fetch(DEFAULT_LOGO_URL, { signal: controller.signal });
+    clearTimeout(timeout);
+    if (!resp.ok) {
+      console.warn(`[bookingReceipt] logo URL fetch failed: ${resp.status} ${DEFAULT_LOGO_URL}`);
+      return null;
+    }
     const ab = await resp.arrayBuffer();
-    return Buffer.from(ab);
-  } catch {
+    cachedLogoBuffer = Buffer.from(ab);
+    return cachedLogoBuffer;
+  } catch (err) {
+    console.warn(`[bookingReceipt] logo URL fetch threw: ${err.message}`);
     return null;
   }
 }
