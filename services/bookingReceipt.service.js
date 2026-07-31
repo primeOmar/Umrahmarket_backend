@@ -21,7 +21,7 @@ const isValidEmail = (email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email |
 const fmtMoney = (n) => `KES ${Number(n || 0).toLocaleString('en-KE', { minimumFractionDigits: 2 })}`;
 
 async function loadLogoBuffer() {
-  const localLogoPath = path.resolve(process.cwd(), '..', 'umrah-market', 'src', 'assets', 'umramarket.png');
+  const localLogoPath = path.resolve(process.cwd(), '..', 'umrah-market', 'src', 'assets', 'umrahmarket.png');
   try {
     return await fs.readFile(localLogoPath);
   } catch {
