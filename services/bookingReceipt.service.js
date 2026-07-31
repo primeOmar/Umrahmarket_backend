@@ -12,7 +12,7 @@ const BRAND = {
   muted: '#64748B',
 };
 
-const DEFAULT_LOGO_URL = process.env.BOOKING_RECEIPT_LOGO_URL || 'https://www.umrahmarket.net/umramarket.png';
+const DEFAULT_LOGO_URL = process.env.BOOKING_RECEIPT_LOGO_URL || 'https://www.umrahmarket.net/umrahmarket.png';
 
 const hasSmtpConfig = () => Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
 
