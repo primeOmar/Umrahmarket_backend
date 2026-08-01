@@ -3,7 +3,7 @@ import crypto            from 'crypto';
 import { supabaseAdmin } from '../config/supabase.js';
 import { createBookingMessage } from './messagesController.js';
 import { sendBookingReceiptEmail } from '../services/bookingReceipt.service.js';
-import { getUsdKesRate, usdToKes } from '../services/currency.service.js'; 
+import { getUsdKesRate, usdToKes, applySellMargin } from '../services/currency.service.js'; 
 import { computeBookingAmount } from '../services/pricing.service.js'; 
 
 const KES_RATE   = Number(process.env.KES_PER_USD) || 130; // kept for fallback
@@ -86,12 +86,20 @@ async function queryTransaction(orderTrackingId, token) {
 export const initiate = async (req, res) => {
   try {
     const userId     = req.user?.id;
-    const { packageId, currency = 'KES', travelers: rawTravelers } = req.body; // <-- added currency + travelers
+    const { packageId, currency: rawCurrency = 'KES', travelers: rawTravelers } = req.body; // <-- added currency + travelers
 
     if (!userId)
       return res.status(401).json({ success: false, message: 'Unauthorised' });
     if (!packageId)
       return res.status(400).json({ success: false, message: 'packageId is required' });
+
+    // ── Normalise + validate requested settlement currency ───────────────────
+    // Card is the ONLY method that can settle in USD (Pesapal supports it).
+    // Never trust an arbitrary string from the client — whitelist only.
+    const currency = String(rawCurrency || 'KES').toUpperCase();
+    if (!['KES', 'USD'].includes(currency)) {
+      return res.status(400).json({ success: false, message: 'currency must be KES or USD' });
+    }
 
     // Validate packageId (UUID, numeric ID, or MongoDB ObjectId)
     const isUUID     = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(packageId);
@@ -141,15 +149,30 @@ export const initiate = async (req, res) => {
     }
 
     // ── Get live FX rate and convert to KES ──────────────────────────────────
-    let rate;
+    // We charge at the SELLING rate (mid + margin), never the raw mid-market
+    // rate — see currency.service.js. The margin is what protects the
+    // business from FX movement between quote and settlement without the
+    // customer ever seeing a surprise price change.
+    let midRate;
     try {
-      rate = await getUsdKesRate();
-      if (!rate || isNaN(rate) || rate <= 0) throw new Error(`Invalid rate returned: ${rate}`);
+      midRate = await getUsdKesRate();
+      if (!midRate || isNaN(midRate) || midRate <= 0) throw new Error(`Invalid rate returned: ${midRate}`);
     } catch (fxErr) {
       
-      rate = KES_RATE; // module-level fallback, defined at top of file
+      midRate = KES_RATE; // module-level fallback, defined at top of file
     }
-    const amountKes = usdToKes(priceUSD, rate);
+    const sellRate  = applySellMargin(midRate);
+    const amountKes = usdToKes(priceUSD, sellRate);
+    // Pesapal wants 2-decimal amounts — round the USD total the same way the
+    // KES total is already rounded above, so what we submit is exactly what
+    // we later compare the settled amount against. No FX margin applies to a
+    // USD order — the customer is already paying the USD list price with no
+    // conversion involved.
+    const amountUsd = Math.round(priceUSD * 100) / 100;
+    // What we actually submit to Pesapal for THIS order, based on the
+    // client's chosen settlement currency.
+    const submitAmount   = currency === 'USD' ? amountUsd : amountKes;
+    const submitCurrency = currency; // 'USD' | 'KES'
 
     // ── Check if user already has a confirmed booking for this package ──
     const { data: existingBooking, error: bookingErr } = await supabaseAdmin
@@ -209,11 +232,12 @@ export const initiate = async (req, res) => {
     const tenMinAgo = new Date(Date.now() - 10 * 60_000).toISOString();
     const { data: existing } = await supabaseAdmin
       .from('payments')
-      .select('id, pesapal_order_tracking_id, pesapal_redirect_url, travelers')
+      .select('id, pesapal_order_tracking_id, pesapal_redirect_url, travelers, currency')
       .eq('user_id', userId)
       .eq('package_id', packageId)
       .eq('method', 'CARD')
       .eq('status', 'PENDING')
+      .eq('currency', currency) // don't resume a KES order once the user has switched to USD (or vice-versa)
       .gte('created_at', tenMinAgo)
       .not('pesapal_redirect_url', 'is', null)
       .maybeSingle();
@@ -261,8 +285,8 @@ export const initiate = async (req, res) => {
     // ── 6. Submit order to Pesapal ────────────────────────────────────────────
     const orderPayload = {
       id:                    merchantRef,
-      currency:              'KES',
-      amount:                amountKes, // <-- use converted KES amount
+      currency:              submitCurrency, // 'KES' or 'USD' — whatever the client chose
+      amount:                submitAmount,   // matching amount for that currency
       description:           `Umrah Package: ${(pkg.name || '').slice(0, 90)} (${totalTravelers} traveler${totalTravelers === 1 ? '' : 's'})`,
       callback_url:          callbackUrl,
       notification_id:       ipnId,
@@ -308,8 +332,8 @@ export const initiate = async (req, res) => {
         method:                     'CARD',
         status:                     'PENDING',
         amount_kes:                 amountKes,
-        amount_usd:                 priceUSD,        
-        fx_rate_used:               rate,            
+        amount_usd:                 amountUsd,
+        fx_rate_used:               sellRate,        
         currency:                   currency,        
         travelers:                  travelers,       
         traveler_count:             totalTravelers,  
@@ -360,7 +384,7 @@ export const verify = async (req, res) => {
     // ── 1. Find payment record — scoped to this user (IDOR prevention) ───────
     const { data: payment, error: payErr } = await supabaseAdmin
       .from('payments')
-      .select('id, user_id, package_id, amount_kes, status, pesapal_merchant_ref, travelers, traveler_count')
+      .select('id, user_id, package_id, amount_kes, amount_usd, currency, status, pesapal_merchant_ref, travelers, traveler_count')
       .eq('pesapal_order_tracking_id', orderTrackingId)
       .eq('user_id', userId)
       .eq('package_id', packageId)
@@ -385,8 +409,8 @@ export const verify = async (req, res) => {
             package_id:     payment.package_id,
             payment_id:     payment.id,
             payment_method: 'CARD',
-            amount_paid:    payment.amount_kes,
-            currency:       'KES',
+            amount_paid:    payment.currency === 'USD' ? payment.amount_usd : payment.amount_kes,
+            currency:       payment.currency || 'KES',
             travelers:      payment.travelers ?? null,
             traveler_count: payment.traveler_count ?? null,
             status:         'confirmed',
@@ -472,16 +496,21 @@ export const verify = async (req, res) => {
       return res.json({ success: true, status: 'PENDING' });
     }
 
-    // 3b. Currency must be KES
-    if (txStatus.currency && txStatus.currency !== 'KES') {
+    // 3b. Currency must match whatever we actually submitted the order in
+    const expectedCurrency = payment.currency || 'KES';
+    if (txStatus.currency && txStatus.currency !== expectedCurrency) {
       
       await supabaseAdmin.from('payments').update({ status: 'FAILED', result_desc: 'Currency mismatch' }).eq('id', payment.id);
       return res.status(400).json({ success: false, message: 'Currency mismatch. Contact support.' });
     }
 
-    // 3c. Amount must match (allow 1 KES tolerance)
+    // 3c. Amount must match the amount for THAT currency
+    // (1 KES tolerance for KES orders, 0.02 USD tolerance for USD orders —
+    // covers Pesapal's own rounding on the settled amount)
+    const expectedAmount = expectedCurrency === 'USD' ? payment.amount_usd : payment.amount_kes;
+    const tolerance       = expectedCurrency === 'USD' ? 0.02 : 1;
     const paidAmount = Number(txStatus.amount);
-    if (!isNaN(paidAmount) && Math.abs(paidAmount - payment.amount_kes) > 1) {
+    if (!isNaN(paidAmount) && Math.abs(paidAmount - expectedAmount) > tolerance) {
       
       await supabaseAdmin.from('payments').update({ status: 'FAILED', result_desc: 'Amount mismatch' }).eq('id', payment.id);
       return res.status(400).json({ success: false, message: 'Amount mismatch. Contact support.' });
@@ -507,8 +536,8 @@ export const verify = async (req, res) => {
         package_id:     payment.package_id,
         payment_id:     payment.id,
         payment_method: 'CARD',
-        amount_paid:    isNaN(paidAmount) ? payment.amount_kes : paidAmount,
-        currency:       'KES',
+        amount_paid:    isNaN(paidAmount) ? expectedAmount : paidAmount,
+        currency:       expectedCurrency,
         travelers:      payment.travelers ?? null,
         traveler_count: payment.traveler_count ?? null,
         status:         'confirmed',
@@ -578,7 +607,7 @@ export const ipn = async (req, res) => {
 
     const { data: payment } = await supabaseAdmin
       .from('payments')
-      .select('id, user_id, package_id, amount_kes, status, travelers, traveler_count')
+      .select('id, user_id, package_id, amount_kes, amount_usd, currency, status, travelers, traveler_count')
       .eq('pesapal_order_tracking_id', orderTrackingId)
       .maybeSingle();
 
@@ -606,8 +635,11 @@ export const ipn = async (req, res) => {
       return res.status(200).json({ orderNotificationType: 'IPNCHANGE', orderTrackingId, orderMerchantReference, status: '200' });
     }
 
+    const ipnCurrency = payment.currency || 'KES';
+    const ipnExpectedAmount = ipnCurrency === 'USD' ? payment.amount_usd : payment.amount_kes;
+    const ipnTolerance      = ipnCurrency === 'USD' ? 0.02 : 1;
     const paidAmount = Number(txStatus.amount);
-    if (!isNaN(paidAmount) && Math.abs(paidAmount - payment.amount_kes) > 1) {
+    if (!isNaN(paidAmount) && Math.abs(paidAmount - ipnExpectedAmount) > ipnTolerance) {
       
       await supabaseAdmin.from('payments').update({ status: 'FAILED', result_desc: 'IPN amount mismatch' }).eq('id', payment.id);
       return res.status(200).json({ orderNotificationType: 'IPNCHANGE', orderTrackingId, orderMerchantReference, status: '200' });
@@ -624,8 +656,8 @@ export const ipn = async (req, res) => {
         package_id:     payment.package_id,
         payment_id:     payment.id,
         payment_method: 'CARD',
-        amount_paid:    isNaN(paidAmount) ? payment.amount_kes : paidAmount,
-        currency:       'KES',
+        amount_paid:    isNaN(paidAmount) ? ipnExpectedAmount : paidAmount,
+        currency:       ipnCurrency,
         travelers:      payment.travelers ?? null,
         traveler_count: payment.traveler_count ?? null,
         status:         'confirmed',

@@ -3,7 +3,7 @@ import { supabaseAdmin } from '../config/supabase.js';
 import { stkPush, stkQuery } from '../services/Mpesaservice.js';
 import { createBookingMessage } from './messagesController.js';
 import { sendBookingReceiptEmail } from '../services/bookingReceipt.service.js';
-import { getUsdKesRate, usdToKes } from '../services/currency.service.js'; // <-- NEW
+import { getUsdKesRate, usdToKes, applySellMargin } from '../services/currency.service.js'; // <-- NEW
 import { computeBookingAmount } from '../services/pricing.service.js'; // <-- travelers → total price
 
 const KES_RATE       = Number(process.env.KES_PER_USD) || 130; // fallback if live rate + service fallback both fail
@@ -14,13 +14,29 @@ function maskPhone(p) { return p ? `${p.slice(0, 6)}****${p.slice(-2)}` : '?'; }
 export const initiate = async (req, res) => {
   try {
     const userId    = req.user?.id;
-    const { packageId, phone, currency = 'KES', travelers: rawTravelers } = req.body; // <-- added currency + travelers
+    const { packageId, phone, currency: rawCurrency = 'KES', travelers: rawTravelers } = req.body; // <-- added currency + travelers
 
     if (!userId)
       return res.status(401).json({ success: false, message: 'Unauthorised' });
 
     if (!packageId || !phone)
       return res.status(400).json({ success: false, message: 'packageId and phone are required' });
+
+    // ── M-Pesa/Daraja only ever settles in KES — never trust the client ──────
+    // The frontend already hides M-Pesa when USD is selected, but the
+    // frontend can be bypassed, so this is the real gate. USD bookings must
+    // go through the card (Pesapal) flow instead.
+    const currency = String(rawCurrency || 'KES').toUpperCase();
+    if (currency === 'USD') {
+      return res.status(400).json({
+        success: false,
+        code:    'MPESA_USD_UNSUPPORTED',
+        message: 'M-Pesa only supports payment in KES. Please pay by card to use USD.',
+      });
+    }
+    if (currency !== 'KES') {
+      return res.status(400).json({ success: false, message: 'currency must be KES for M-Pesa' });
+    }
 
     const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(packageId);
     const isNumericId = /^[0-9]+$/.test(packageId);
@@ -72,14 +88,18 @@ export const initiate = async (req, res) => {
     }
 
     // ── Get live FX rate and convert to KES ──────────────────────────────
-    let rate;
+    // Charge at the SELLING rate (mid + margin), same as the card flow — see
+    // currency.service.js. Keeps the two payment methods priced identically
+    // for the same package and protects against FX movement/staleness.
+    let midRate;
     try {
-      rate = await getUsdKesRate();
-      if (!rate || isNaN(rate) || rate <= 0) throw new Error(`Invalid rate returned: ${rate}`);
+      midRate = await getUsdKesRate();
+      if (!midRate || isNaN(midRate) || midRate <= 0) throw new Error(`Invalid rate returned: ${midRate}`);
     } catch (fxErr) {
       
-      rate = KES_RATE; // module-level fallback, defined at top of file
+      midRate = KES_RATE; // module-level fallback, defined at top of file
     }
+    const rate      = applySellMargin(midRate); // kept as `rate` — used below and stored as fx_rate_used
     const amountKes = usdToKes(priceUSD, rate);
 
     // ── Check if user already has a confirmed booking for this package ──
