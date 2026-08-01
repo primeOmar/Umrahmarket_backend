@@ -567,7 +567,7 @@ router.post(
       // at login time (Supabase sync lag) and causes the dummy-user bug
       let { data: profile, error: profileError } = await supabaseAdmin
         .from('profiles')
-        .select('role, agent_number, company_name, first_name, last_name, approved, email_verified')
+        .select('role, agent_number, company_name, first_name, last_name, approved, email_verified, logo_url')
         .eq('id', data.user.id)
         .maybeSingle(); // ← never throws on 0 rows (unlike .single())
 
@@ -600,7 +600,7 @@ router.post(
             email_verified: true, // legacy/pre-existing account — don't retroactively nag
             created_at: new Date().toISOString(),
           }, { onConflict: 'id' })
-          .select('role, agent_number, company_name, first_name, last_name, approved, email_verified')
+          .select('role, agent_number, company_name, first_name, last_name, approved, email_verified, logo_url')
           .single();
 
         if (createError || !created) {
@@ -655,6 +655,7 @@ router.post(
             ...(userRole === 'agent' && {
               agentNumber: profile.agent_number || null,
               agentName:   profile.company_name || null,
+              logoUrl:     profile.logo_url || null,
             }),
           },
           accessToken,
@@ -721,7 +722,7 @@ router.post('/google', authRateLimiter, async (req, res) => {
           email_verified: true, // Google already verified this address
           created_at: new Date().toISOString(),
         }, { onConflict: 'id' })
-        .select('role, agent_number, company_name, first_name, last_name, approved, email_verified')
+        .select('role, agent_number, company_name, first_name, last_name, approved, email_verified, logo_url')
         .single();
 
       if (googleProfileError) {
@@ -776,6 +777,7 @@ router.post('/google', authRateLimiter, async (req, res) => {
           ...(googleRole === 'agent' && {
             agentNumber: dbProfile?.agent_number || null,
             agentName:   dbProfile?.company_name || null,
+            logoUrl:     dbProfile?.logo_url || null,
           }),
         },
         accessToken,
@@ -1154,11 +1156,15 @@ router.post('/verify-email/resend', authRateLimiter, validateEmail, async (req, 
 // ===========================================
 router.get('/me', verifyToken, async (req, res) => {
   try {
-    // Fetch fresh so emailVerified (and other fast-changing flags) reflect
-    // the current DB state rather than whatever was baked into the JWT.
+    // Fetch fresh so emailVerified, logoUrl, and other fields that change
+    // after login (agent uploads a logo, edits their profile, etc.) reflect
+    // current DB state rather than whatever was baked into the access
+    // token at login time. The JWT only ever encodes id/role/email (see
+    // generateAccessToken), so logo_url in particular can never come from
+    // req.user — it has to be fetched here on every /me call.
     const { data: profile } = await supabaseAdmin
       .from('profiles')
-      .select('email_verified')
+      .select('email_verified, company_name, first_name, last_name, agent_number, logo_url')
       .eq('id', req.user?.id || req.userId)
       .maybeSingle();
 
@@ -1168,6 +1174,12 @@ router.get('/me', verifyToken, async (req, res) => {
         user: {
           ...req.user,
           emailVerified: profile?.email_verified ?? req.user?.emailVerified ?? false,
+          // DB values win over stale JWT-derived fields once we have them.
+          firstName:  profile?.first_name  ?? req.user?.firstName,
+          lastName:   profile?.last_name   ?? req.user?.lastName,
+          agentNumber: profile?.agent_number ?? req.user?.agentNumber,
+          agentName:  profile?.company_name ?? req.user?.agentName,
+          logoUrl:    profile?.logo_url ?? null,
         },
       },
     });
