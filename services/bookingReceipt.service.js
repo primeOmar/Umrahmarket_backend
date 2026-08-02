@@ -119,17 +119,31 @@ async function renderBookingReceiptPdf({ payment, booking, clientProfile, agentP
     const travelerCount = Number(booking?.traveler_count ?? payment?.traveler_count ?? 1) || 1;
     const receiptNo = `DA-${String(payment.id).replace(/-/g, '').slice(0, 8).toUpperCase()}`;
 
-    // ───────────────────────── Letterhead-style header (white, compact) ─────────────────────────
+    // ───────────────────────── Letterhead-style header (gradient, compact) ─────────────────────────
     const HEADER_H = 92;
 
-    // Faint corner accent, echoing the lattice motif on the printed letterhead —
-    // kept subtle so it doesn't compete with the content.
+    // Top accent bar — navy → emerald → gold, the same brand palette read
+    // left to right, giving the header an immediate splash of colour.
+    const topBar = doc.linearGradient(0, 0, PAGE_W, 0);
+    topBar.stop(0, BRAND.navy).stop(0.5, BRAND.emerald).stop(1, BRAND.gold);
+    doc.rect(0, 0, PAGE_W, 5).fill(topBar);
+
+    // Soft gradient wash across the header body — near-white fading into a
+    // faint emerald tint, so the header reads as a distinct panel without
+    // fighting the dark ink text sitting on top of it.
+    const headerWash = doc.linearGradient(0, 5, PAGE_W, HEADER_H);
+    headerWash.stop(0, '#FFFFFF').stop(0.6, '#FBFBF8').stop(1, BRAND.emeraldSoft);
+    doc.rect(0, 5, PAGE_W, HEADER_H - 5).fill(headerWash);
+
+    // Gradient corner accent, echoing the lattice motif on the printed
+    // letterhead — a filled gold→emerald wedge instead of flat lines.
     doc.save();
-    doc.strokeColor(BRAND.gold).lineWidth(1);
-    for (let i = 0; i < 5; i++) {
-      doc.strokeOpacity(0.10 + i * 0.03);
-      doc.moveTo(PAGE_W - 34 - i * 9, 0).lineTo(PAGE_W, 34 + i * 9).stroke();
-    }
+    doc.rect(0, 0, PAGE_W, HEADER_H).clip();
+    const cornerGrad = doc.linearGradient(PAGE_W - 130, 0, PAGE_W, 90);
+    cornerGrad.stop(0, BRAND.gold).stop(1, BRAND.emerald);
+    doc.opacity(0.08);
+    doc.polygon([PAGE_W - 130, 0], [PAGE_W, 0], [PAGE_W, 90]).fill(cornerGrad);
+    doc.opacity(1);
     doc.restore();
 
     // Logo mark
@@ -167,27 +181,38 @@ async function renderBookingReceiptPdf({ payment, booking, clientProfile, agentP
       .text(paidAt.toLocaleDateString('en-KE', { day: '2-digit', month: 'long', year: 'numeric' }), RIGHT_X, 54, { width: RIGHT_W, align: 'right' });
 
     const badgeW = 54, badgeH = 16;
-    doc.roundedRect(RIGHT_X + RIGHT_W - badgeW, 70, badgeW, badgeH, 8).lineWidth(1).stroke(BRAND.gold);
-    doc.fillColor(BRAND.gold).fontSize(8).font('Helvetica-Bold')
+    const badgeGrad = doc.linearGradient(RIGHT_X + RIGHT_W - badgeW, 70, RIGHT_X + RIGHT_W, 70 + badgeH);
+    badgeGrad.stop(0, BRAND.emerald).stop(1, '#0E8A63');
+    doc.roundedRect(RIGHT_X + RIGHT_W - badgeW, 70, badgeW, badgeH, 8).fill(badgeGrad);
+    doc.fillColor('#FFFFFF').fontSize(8).font('Helvetica-Bold')
       .text('PAID', RIGHT_X + RIGHT_W - badgeW, 70 + 4.5, { width: badgeW, align: 'center', characterSpacing: 1 });
 
-    // Divider: thin gold line, full width, with a short navy accent centered —
-    // the same gold/navy/gold treatment as the printed letterhead's rule.
-    doc.rect(0, HEADER_H, PAGE_W, 2).fill(BRAND.gold);
-    const accentW = 130;
-    doc.rect((PAGE_W - accentW) / 2, HEADER_H - 1, accentW, 4).fill(BRAND.navy);
+    // Divider: gold → emerald → navy gradient rule, echoing the header's
+    // top accent bar and giving a stronger, more modern hand-off into the
+    // body than a flat single-colour line.
+    const dividerGrad = doc.linearGradient(0, HEADER_H, PAGE_W, HEADER_H);
+    dividerGrad.stop(0, BRAND.gold).stop(0.5, BRAND.navy).stop(1, BRAND.emerald);
+    doc.rect(0, HEADER_H, PAGE_W, 3).fill(dividerGrad);
 
-    // ───────────────────────── Confirmation strip ─────────────────────────
-    let y = HEADER_H + 4 + 20;
-    doc.rect(M, y, CW, 32).fill(BRAND.emeraldSoft);
-    doc.fillColor(BRAND.emerald).fontSize(10).font('Helvetica-Bold')
-      .text(`✓  Payment received — your booking is confirmed for ${travelerCount} traveler${travelerCount === 1 ? '' : 's'}.`, M + 14, y + 10);
-    y += 32 + 26;
+    let y = HEADER_H + 3 + 26;
 
     // ───────────────────────── Billed To / Agency / Booking details (three columns) ─────────────────────────
     const gap = 20;
     const colW = (CW - gap * 2) / 3;
     const c1 = M, c2 = M + colW + gap, c3 = M + 2 * (colW + gap);
+
+    // Card background with a thin hairline border so the three columns read
+    // as one grouped block against the page rather than floating text.
+    const cardTop = y;
+    const cardH = 92;
+    doc.roundedRect(M, cardTop, CW, cardH, 8).fillAndStroke('#FAFAF8', BRAND.hairline);
+    // Slim gold accent on the card's left edge for a touch of colour.
+    doc.roundedRect(M, cardTop, 4, cardH, 2).fill(BRAND.gold);
+    // Vertical hairline separators between the three columns.
+    doc.moveTo(c2 - gap / 2, cardTop + 14).lineTo(c2 - gap / 2, cardTop + cardH - 14).stroke(BRAND.hairline);
+    doc.moveTo(c3 - gap / 2, cardTop + 14).lineTo(c3 - gap / 2, cardTop + cardH - 14).stroke(BRAND.hairline);
+
+    y += 18;
     const sectionTop = y;
 
     doc.fillColor(BRAND.muted).fontSize(7.5).font('Helvetica-Bold')
@@ -205,8 +230,11 @@ async function renderBookingReceiptPdf({ payment, booking, clientProfile, agentP
 
     doc.fillColor(BRAND.muted).fontSize(8.5).font('Helvetica')
       .text(clientProfile?.email || '—', c1, y, { width: colW });
+    // Show phone and email together when both are on file; fall back
+    // gracefully to whichever one is available.
+    const agencyContact = [agency.phone, agency.email].filter(Boolean).join('  ·  ') || '—';
     doc.fillColor(BRAND.muted).fontSize(8.5).font('Helvetica')
-      .text(agency.phone || agency.email || '—', c2, y, { width: colW });
+      .text(agencyContact, c2, y, { width: colW, lineGap: 1 });
     doc.fillColor(BRAND.muted).fontSize(8.5).font('Helvetica')
       .text(`Booking ID: ${booking?.id ? String(booking.id).slice(0, 8).toUpperCase() : '—'}`, c3, y, { width: colW });
     y += 13;
@@ -218,21 +246,28 @@ async function renderBookingReceiptPdf({ payment, booking, clientProfile, agentP
     doc.fillColor(BRAND.muted).fontSize(8.5).font('Helvetica')
       .text(`Paid on: ${paidAt.toLocaleString('en-KE', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })}`, c3, y, { width: colW });
 
-    y = sectionTop + 14 + 13 * 3 + 24; // clear the tallest column (Booking Details), then breathing room
+    y = cardTop + cardH + 24; // clear the card background, then breathing room
 
     // ───────────────────────── Itemized summary table ─────────────────────────
     const tableTop = y;
     const rowH = 30;
     const col = { desc: M + 12, qty: M + CW - 190, price: M + CW - 120, total: M + CW - 12 };
 
-    doc.roundedRect(M, tableTop, CW, rowH, 6).fill('#F1F5F3');
+    const headerGrad = doc.linearGradient(M, tableTop, M + CW, tableTop);
+    headerGrad.stop(0, '#EFF4F1').stop(1, '#E9F1EC');
+    doc.roundedRect(M, tableTop, CW, rowH, 6).fill(headerGrad);
     doc.fillColor(BRAND.ink).fontSize(8.5).font('Helvetica-Bold')
       .text('DESCRIPTION', col.desc, tableTop + 10, { characterSpacing: 0.3 })
       .text('TRAVELERS', col.qty - 60, tableTop + 10, { width: 60, align: 'right', characterSpacing: 0.3 })
       .text('UNIT PRICE', col.price - 70, tableTop + 10, { width: 70, align: 'right', characterSpacing: 0.3 })
       .text('AMOUNT', col.total - 90, tableTop + 10, { width: 90, align: 'right', characterSpacing: 0.3 });
 
-    y = tableTop + rowH + 12;
+    y = tableTop + rowH;
+    const lineRowH = 52;
+    // Light bordered row under the header so the single line item still
+    // reads as a distinct table row rather than loose floating text.
+    doc.roundedRect(M, y, CW, lineRowH, 4).lineWidth(1).stroke(BRAND.hairline);
+    y += 12;
     const unitPrice = Number(payment.amount_kes || 0) / travelerCount;
     doc.fillColor(BRAND.ink).fontSize(10).font('Helvetica-Bold')
       .text(packageName, col.desc, y, { width: col.qty - col.desc - 70 });
@@ -244,14 +279,18 @@ async function renderBookingReceiptPdf({ payment, booking, clientProfile, agentP
       .font('Helvetica-Bold')
       .text(fmtMoney(payment.amount_kes), col.total - 90, y + 2, { width: 90, align: 'right' });
 
-    y += 40;
+    y += lineRowH - 12 + 16;
     doc.moveTo(M, y).lineTo(M + CW, y).stroke(BRAND.hairline);
     y += 16;
 
-    // Total paid — a slim, bordered official summary line rather than a large filled pill
+    // Total paid — a slim, bordered summary line with a gradient wash so it
+    // still stands out as the key figure without becoming a heavy block.
     const totalBoxH = 36;
     doc.lineWidth(1);
-    doc.roundedRect(M, y, CW, totalBoxH, 4).fillAndStroke(BRAND.emeraldSoft, BRAND.emerald);
+    const totalGrad = doc.linearGradient(M, y, M + CW, y + totalBoxH);
+    totalGrad.stop(0, BRAND.emeraldSoft).stop(1, '#EFF7E9');
+    doc.roundedRect(M, y, CW, totalBoxH, 4).fill(totalGrad);
+    doc.roundedRect(M, y, CW, totalBoxH, 4).lineWidth(1).stroke(BRAND.emerald);
     doc.fillColor(BRAND.emerald).fontSize(8.5).font('Helvetica-Bold')
       .text('TOTAL AMOUNT PAID', M + 14, y + 13, { characterSpacing: 0.5 });
     doc.fillColor(BRAND.emerald).fontSize(14).font('Helvetica-Bold')
