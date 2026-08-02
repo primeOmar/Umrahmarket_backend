@@ -1,30 +1,22 @@
 // routes/fx.routes.js
-import express from 'express';
-import { getUsdKesRateMeta } from '../services/currency.service.js';
-import { requireAuth } from '../middleware/auth.middleware.js';
+import express   from 'express';
+import rateLimit from 'express-rate-limit';
+import { getRate } from '../controllers/fx.controller.js';
 
 const router = express.Router();
 
-// GET /api/fx/rate
-// Returns live USD/KES rate with source + cache metadata.
-// Authenticated to prevent external hammering (frontend uses this on booking open).
-router.get('/rate', async (req, res) => {
-  try {
-    const { rate, source, cached } = await getUsdKesRateMeta();
-    return res.json({
-      success:     true,
-      usdKes:      rate,
-      source,
-      cached,
-      fetchedAt:   new Date().toISOString(),
-    });
-  } catch (err) {
-    
-    return res.status(503).json({
-      success: false,
-      message: 'Exchange rate temporarily unavailable. Please retry.',
-    });
-  }
+// Public and read-only (no requireAuth — package prices need to render for
+// logged-out visitors too). Light rate limit purely to blunt scraping/abuse,
+// not because this is expensive to serve (currency.service.js already
+// caches for 10 minutes internally).
+const rateLimiter = rateLimit({
+  windowMs: 60_000,
+  max:      60,
+  standardHeaders: true,
+  legacyHeaders:   false,
 });
+
+// GET /api/fx/rate
+router.get('/rate', rateLimiter, getRate);
 
 export default router;
