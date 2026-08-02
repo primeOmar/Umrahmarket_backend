@@ -72,7 +72,7 @@ const allowedOrigins = [
 
 logger.info('CORS enabled for origins', { allowedOrigins });
 
-app.use(cors({
+const corsMiddleware = cors({
   origin: function (origin, callback) {
     // Allow requests with no origin (mobile apps, Postman, curl)
     if (!origin) return callback(null, true);
@@ -89,7 +89,26 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
   exposedHeaders: ['X-RateLimit-Limit', 'X-RateLimit-Remaining'],
   maxAge: 86400 // 24 hours
-}));
+});
+
+// Server-to-server webhook routes are never called by a browser, so they
+// carry no meaningful "origin" in the CORS sense — but the callers (Pesapal,
+// Safaricom) DO sometimes send their own Origin header, which the whitelist
+// above (built for our frontend origins) correctly has no reason to know
+// about. Applying the browser-facing CORS check to these would incorrectly
+// reject legitimate webhook calls, which is exactly what was happening on
+// POST /api/payments/card/ipn ("Not allowed by CORS" in the logs). These
+// routes are skipped here and simply don't get CORS headers — they don't
+// need them, since no browser is involved.
+const CORS_EXEMPT_PATHS = [
+  '/api/payments/card/ipn',
+  '/api/payments/mpesa/callback',
+];
+
+app.use((req, res, next) => {
+  if (CORS_EXEMPT_PATHS.includes(req.path)) return next();
+  return corsMiddleware(req, res, next);
+});
 
 // Handle preflight for all routes
 app.options('*', cors());
