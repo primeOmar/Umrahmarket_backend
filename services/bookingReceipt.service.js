@@ -122,27 +122,22 @@ async function renderBookingReceiptPdf({ payment, booking, clientProfile, agentP
     // ───────────────────────── Letterhead-style header (gradient, compact) ─────────────────────────
     const HEADER_H = 92;
 
-    // Top accent bar — navy → emerald → gold, the same brand palette read
-    // left to right, giving the header an immediate splash of colour.
-    const topBar = doc.linearGradient(0, 0, PAGE_W, 0);
-    topBar.stop(0, BRAND.navy).stop(0.5, BRAND.emerald).stop(1, BRAND.gold);
-    doc.rect(0, 0, PAGE_W, 5).fill(topBar);
+    // One cohesive diagonal gradient across the full header panel — light
+    // emerald in the top-left, through white, into a warm gold tint at the
+    // bottom-right — so the colour actually reads as part of the header
+    // rather than a thin, disconnected bar sitting above it.
+    const headerGrad = doc.linearGradient(0, 0, PAGE_W, HEADER_H);
+    headerGrad.stop(0, '#DCEEE5').stop(0.45, '#FDFDFB').stop(1, '#F6E9C8');
+    doc.rect(0, 0, PAGE_W, HEADER_H).fill(headerGrad);
 
-    // Soft gradient wash across the header body — near-white fading into a
-    // faint emerald tint, so the header reads as a distinct panel without
-    // fighting the dark ink text sitting on top of it.
-    const headerWash = doc.linearGradient(0, 5, PAGE_W, HEADER_H);
-    headerWash.stop(0, '#FFFFFF').stop(0.6, '#FBFBF8').stop(1, BRAND.emeraldSoft);
-    doc.rect(0, 5, PAGE_W, HEADER_H - 5).fill(headerWash);
-
-    // Gradient corner accent, echoing the lattice motif on the printed
-    // letterhead — a filled gold→emerald wedge instead of flat lines.
+    // Gradient corner flourish, echoing the lattice motif on the printed
+    // letterhead — a bolder gold→emerald wedge layered on top of the wash.
     doc.save();
     doc.rect(0, 0, PAGE_W, HEADER_H).clip();
-    const cornerGrad = doc.linearGradient(PAGE_W - 130, 0, PAGE_W, 90);
+    const cornerGrad = doc.linearGradient(PAGE_W - 160, 0, PAGE_W, HEADER_H);
     cornerGrad.stop(0, BRAND.gold).stop(1, BRAND.emerald);
-    doc.opacity(0.08);
-    doc.polygon([PAGE_W - 130, 0], [PAGE_W, 0], [PAGE_W, 90]).fill(cornerGrad);
+    doc.opacity(0.16);
+    doc.polygon([PAGE_W - 160, 0], [PAGE_W, 0], [PAGE_W, HEADER_H]).fill(cornerGrad);
     doc.opacity(1);
     doc.restore();
 
@@ -197,9 +192,12 @@ async function renderBookingReceiptPdf({ payment, booking, clientProfile, agentP
     let y = HEADER_H + 3 + 26;
 
     // ───────────────────────── Billed To / Agency / Booking details (three columns) ─────────────────────────
+    const CARD_PAD = 20; // keeps text clear of the gold accent bar and card edges
     const gap = 20;
-    const colW = (CW - gap * 2) / 3;
-    const c1 = M, c2 = M + colW + gap, c3 = M + 2 * (colW + gap);
+    const contentX0 = M + CARD_PAD;
+    const contentW = CW - CARD_PAD * 2;
+    const colW = (contentW - gap * 2) / 3;
+    const c1 = contentX0, c2 = contentX0 + colW + gap, c3 = contentX0 + 2 * (colW + gap);
 
     // Card background with a thin hairline border so the three columns read
     // as one grouped block against the page rather than floating text.
@@ -253,9 +251,9 @@ async function renderBookingReceiptPdf({ payment, booking, clientProfile, agentP
     const rowH = 30;
     const col = { desc: M + 12, qty: M + CW - 190, price: M + CW - 120, total: M + CW - 12 };
 
-    const headerGrad = doc.linearGradient(M, tableTop, M + CW, tableTop);
-    headerGrad.stop(0, '#EFF4F1').stop(1, '#E9F1EC');
-    doc.roundedRect(M, tableTop, CW, rowH, 6).fill(headerGrad);
+    const tableHeaderGrad = doc.linearGradient(M, tableTop, M + CW, tableTop);
+    tableHeaderGrad.stop(0, '#EFF4F1').stop(1, '#E9F1EC');
+    doc.roundedRect(M, tableTop, CW, rowH, 6).fill(tableHeaderGrad);
     doc.fillColor(BRAND.ink).fontSize(8.5).font('Helvetica-Bold')
       .text('DESCRIPTION', col.desc, tableTop + 10, { characterSpacing: 0.3 })
       .text('TRAVELERS', col.qty - 60, tableTop + 10, { width: 60, align: 'right', characterSpacing: 0.3 })
