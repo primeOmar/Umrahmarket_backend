@@ -122,49 +122,50 @@ async function renderBookingReceiptPdf({ payment, booking, clientProfile, agentP
     // ───────────────────────── Letterhead-style header (gradient, compact) ─────────────────────────
     const HEADER_H = 92;
 
-    // One cohesive diagonal gradient across the full header panel — light
-    // emerald in the top-left, through white, into a warm gold tint at the
-    // bottom-right — so the colour actually reads as part of the header
-    // rather than a thin, disconnected bar sitting above it.
+    // One cohesive diagonal gradient across the full header panel — a
+    // restrained emerald-to-warm-ivory wash rather than a bold two-tone
+    // split, so it reads as premium letterhead rather than a colour block.
     const headerGrad = doc.linearGradient(0, 0, PAGE_W, HEADER_H);
-    headerGrad.stop(0, '#DCEEE5').stop(0.45, '#FDFDFB').stop(1, '#F6E9C8');
+    headerGrad.stop(0, '#E6F4EC').stop(0.55, '#FDFDFC').stop(1, '#F5EFDD');
     doc.rect(0, 0, PAGE_W, HEADER_H).fill(headerGrad);
 
     // Gradient corner flourish, echoing the lattice motif on the printed
-    // letterhead — a bolder gold→emerald wedge layered on top of the wash.
+    // letterhead — kept small and low-opacity so it reads as a refined
+    // accent rather than competing with the content.
     doc.save();
     doc.rect(0, 0, PAGE_W, HEADER_H).clip();
-    const cornerGrad = doc.linearGradient(PAGE_W - 160, 0, PAGE_W, HEADER_H);
+    const cornerGrad = doc.linearGradient(PAGE_W - 100, 0, PAGE_W, HEADER_H);
     cornerGrad.stop(0, BRAND.gold).stop(1, BRAND.emerald);
-    doc.opacity(0.16);
-    doc.polygon([PAGE_W - 160, 0], [PAGE_W, 0], [PAGE_W, HEADER_H]).fill(cornerGrad);
+    doc.opacity(0.10);
+    doc.polygon([PAGE_W - 100, 0], [PAGE_W, 0], [PAGE_W, HEADER_H]).fill(cornerGrad);
     doc.opacity(1);
     doc.restore();
 
-    // Logo mark
-    const LOGO_S = 46, LOGO_X = M, LOGO_Y = 24;
-    doc.roundedRect(LOGO_X, LOGO_Y, LOGO_S, LOGO_S, 8).lineWidth(1).stroke('#E7E2D6');
+    // Logo mark — a solid white plate behind it (independent of the header
+    // gradient) so the logo stays crisp and visible, plus a larger size.
+    const LOGO_S = 58, LOGO_X = M, LOGO_Y = (HEADER_H - LOGO_S) / 2;
+    doc.roundedRect(LOGO_X, LOGO_Y, LOGO_S, LOGO_S, 10).fillAndStroke('#FFFFFF', '#E7E2D6');
     if (logoBuffer) {
       try {
-        doc.image(logoBuffer, LOGO_X + 5, LOGO_Y + 5, { fit: [LOGO_S - 10, LOGO_S - 10], align: 'center', valign: 'center' });
+        doc.image(logoBuffer, LOGO_X + 6, LOGO_Y + 6, { fit: [LOGO_S - 12, LOGO_S - 12], align: 'center', valign: 'center' });
       } catch {
-        doc.fillColor(BRAND.emerald).fontSize(20).font('Helvetica-Bold')
-          .text('U', LOGO_X, LOGO_Y + 12, { width: LOGO_S, align: 'center' });
+        doc.fillColor(BRAND.emerald).fontSize(24).font('Helvetica-Bold')
+          .text('U', LOGO_X, LOGO_Y + 16, { width: LOGO_S, align: 'center' });
       }
     } else {
-      doc.fillColor(BRAND.emerald).fontSize(20).font('Helvetica-Bold')
-        .text('U', LOGO_X, LOGO_Y + 12, { width: LOGO_S, align: 'center' });
+      doc.fillColor(BRAND.emerald).fontSize(24).font('Helvetica-Bold')
+        .text('U', LOGO_X, LOGO_Y + 16, { width: LOGO_S, align: 'center' });
     }
 
     // Wordmark — gold "UMRAH" + emerald "MARKET", matching the letterhead
     const TEXT_X = LOGO_X + LOGO_S + 14;
     doc.fontSize(17).font('Helvetica-Bold')
-      .fillColor(BRAND.gold).text('UMRAH ', TEXT_X, LOGO_Y, { continued: true })
+      .fillColor(BRAND.gold).text('UMRAH ', TEXT_X, LOGO_Y + 6, { continued: true })
       .fillColor(BRAND.emerald).text('MARKET');
     doc.fillColor(BRAND.muted).fontSize(7).font('Helvetica')
-      .text('YOUR TRUSTED PILGRIMAGE MARKET', TEXT_X, LOGO_Y + 21, { characterSpacing: 1 });
+      .text('YOUR TRUSTED PILGRIMAGE MARKET', TEXT_X, LOGO_Y + 27, { characterSpacing: 1 });
     doc.fillColor(BRAND.muted).fontSize(8).font('Helvetica')
-      .text('www.umrahmarket.net', TEXT_X, LOGO_Y + 33);
+      .text('www.umrahmarket.net', TEXT_X, LOGO_Y + 39);
 
     // Right side: title, receipt no, date, compact outlined PAID badge
     const RIGHT_W = 200;
@@ -304,7 +305,19 @@ async function renderBookingReceiptPdf({ payment, booking, clientProfile, agentP
 
     // ───────────────────────── Footer (letterhead-style: Address / Phone / Email) ─────────────────────────
     const footerY = PAGE_H - 128;
-    doc.moveTo(M, footerY).lineTo(M + CW, footerY).stroke(BRAND.hairline);
+
+    // Subtle gradient wash behind the footer, mirroring the header's palette
+    // in reverse (warm ivory → white → soft emerald) so the page opens and
+    // closes with the same restrained, official colour treatment.
+    const footerWash = doc.linearGradient(0, footerY, PAGE_W, PAGE_H);
+    footerWash.stop(0, '#F5EFDD').stop(0.5, '#FDFDFC').stop(1, '#E6F4EC');
+    doc.rect(0, footerY, PAGE_W, PAGE_H - footerY).fill(footerWash);
+
+    // Gradient rule — the same gold → navy → emerald treatment as the
+    // header divider — marking the top edge of the footer panel.
+    const footerRuleGrad = doc.linearGradient(0, footerY, PAGE_W, footerY);
+    footerRuleGrad.stop(0, BRAND.gold).stop(0.5, BRAND.navy).stop(1, BRAND.emerald);
+    doc.rect(0, footerY, PAGE_W, 2).fill(footerRuleGrad);
 
     const footerColW = CW / 3;
     const fy = footerY + 16;
