@@ -72,27 +72,27 @@ async function loadLogoBuffer() {
   }
 }
 
-// Best-effort resolution of an agency's display name/contact from a
-// `profiles` row. Field names are guessed to cover common conventions —
-// adjust these to match your actual agent profile schema if needed.
-function resolveAgency(agentProfile) {
-  if (!agentProfile) {
-    return { name: 'Umrah Market Partner Agency', phone: null, email: null };
-  }
+// Agency display name/contact. `packages.agent_name` is the denormalized
+// field already used everywhere else in the codebase (Cardcontroller.js,
+// mpesaController.js) — that's the primary source and needs no join at all.
+// `agentProfile` (fetched separately via packages.created_by) only fills in
+// phone/email, and is optional — its absence should never affect the name.
+function resolveAgency(packageAgentName, agentProfile) {
   const name =
-    agentProfile.business_name ||
-    agentProfile.agency_name ||
-    agentProfile.company_name ||
-    [agentProfile.first_name, agentProfile.last_name].filter(Boolean).join(' ') ||
+    packageAgentName ||
+    agentProfile?.business_name ||
+    agentProfile?.agency_name ||
+    agentProfile?.company_name ||
+    [agentProfile?.first_name, agentProfile?.last_name].filter(Boolean).join(' ') ||
     'Umrah Market Partner Agency';
-  const phone = agentProfile.phone || agentProfile.business_phone || agentProfile.contact_phone || null;
-  const email = agentProfile.business_email || agentProfile.email || null;
+  const phone = agentProfile?.phone || agentProfile?.business_phone || agentProfile?.contact_phone || null;
+  const email = agentProfile?.business_email || agentProfile?.email || null;
   return { name, phone, email };
 }
 
 async function renderBookingReceiptPdf({ payment, booking, clientProfile, agentProfile }) {
   const logoBuffer = await loadLogoBuffer();
-  const agency = resolveAgency(agentProfile);
+  const agency = resolveAgency(payment?.package?.agent_name, agentProfile);
 
   return await new Promise((resolve, reject) => {
     // IMPORTANT: margin is 0 and every element below is placed with an
@@ -299,22 +299,31 @@ async function renderBookingReceiptPdf({ payment, booking, clientProfile, agentP
 }
 
 export async function sendBookingReceiptEmail({ paymentId, bookingId = null, force = false }) {
-  if (!paymentId) return { success: false, reason: 'missing_payment_id' };
+  if (!paymentId) {
+    console.warn('[bookingReceipt] skipped: missing_payment_id');
+    return { success: false, reason: 'missing_payment_id' };
+  }
   if (!hasSmtpConfig()) {
-    
+    console.warn('[bookingReceipt] skipped: smtp_not_configured — check SMTP_HOST/SMTP_USER/SMTP_PASS env vars on the backend host', { paymentId });
     return { success: false, reason: 'smtp_not_configured' };
   }
 
   const { data: payment, error: payErr } = await supabaseAdmin
     .from('payments')
-    .select('id, user_id, package_id, method, amount_kes, status, paid_at, receipt_generated, traveler_count, package:packages(name, agent_id)')
+    .select('id, user_id, package_id, method, amount_kes, status, paid_at, receipt_generated, traveler_count, package:packages(name, agent_name, created_by)')
     .eq('id', paymentId)
     .maybeSingle();
 
-  if (payErr || !payment) return { success: false, reason: 'payment_not_found' };
-  if (payment.status !== 'SUCCESS') return { success: false, reason: 'payment_not_success' };
+  if (payErr || !payment) {
+    console.error('[bookingReceipt] skipped: payment_not_found', { paymentId, supabaseError: payErr?.message });
+    return { success: false, reason: 'payment_not_found' };
+  }
+  if (payment.status !== 'SUCCESS') {
+    console.warn('[bookingReceipt] skipped: payment_not_success', { paymentId, status: payment.status });
+    return { success: false, reason: 'payment_not_success' };
+  }
   if (!force && payment.receipt_generated) {
-    
+    console.info('[bookingReceipt] skipped: already_sent', { paymentId });
     return { success: true, skipped: true, reason: 'already_sent' };
   }
 
@@ -326,7 +335,7 @@ export async function sendBookingReceiptEmail({ paymentId, bookingId = null, for
 
   const recipient = String(clientProfile?.email || '').trim();
   if (!isValidEmail(recipient)) {
-    
+    console.error('[bookingReceipt] skipped: invalid_recipient_email', { paymentId, userId: payment.user_id, rawEmail: clientProfile?.email });
     return { success: false, reason: 'invalid_recipient_email' };
   }
 
@@ -340,10 +349,11 @@ export async function sendBookingReceiptEmail({ paymentId, bookingId = null, for
     booking = data || null;
   }
 
-  // Agency the package belongs to — best-effort; field names in resolveAgency()
-  // may need to match your actual agent profile columns.
+  // Agency contact details (phone/email) — best-effort, purely additive.
+  // The agency NAME itself already comes from packages.agent_name above and
+  // does not depend on this lookup succeeding.
   let agentProfile = null;
-  const agentId = payment?.package?.agent_id;
+  const agentId = payment?.package?.created_by;
   if (agentId) {
     try {
       const { data } = await supabaseAdmin
@@ -379,6 +389,6 @@ export async function sendBookingReceiptEmail({ paymentId, bookingId = null, for
   });
 
   await supabaseAdmin.from('payments').update({ receipt_generated: true }).eq('id', payment.id);
-  
+  console.info('[bookingReceipt] sent', { paymentId, recipient, messageId: info?.messageId || null });
   return { success: true, recipient, messageId: info?.messageId || null };
 }

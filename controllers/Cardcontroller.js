@@ -452,9 +452,20 @@ export const verify = async (req, res) => {
 
       if (booking?.id) {
         try {
-          await sendBookingReceiptEmail({ paymentId: payment.id, bookingId: booking.id });
+          const receiptResult = await sendBookingReceiptEmail({ paymentId: payment.id, bookingId: booking.id });
+          if (!receiptResult?.success) {
+            console.error('[Cardcontroller] receipt email not sent (already-processed branch)', {
+              paymentId: payment.id,
+              bookingId: booking.id,
+              reason: receiptResult?.reason || 'unknown',
+            });
+          }
         } catch (mailErr) {
-          
+          console.error('[Cardcontroller] receipt email threw (already-processed branch)', {
+            paymentId: payment.id,
+            bookingId: booking.id,
+            error: mailErr.message,
+          });
         }
       }
 
@@ -575,9 +586,20 @@ export const verify = async (req, res) => {
     }
 
     try {
-      await sendBookingReceiptEmail({ paymentId: payment.id, bookingId: booking.id });
+      const receiptResult = await sendBookingReceiptEmail({ paymentId: payment.id, bookingId: booking.id });
+      if (!receiptResult?.success) {
+        console.error('[Cardcontroller] receipt email not sent', {
+          paymentId: payment.id,
+          bookingId: booking.id,
+          reason: receiptResult?.reason || 'unknown',
+        });
+      }
     } catch (mailErr) {
-      
+      console.error('[Cardcontroller] receipt email threw', {
+        paymentId: payment.id,
+        bookingId: booking.id,
+        error: mailErr.message,
+      });
     }
 
     return res.json({ success: true, status: 'SUCCESS', booking });
