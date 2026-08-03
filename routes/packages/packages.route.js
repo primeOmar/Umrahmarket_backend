@@ -1,6 +1,6 @@
 import express from 'express';
 import { parseFormData, uploadImagesToR2 } from '../../middleware/uploads/Uploadtocloudflare.js';
-import { getAgentPackages, getAllActivePackages } from '../../controllers/packages/getpackages.controller.js';
+import { getAgentPackages, getAllActivePackages, getPackageById } from '../../controllers/packages/getpackages.controller.js';
 import { createPackage, updatePackage, deletePackage } from '../../controllers/packages/createpackages.controller.js';
 import { getItinerary, saveItinerary } from '../../controllers/packages/itinerary.controller.js';
 import { verifyToken } from '../../middleware/auth.middleware.js';
@@ -35,6 +35,16 @@ router.post(
 
 // GET /api/packages/getagentpackages
 router.get('/getagentpackages', verifyToken, getAgentPackages);
+
+// GET /api/packages/:id — single package fetch, incl. price_tiers.
+// No verifyToken here: Active packages must stay reachable by guests. This
+// means a logged-in agent viewing their own Draft/Inactive package via this
+// fallback route currently gets the same 404 an anonymous visitor would —
+// req.user is never populated without auth middleware. Wire in an
+// optional-auth middleware here (one that decodes a token if present but
+// doesn't reject its absence) if agents need to preview their own
+// unpublished packages through this endpoint.
+router.get('/:id', getPackageById);
 
 // PUT /api/packages/:id — agent edits their own package (all fields + images)
 // Same pipeline as create: auth → approved-agent gate → parse multipart →
