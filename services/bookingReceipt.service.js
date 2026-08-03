@@ -4,6 +4,9 @@ import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { supabaseAdmin } from '../config/supabase.js';
+// NOTE: adjust this relative path if email.service.js lives elsewhere
+// relative to this file in your actual folder layout.
+import { sendAgentBookingNotificationEmail } from './email.service.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -440,5 +443,29 @@ export async function sendBookingReceiptEmail({ paymentId, bookingId = null, for
 
   await supabaseAdmin.from('payments').update({ receipt_generated: true }).eq('id', payment.id);
   console.info('[bookingReceipt] sent', { paymentId, recipient, messageId: info?.messageId || null });
+
+  // ── Notify the agent that a client booked their package ──────────────
+  // Best-effort and non-blocking: the client's own receipt above is the
+  // critical path, so a failure here should never fail the whole request
+  // or prevent the payment from being marked as receipted.
+  const agency = resolveAgency(payment?.package?.agent_name, agentProfile);
+  const agentEmail = String(agentProfile?.email || agentProfile?.business_email || '').trim();
+  if (isValidEmail(agentEmail)) {
+    try {
+      await sendAgentBookingNotificationEmail({
+        to: agentEmail,
+        agentName: agentProfile?.first_name || agency.name,
+        clientName: [clientProfile?.first_name, clientProfile?.last_name].filter(Boolean).join(' ') || 'A client',
+        packageName: payment?.package?.name || 'Umrah Package',
+        travelerCount: Number(booking?.traveler_count ?? payment?.traveler_count ?? 1) || 1,
+        amountKes: Number(payment.amount_kes) || 0,
+      });
+    } catch (err) {
+      console.warn('[bookingReceipt] agent notification email failed', { paymentId, agentId, error: err.message });
+    }
+  } else {
+    console.warn('[bookingReceipt] skipped agent notification: no valid agent email on file', { paymentId, agentId });
+  }
+
   return { success: true, recipient, messageId: info?.messageId || null };
 }

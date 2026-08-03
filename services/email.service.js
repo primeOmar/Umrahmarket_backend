@@ -155,4 +155,81 @@ export const sendVerificationEmail = async ({ to, firstName, verifyUrl }) => {
   return info;
 };
 
-export default { sendVerificationEmail, verifyEmailTransport };
+// ===========================================
+// Send: Agent New Booking Notification Email
+// ===========================================
+// Fired whenever a client successfully books a package, so the agent knows
+// to log in and move the booking forward (visa processing, docs, etc).
+// Callers should treat failures here as non-fatal — the client's own
+// receipt/confirmation email is the critical path, this is a courtesy
+// notification on top of it.
+export const sendAgentBookingNotificationEmail = async ({
+  to,
+  agentName,
+  clientName,
+  packageName,
+  travelerCount,
+  amountKes,
+  dashboardUrl,
+}) => {
+  const recipient = String(to || '').trim();
+  if (!recipient) {
+    logger.warn('Agent booking notification: no agent email on file, skipping', { packageName });
+    return { success: false, reason: 'missing_agent_email' };
+  }
+
+  const safeAgentName = escapeHtml(agentName || 'there');
+  const safeClientName = escapeHtml(clientName || 'A client');
+  const safePackageName = escapeHtml(packageName || 'your package');
+  const travelerLine =
+    typeof travelerCount === 'number' && travelerCount > 0
+      ? ` for ${travelerCount} traveler${travelerCount === 1 ? '' : 's'}`
+      : '';
+  const formattedAmount =
+    typeof amountKes === 'number'
+      ? `KES ${amountKes.toLocaleString('en-KE', { minimumFractionDigits: 2 })}`
+      : null;
+
+  // NOTE: adjust the fallback path below if the agent dashboard is mounted
+  // at a different route in the frontend router.
+  const url = dashboardUrl || `${FRONTEND_BASE_URL_FOR_ASSETS}/agent/dashboard`;
+
+  const bodyHtml = `
+    <h1 style="margin:0 0 12px;font-size:20px;font-weight:700;color:#101828;">New booking received 🎉</h1>
+    <p style="margin:0 0 16px;font-size:14px;line-height:22px;color:#475467;">
+      Hi ${safeAgentName}, ${safeClientName} just booked <strong>${safePackageName}</strong>${travelerLine}.
+    </p>
+    ${
+      formattedAmount
+        ? `<p style="margin:0 0 20px;font-size:14px;line-height:22px;color:#475467;">Amount paid: <strong>${formattedAmount}</strong></p>`
+        : ''
+    }
+    <p style="margin:0 0 20px;font-size:14px;line-height:22px;color:#475467;">
+      Please log in to your dashboard to review the booking and start the next steps — visa processing, document collection, and travel prep.
+    </p>
+    <table role="presentation" cellpadding="0" cellspacing="0">
+      <tr>
+        <td style="border-radius:10px;background:linear-gradient(135deg,#10b981,#0d9488);">
+          <a href="${url}" style="display:inline-block;padding:12px 28px;font-size:14px;font-weight:600;color:#ffffff;text-decoration:none;border-radius:10px;">
+            Go to my dashboard
+          </a>
+        </td>
+      </tr>
+    </table>
+  `;
+
+  const info = await getTransporter().sendMail({
+    from: `"${FROM_NAME}" <${FROM_ADDRESS}>`,
+    to: recipient,
+    subject: `New booking: ${packageName || 'a package'} was just booked`,
+    html: brandShell({
+      preheader: `${clientName || 'A client'} booked ${packageName || 'your package'} — log in to proceed.`,
+      bodyHtml,
+    }),
+  });
+
+  logger.info('Agent booking notification email sent', { to: recipient, messageId: info.messageId });
+  return { success: true, messageId: info.messageId };
+};
+
+export default { sendVerificationEmail, sendAgentBookingNotificationEmail, verifyEmailTransport };
