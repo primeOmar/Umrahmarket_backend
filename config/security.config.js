@@ -47,7 +47,8 @@ const config = {
       'http://localhost:3000',
       'http://localhost:5173',
       'https://umrahmarket.vercel.app',
-      'https://umrahmarket.net'
+      'https://umrahmarket.net',
+      'https://www.umrahmarket.net'
     ],
     credentials: true,
   },

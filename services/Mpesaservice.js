@@ -6,7 +6,7 @@
 //   MPESA_CONSUMER_SECRET
 //   MPESA_SHORTCODE          ← your Paybill or Till number
 //   MPESA_PASSKEY            ← from Safaricom portal
-//   MPESA_CALLBACK_URL       ← must be public HTTPS e.g. https://umrahmarket-backend.onrender.com/api/payments/mpesa/callback
+//   MPESA_CALLBACK_URL       ← must be public HTTPS e.g. https://api.umrahmarket.net/api/payments/mpesa/callback
 //   MPESA_ENV                ← 'sandbox' or 'production'
 
 import axios from 'axios';

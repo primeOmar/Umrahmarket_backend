@@ -85,7 +85,7 @@ const brandShell = ({ preheader, bodyHtml }) => `
       <td align="center">
         <table role="presentation" width="100%" style="max-width:480px;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 1px 3px rgba(16,24,40,0.08);">
           <tr>
-            <td style="background:linear-gradient(135deg,#10b981,#0d9488);padding:24px 32px;">
+            <td style="background-color:#ffffff;padding:24px 32px;">
               <img
                 src="${LOGO_URL}"
                 alt="UmrahMarket"
