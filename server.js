@@ -67,6 +67,7 @@ const allowedOrigins = [
   'https://umrahmarket.vercel.app',
   'https://umrahmarket.net',
     'https://www.umrahmarket.net',
+    'https://umrahmarket-ducfv6d52-primeomars-projects.vercel.app',
   ...(process.env.ALLOWED_ORIGINS?.split(',').map(o => o.trim()) || [])
 ].filter(Boolean);
 
