@@ -49,6 +49,85 @@ function sanitizeTags(arr, maxLen = 80, maxCount = 30) {
   return arr.slice(0, maxCount).map((t) => sanitizeText(t, maxLen)).filter(Boolean);
 }
 
+// Normalises a city key the same way the frontend does (lowercase, spaces →
+// underscores, stripped of anything that isn't a letter/digit/dash) so a
+// city selected client-side always matches its city_hotels entry key.
+function sanitizeCityKey(value = '') {
+  return String(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/ /g, '_')
+    .slice(0, 40);
+}
+
+const MAX_CITIES = 12; // sane cap — nobody's building a 12-city Umrah package
+
+// `cities`: the full list of cities this package covers, Makkah always
+// first and always present regardless of what the client sent.
+function sanitizeCities(raw) {
+  let parsed = [];
+  if (raw) {
+    try {
+      parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (!Array.isArray(parsed)) parsed = [];
+    } catch {
+      parsed = [];
+    }
+  }
+  const seen = new Set(['makkah']);
+  const out = ['makkah'];
+  parsed.forEach((c) => {
+    const key = sanitizeCityKey(c);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    out.push(key);
+  });
+  return out.slice(0, MAX_CITIES);
+}
+
+// `city_hotels`: hotel details for every city beyond Makkah/Madinah (those
+// two keep their own dedicated columns for backward compatibility with
+// existing consumers — PackageCard, PackageDetailPage, receipts, etc.).
+// Only entries for cities actually in `cities` are kept — an entry for a
+// city the agent deselected (or never selected) is dropped rather than
+// trusted from the client. An entry without a hotel name is dropped too, so
+// a half-filled block can never create a stray empty record.
+function sanitizeCityHotels(raw, cities = []) {
+  let parsed = {};
+  if (raw) {
+    try {
+      parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (!parsed || typeof parsed !== 'object') parsed = {};
+    } catch {
+      parsed = {};
+    }
+  }
+  const allowedCities = new Set(
+    (Array.isArray(cities) ? cities : []).filter((c) => c !== 'makkah' && c !== 'madinah')
+  );
+
+  const out = {};
+  allowedCities.forEach((city) => {
+    const entry = parsed[city];
+    if (!entry || typeof entry !== 'object') return;
+    const hotel_name = sanitizeText(entry.hotel_name, 120);
+    if (!hotel_name) return;
+    const { in: check_in_date, out: check_out_date } =
+      sanitizeDatePair(entry.check_in_date, entry.check_out_date);
+    out[city] = {
+      hotel_name,
+      hotel_rating: sanitizeNumber(entry.hotel_rating) || null,
+      hotel_distance: sanitizeText(entry.hotel_distance, 30) || null,
+      hotel_address: sanitizeText(entry.hotel_address, 120) || null,
+      check_in_date,
+      check_out_date,
+    };
+  });
+  return out;
+}
+
 // Age-tier pricing (stored as a single `price_tiers` jsonb column):
 //   adult       — 12+ yrs, required, mirrors the top-level `price` column
 //                 so every existing query/UI that reads pkg.price keeps working
@@ -153,6 +232,18 @@ const madinah_hotel_distance = sanitizeText(req.body.madinah_hotel_distance, 30)
   const inclusions = sanitizeTags(parseArray('inclusions'));
   const exclusions = sanitizeTags(parseArray('exclusions'));
 
+  // Full city list + per-city hotel details for anything beyond Makkah/
+  // Madinah (Jeddah, Dubai, Riyadh, Taif, or a custom-typed city) — see the
+  // sanitizeCities/sanitizeCityHotels helpers above.
+  const cities      = sanitizeCities(req.body.cities);
+  const city_hotels = sanitizeCityHotels(req.body.city_hotels, cities);
+  // Madinah is required whenever it's actually part of the trip — either
+  // because it's in the new `cities` list, or (for any older client that
+  // only ever sent the legacy `location` bucket) because `location` implies
+  // it. Checked server-side too, not just trusted from the client-side
+  // step validation.
+  const needsMadinah = cities.includes('madinah') || (location && location !== 'makkah');
+
   // existing_image_urls carries over photos when duplicating a package;
   // req.imageUrls is whatever uploadImagesToR2 just uploaded fresh.
   const keptImageUrls = parseImageUrls(req.body.existing_image_urls);
@@ -162,30 +253,33 @@ const madinah_hotel_distance = sanitizeText(req.body.madinah_hotel_distance, 30)
   // ── Build record ────────────────────────────────────────────────────────────
   const currentTime = new Date().toISOString();
 
-  const newPackage = {
-    name, type, location, description,
-    price, original_price, discount, duration, price_tiers,
-    available_from, available_to,
-    min_group_size, max_group_size,
-    makkah_hotel_name, makkah_hotel_rating, makkah_hotel_distance,
-    makkah_hotel_address, makkah_check_in_date, makkah_check_out_date,
-    madinah_hotel_name, madinah_hotel_rating, madinah_hotel_distance,
-    madinah_hotel_address, madinah_check_in_date, madinah_check_out_date,
-    highlights, inclusions, exclusions,
-    image_urls,
-    created_by:  userId,
-    agent_name: agentName,
-    agent_number: agentNumber,
-    status: 'Active',
-    created_at: currentTime,
-    updated_at: currentTime,
-  };
-
   // ── Validate required fields ─────────────────────────────────────────────────
   if (!name || !type || !location || !price || !duration) {
     return res.status(400).json({
       success: false,
       message: 'Missing required fields: name, type, location, price, duration are required.'
+    });
+  }
+  if (!makkah_hotel_name || !makkah_hotel_rating || !makkah_check_in_date || !makkah_check_out_date) {
+    return res.status(400).json({
+      success: false,
+      message: 'Makkah hotel details (name, rating, check-in and check-out dates) are required.'
+    });
+  }
+  if (needsMadinah && (!madinah_hotel_name || !madinah_hotel_rating || !madinah_check_in_date || !madinah_check_out_date)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Madinah hotel details are required for a package that includes Madinah.'
+    });
+  }
+  // Every OTHER selected city needs a matching, non-blank city_hotels entry
+  // (sanitizeCityHotels already dropped anything without a hotel name) —
+  // this catches a city the agent picked but never actually filled in.
+  const missingCityHotels = cities.filter((c) => c !== 'makkah' && c !== 'madinah' && !city_hotels[c]);
+  if (missingCityHotels.length > 0) {
+    return res.status(400).json({
+      success: false,
+      message: `Hotel details are required for: ${missingCityHotels.map((c) => c.replace(/_/g, ' ')).join(', ')}.`
     });
   }
 
@@ -196,6 +290,8 @@ const madinah_hotel_distance = sanitizeText(req.body.madinah_hotel_distance, 30)
       name,
       type,
       location,
+      cities,
+      city_hotels,
       description: description || null,
       price,
       original_price: original_price || null,
@@ -235,7 +331,7 @@ const madinah_hotel_distance = sanitizeText(req.body.madinah_hotel_distance, 30)
     const { data, error } = await supabase
       .from('packages')
       .insert([packageToInsert])
-      .select('id, name, type, location, price, price_tiers, duration, status, created_by, agent_name, agent_number');
+      .select('id, name, type, location, cities, price, price_tiers, duration, status, created_by, agent_name, agent_number');
 
     if (error) {
       
@@ -333,6 +429,12 @@ export const updatePackage = async (req, res) => {
   const inclusions = sanitizeTags(parseArray('inclusions'));
   const exclusions = sanitizeTags(parseArray('exclusions'));
 
+  // Full city list + per-city hotel details — see createPackage above for
+  // the full rationale, kept identical here so create/edit never drift.
+  const cities      = sanitizeCities(req.body.cities);
+  const city_hotels = sanitizeCityHotels(req.body.city_hotels, cities);
+  const needsMadinah = cities.includes('madinah') || (location && location !== 'makkah');
+
   const keptImageUrls = parseImageUrls(req.body.existing_image_urls);
   const uploadedUrls  = Array.isArray(req.imageUrls) ? req.imageUrls : [];
   const image_urls    = [...keptImageUrls, ...uploadedUrls].slice(0, 10);
@@ -343,10 +445,31 @@ export const updatePackage = async (req, res) => {
       message: 'Missing required fields: name, type, location, price, duration are required.'
     });
   }
+  if (!makkah_hotel_name || !makkah_hotel_rating || !makkah_check_in_date || !makkah_check_out_date) {
+    return res.status(400).json({
+      success: false,
+      message: 'Makkah hotel details (name, rating, check-in and check-out dates) are required.'
+    });
+  }
+  if (needsMadinah && (!madinah_hotel_name || !madinah_hotel_rating || !madinah_check_in_date || !madinah_check_out_date)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Madinah hotel details are required for a package that includes Madinah.'
+    });
+  }
+  const missingCityHotels = cities.filter((c) => c !== 'makkah' && c !== 'madinah' && !city_hotels[c]);
+  if (missingCityHotels.length > 0) {
+    return res.status(400).json({
+      success: false,
+      message: `Hotel details are required for: ${missingCityHotels.map((c) => c.replace(/_/g, ' ')).join(', ')}.`
+    });
+  }
 
   try {
     const packageToUpdate = {
       name, type, location,
+      cities,
+      city_hotels,
       description: description || null,
       price,
       original_price: original_price || null,
@@ -380,7 +503,7 @@ export const updatePackage = async (req, res) => {
       .from('packages')
       .update(packageToUpdate)
       .eq('id', id)
-      .select('id, name, type, location, price, price_tiers, duration, status, created_by, agent_name, agent_number, image_urls');
+      .select('id, name, type, location, cities, price, price_tiers, duration, status, created_by, agent_name, agent_number, image_urls');
 
     if (error) {
       

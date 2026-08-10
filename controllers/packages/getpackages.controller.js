@@ -10,7 +10,7 @@ export const getAllActivePackages = async (req, res) => {
     const { data, error } = await supabase
       .from('packages')
       .select(
-        `id, name, type, location, description,
+        `id, name, type, location, cities, city_hotels, description,
          price, price_tiers, original_price, discount, duration,
          available_from, available_to,
          makkah_hotel_rating, makkah_hotel_distance,
@@ -75,7 +75,7 @@ export const getPackageById = async (req, res) => {
     const { data, error } = await supabase
       .from('packages')
       .select(
-        `id, name, type, location, description,
+        `id, name, type, location, cities, city_hotels, description,
          price, price_tiers, original_price, discount, duration,
          available_from, available_to, min_group_size, max_group_size,
          makkah_hotel_name, makkah_hotel_rating, makkah_hotel_distance,
@@ -131,7 +131,7 @@ export const getAgentPackages = async (req, res) => {
     const { data, error } = await supabase
       .from('packages')
       .select(
-        `id, name, type, location, description,
+        `id, name, type, location, cities, city_hotels, description,
          price, price_tiers, original_price, discount, duration,
          available_from, available_to, min_group_size, max_group_size,
          makkah_hotel_name, makkah_hotel_rating, makkah_hotel_distance,
