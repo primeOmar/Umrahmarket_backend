@@ -10,6 +10,9 @@ import {
 
 import PDFDocument from 'pdfkit';
 import accountingRouter from './accounting.routes.js';
+// ⚠️ Adjust this path if email.service.js doesn't live under ../services/
+// in your repo — this mirrors config/security.config.js's relative depth.
+import { sendBroadcastEmail } from '../services/email.service.js';
 const router = express.Router();
 const R2 = new S3Client({
   region: 'auto',
@@ -857,6 +860,143 @@ router.get('/agents', authenticateSuperadmin, async (req, res) => {
   } catch (err) {
     
     res.status(500).json({ success: false, message: 'Failed to fetch agents' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AGENTS — Batch Email
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /agents/batch-email
+// body: { agentIds: string[], subject: string, message: string }
+//   - agentIds: array of profile ids to email. Only agents explicitly
+//     listed here are queried — an empty array or omitted agentIds means
+//     "no agents", not "all agents". The frontend always sends the full,
+//     explicit id list for both a real "select all" click and a
+//     zero-agent "external emails only" compose, so there's no case where
+//     inferring "all" from an empty array is correct — it previously
+//     caused every agent in the database to get emailed on any compose
+//     that only targeted external addresses.
+//   - subject / message: plain text (with optional light markdown —
+//     **bold**, [text](url), "- " bullets), required. sendBroadcastEmail
+//     renders that into styled HTML — no HTML input needed here.
+//
+// Sends sequentially with a short delay between each recipient — SMTP
+// providers (Zoho included) throttle or spam-flag bursty sends, and this
+// reuses the single pooled transporter from email.service.js rather than
+// opening a new connection per recipient the way the older
+// /accounting/transactions/:id/email route does.
+//
+// NOTE ON SCALE: this runs inside the request/response cycle, so a very
+// large agent list (100+) could approach Render's request timeout given
+// the per-send delay. Fine at current agent counts — if the agent list
+// grows a lot, this should move to a background job (queue table +
+// worker) instead of a synchronous loop.
+router.post('/agents/batch-email', authenticateSuperadmin, async (req, res) => {
+  const { agentIds, extraEmails, subject, message } = req.body || {};
+
+  const cleanSubject = String(subject || '').trim();
+  const cleanMessage = String(message || '').trim();
+  const normalizedExtraEmails = Array.isArray(extraEmails)
+    ? extraEmails
+    : typeof extraEmails === 'string'
+      ? extraEmails.split(/[\n,;]+/)
+      : [];
+  const cleanAgentIds = Array.isArray(agentIds) ? agentIds.filter(Boolean) : [];
+
+  if (!cleanSubject || !cleanMessage) {
+    return res.status(422).json({ success: false, message: 'Subject and message are required' });
+  }
+  if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
+    return res.status(501).json({ success: false, message: 'Email service not configured on this server' });
+  }
+
+  try {
+    // No agent ids sent → no agents to email. Only run the profiles
+    // query when there's actually something to filter by, so a
+    // zero-agent / extra-emails-only send never touches this table.
+    let agents = [];
+    if (cleanAgentIds.length > 0) {
+      const { data, error } = await supabase
+        .from('profiles')
+        .select('id, first_name, last_name, email')
+        .eq('role', 'agent')
+        .not('email', 'is', null)
+        .in('id', cleanAgentIds);
+      if (error) throw error;
+      agents = data;
+    }
+
+    const dedupedEmails = new Map();
+    const agentRecipients = (agents || []).filter((a) => a.email);
+    agentRecipients.forEach((agent) => {
+      const email = String(agent.email).trim().toLowerCase();
+      if (!email) return;
+      dedupedEmails.set(email, {
+        email,
+        name: `${agent.first_name || ''} ${agent.last_name || ''}`.trim() || 'there',
+        recipientType: 'agent',
+      });
+    });
+
+    (normalizedExtraEmails || [])
+      .map((email) => String(email).trim().toLowerCase())
+      .filter((email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
+      .forEach((email) => {
+        if (!dedupedEmails.has(email)) {
+          dedupedEmails.set(email, { email, name: 'there', recipientType: 'external' });
+        }
+      });
+
+    const recipients = Array.from(dedupedEmails.values());
+    if (recipients.length === 0) {
+      return res.status(422).json({ success: false, message: 'No valid email addresses found for this selection' });
+    }
+
+    const results = { sent: [], failed: [] };
+    const SEND_DELAY_MS = 400;
+
+    for (let i = 0; i < recipients.length; i++) {
+      const recipient = recipients[i];
+
+      try {
+        await sendBroadcastEmail({
+          to: recipient.email,
+          agentName: recipient.name,
+          subject: cleanSubject,
+          message: cleanMessage,
+          recipientType: recipient.recipientType,
+        });
+        results.sent.push(recipient.email);
+      } catch (sendErr) {
+        results.failed.push({ email: recipient.email, error: sendErr.message });
+      }
+
+      if (i < recipients.length - 1) {
+        await new Promise((r) => setTimeout(r, SEND_DELAY_MS));
+      }
+    }
+
+    await logAuditAction(
+      req.superadmin.id,
+      'BATCH_EMAIL_AGENTS',
+      'agent_batch_email',
+      `${recipients.length}_recipients`,
+      `Subject: "${cleanSubject}" — ${results.sent.length} sent, ${results.failed.length} failed`,
+      results.failed.length === 0 ? 'success' : 'partial',
+      results.failed.length ? JSON.stringify(results.failed).slice(0, 500) : '',
+      req,
+    );
+
+    res.json({
+      success: true,
+      message: `Sent to ${results.sent.length} of ${recipients.length} recipients`,
+      sentCount: results.sent.length,
+      failedCount: results.failed.length,
+      recipientCount: recipients.length,
+      failed: results.failed,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to send batch email' });
   }
 });
 

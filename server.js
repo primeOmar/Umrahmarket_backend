@@ -64,6 +64,7 @@ app.set('trust proxy', 1);
 const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:3000',
+  'http://localhost:5000',
   'https://umrahmarket.vercel.app',
   'https://umrahmarket.net',
     'https://www.umrahmarket.net',
