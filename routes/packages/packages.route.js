@@ -5,7 +5,12 @@ import { createPackage, updatePackage, deletePackage } from '../../controllers/p
 import { getItinerary, saveItinerary } from '../../controllers/packages/itinerary.controller.js';
 import { verifyToken } from '../../middleware/auth.middleware.js';
 import { validatePackage } from '../../middleware/uploads/validatePackage.js';
-import { requireApprovedAgent } from '../../middleware/agentVerification.middleware.js';
+// GATE REMOVED: requireApprovedAgent no longer wired into the pipelines
+// below — agents can post/edit packages before document approval.
+// Verification/documents can still be reviewed and approved independently;
+// it just isn't required before creating a package. Re-add the import and
+// drop it back into the two pipelines below to restore the gate.
+// import { requireApprovedAgent } from '../../middleware/agentVerification.middleware.js';
 
 const router = express.Router();
 
@@ -16,17 +21,17 @@ router.get('/all-active', getAllActivePackages);
 //
 // Pipeline:
 //  1. verifyToken          — authenticate the agent
-//  2. requireApprovedAgent — block unverified/rejected agents with a clear
-//                            reason (AGENT_NOT_VERIFIED) before we ever
-//                            parse the multipart body or touch R2
-//  3. parseFormData        — multer parses multipart body; req.body + req.files populated (nothing uploaded yet)
-//  4. validatePackage      — reject early if required text fields are missing or invalid
-//  5. uploadImagesToR2     — security scan + R2 upload only if validation passed
-//  6. createPackage        — insert record into Supabase with image URLs
+//  2. parseFormData        — multer parses multipart body; req.body + req.files populated (nothing uploaded yet)
+//  3. validatePackage      — reject early if required text fields are missing or invalid
+//  4. uploadImagesToR2     — security scan + R2 upload only if validation passed
+//  5. createPackage        — insert record into Supabase with image URLs
+//
+// NOTE: requireApprovedAgent gate removed — agents no longer need approved
+// documents to create a package. See import comment above to restore.
 router.post(
   '/create-packages',
   verifyToken,
-  requireApprovedAgent,
+  // requireApprovedAgent,
   parseFormData,
   validatePackage,
   uploadImagesToR2,
@@ -47,13 +52,14 @@ router.get('/getagentpackages', verifyToken, getAgentPackages);
 router.get('/:id', getPackageById);
 
 // PUT /api/packages/:id — agent edits their own package (all fields + images)
-// Same pipeline as create: auth → approved-agent gate → parse multipart →
-// validate → upload any new images to R2 → update the record. Ownership is
-// re-checked inside updatePackage itself, not just inferred from the token.
+// Same pipeline as create (approved-agent gate removed): auth → parse
+// multipart → validate → upload any new images to R2 → update the record.
+// Ownership is re-checked inside updatePackage itself, not just inferred
+// from the token.
 router.put(
   '/:id',
   verifyToken,
-  requireApprovedAgent,
+  // requireApprovedAgent,
   parseFormData,
   validatePackage,
   uploadImagesToR2,
