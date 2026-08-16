@@ -183,6 +183,60 @@ router.post('/upload-url', authenticateSuperadmin, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// PDF attachment upload — same backend-proxy pattern as images, for
+// attaching a source document (e.g. the full magazine/newspaper issue a
+// post references) that readers can open below the post.
+// ─────────────────────────────────────────────────────────────────────────────
+const PDF_MIMES = ['application/pdf'];
+const PDF_MAX_SIZE = 25 * 1024 * 1024; // 25MB
+
+const pdfUpload = multer({
+  storage: multer.memoryStorage(),
+  fileFilter: (_req, file, cb) => {
+    if (!PDF_MIMES.includes(file.mimetype)) {
+      return cb(new Error(`Invalid file type: ${file.mimetype}. Allowed: pdf`), false);
+    }
+    cb(null, true);
+  },
+  limits: { fileSize: PDF_MAX_SIZE, files: 1 },
+});
+
+router.post('/upload-attachment', authenticateSuperadmin, pdfUpload.single('attachment'), async (req, res) => {
+  try {
+    const file = req.file;
+    if (!file) return res.status(422).json({ success: false, message: 'No file provided' });
+    if (!R2_BUCKET) return res.status(500).json({ success: false, message: 'R2 bucket not configured' });
+
+    const buffer = file.buffer;
+
+    const detected = await fileTypeFromBuffer(buffer);
+    if (!detected || !PDF_MIMES.includes(detected.mime)) {
+      logSuspiciousActivity('Blog attachment upload rejected — MIME mismatch', {
+        claimed: file.mimetype, detected: detected?.mime ?? 'unknown',
+        userId: req.superadmin?.id, ip: req.ip,
+      });
+      return res.status(400).json({ success: false, message: 'File type verification failed. Only PDF is allowed.' });
+    }
+
+    const uid = crypto.randomBytes(16).toString('hex');
+    const key = `blog/attachments/${Date.now()}-${uid}.pdf`;
+
+    await R2.send(new PutObjectCommand({ Bucket: R2_BUCKET, Key: key, Body: buffer, ContentType: detected.mime }));
+
+    logFileUpload(req.superadmin?.id, key, detected.mime, buffer.length, true, req.ip);
+
+    return res.json({ success: true, data: { publicUrl: publicUrlFor(key), key, name: file.originalname } });
+  } catch (err) {
+    if (err instanceof multer.MulterError) {
+      const msgs = { LIMIT_FILE_SIZE: `File too large. Max ${PDF_MAX_SIZE / 1024 / 1024}MB.` };
+      return res.status(400).json({ success: false, message: msgs[err.code] || err.message });
+    }
+    logger.error('Blog attachment upload failed', { error: err.message });
+    return res.status(500).json({ success: false, message: 'Attachment upload failed. Please try again.' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GET /superadmin/blog
 // List posts for the admin table. Lightweight — omits `content`.
 // Query: ?status=draft|published&category=News&search=foo
@@ -238,6 +292,7 @@ router.post('/', authenticateSuperadmin, async (req, res) => {
     const {
       title, excerpt, content, slug: rawSlug,
       cover_image_url, cover_image_key, cover_video_url, cover_video_key,
+      attachment_url, attachment_key, attachment_name,
       category, tags, status, meta_title, meta_description,
       author_name, author_avatar_url,
     } = req.body || {};
@@ -260,6 +315,9 @@ router.post('/', authenticateSuperadmin, async (req, res) => {
         cover_image_key:    cover_image_key || null,
         cover_video_url:    cover_video_url || null,
         cover_video_key:    cover_video_key || null,
+        attachment_url:     attachment_url || null,
+        attachment_key:     attachment_key || null,
+        attachment_name:    attachment_name || null,
         category:           category || 'News',
         tags:                Array.isArray(tags) ? tags : [],
         status:              safeStatus,
@@ -292,7 +350,7 @@ router.put('/:id', authenticateSuperadmin, async (req, res) => {
 
     const { data: existing, error: fetchErr } = await supabase
       .from('blog_posts')
-      .select('id, slug, status, published_at, cover_image_key, cover_video_key')
+      .select('id, slug, status, published_at, cover_image_key, cover_video_key, attachment_key')
       .eq('id', id)
       .single();
 
@@ -301,6 +359,7 @@ router.put('/:id', authenticateSuperadmin, async (req, res) => {
     const {
       title, excerpt, content, slug: rawSlug,
       cover_image_url, cover_image_key, cover_video_url, cover_video_key,
+      attachment_url, attachment_key, attachment_name,
       category, tags, status, meta_title, meta_description,
       author_name, author_avatar_url,
     } = req.body || {};
@@ -326,8 +385,14 @@ router.put('/:id', authenticateSuperadmin, async (req, res) => {
     // Media — old objects are deleted from R2 below if replaced
     const oldImageKey = existing.cover_image_key;
     const oldVideoKey = existing.cover_video_key;
+    const oldAttachmentKey = existing.attachment_key;
     if (cover_image_url !== undefined) { update.cover_image_url = cover_image_url; update.cover_image_key = cover_image_key || null; }
     if (cover_video_url !== undefined) { update.cover_video_url = cover_video_url; update.cover_video_key = cover_video_key || null; }
+    if (attachment_url !== undefined) {
+      update.attachment_url = attachment_url;
+      update.attachment_key = attachment_key || null;
+      update.attachment_name = attachment_name || null;
+    }
 
     // Publish/unpublish transitions
     if (status !== undefined && status !== existing.status) {
@@ -356,6 +421,9 @@ router.put('/:id', authenticateSuperadmin, async (req, res) => {
     if (cover_video_url !== undefined && oldVideoKey && oldVideoKey !== update.cover_video_key) {
       R2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: oldVideoKey })).catch(() => {});
     }
+    if (attachment_url !== undefined && oldAttachmentKey && oldAttachmentKey !== update.attachment_key) {
+      R2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: oldAttachmentKey })).catch(() => {});
+    }
 
     await logAuditActionSafe(req.superadmin?.id, 'UPDATE_BLOG_POST', 'blog_post', id, `Updated "${data.title}"`, req);
 
@@ -374,7 +442,7 @@ router.delete('/:id', authenticateSuperadmin, async (req, res) => {
 
     const { data: existing, error: fetchErr } = await supabase
       .from('blog_posts')
-      .select('id, title, cover_image_key, cover_video_key')
+      .select('id, title, cover_image_key, cover_video_key, attachment_key')
       .eq('id', id)
       .single();
 
@@ -384,7 +452,7 @@ router.delete('/:id', authenticateSuperadmin, async (req, res) => {
     if (error) throw error;
 
     // Best-effort R2 cleanup
-    const cleanupKeys = [existing.cover_image_key, existing.cover_video_key].filter(Boolean);
+    const cleanupKeys = [existing.cover_image_key, existing.cover_video_key, existing.attachment_key].filter(Boolean);
     await Promise.all(
       cleanupKeys.map((key) =>
         R2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: key })).catch(() => {})
