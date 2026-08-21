@@ -29,6 +29,7 @@ import resourcesRoutes from './routes/resorces.routes.js';
 import blogPublicRoutes from './routes/blog.public.routes.js';
 import publicChatRoutes from './routes/publicchat.route.js';
 import visitsRoutes from './routes/visits.routes.js';
+import sitemapRoutes from './routes/sitemap.route.js';
 const router = express.Router();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -226,6 +227,14 @@ app.use('/api/publicchat', publicChatRoutes);
 app.use('/api/visits', visitsRoutes);
 app.use('/api/agent_accounting', accountingRoutes);
 app.use('/api/fx', fxRoutes);
+
+// Sitemap — mounted at root (not under /api) so it serves directly at
+// GET /sitemap.xml on this Render domain. See routes/sitemap.route.js
+// header comment: vercel.json's /sitemap.xml -> /api/sitemap rewrite must
+// be repointed at this backend's /sitemap.xml URL for this to actually be
+// what Google fetches at www.umrahmarket.net/sitemap.xml — otherwise this
+// route exists but nothing routes traffic to it.
+app.use(sitemapRoutes);
 
 // ═══════════════════════════════════════════════════════════════════════
 // MESSAGES ROUTES WITH RATE LIMITING
