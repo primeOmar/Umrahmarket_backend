@@ -29,6 +29,7 @@ import resourcesRoutes from './routes/resorces.routes.js';
 import blogPublicRoutes from './routes/blog.public.routes.js';
 import publicChatRoutes from './routes/publicchat.route.js';
 import visitsRoutes from './routes/visits.routes.js';
+import { startTaskReminderJob } from './jobs/taskReminder.job.js';
 const router = express.Router();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -364,7 +365,9 @@ const server = app.listen(PORT, '0.0.0.0', async () => {
   if (!supabaseConnected) {
     logger.warn('⚠️  Supabase connection could not be verified');
   }
-  
+
+  startTaskReminderJob();
+
   logger.info('✅ Server is ready', {
     port: PORT,
     environment: config.env,

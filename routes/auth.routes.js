@@ -4,6 +4,7 @@ import bcrypt from 'bcryptjs';
 import { supabase, supabaseAdmin } from '../config/supabase.js';
 import config from '../config/security.config.js';
 import { sendVerificationEmail } from '../services/email.service.js';
+import { notifyNewAgent } from '../services/agentVerification.service.js';
 import logger, { 
   logAuthAttempt, 
   logSecurityEvent,
@@ -455,6 +456,13 @@ router.post(
       // Fire-and-forget — same as client registration. Independent of the
       // separate admin-approval workflow (approved: false above).
       issueVerificationEmail({ userId: authData.user.id, email, firstName });
+
+      // ── Send "upload your documents" WhatsApp + email ──────────────────
+      // Fire-and-forget, same as above — must never block or fail
+      // registration. Starts the 48hr reminder clock (see
+      // cron/verificationReminderJob.js), which stops once an
+      // agent_documents row exists for this agent.
+      notifyNewAgent({ id: authData.user.id, firstName, email, phone }, supabaseAdmin);
 
       // ── Establish a real app session immediately ───────────────────────
       // BUG FIX: this route used to return without ever calling res.cookie()
