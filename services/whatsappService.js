@@ -1,5 +1,4 @@
-// services/whatsappService.js
-//
+
 // Twilio WhatsApp integration for UmrahMarket.
 //
 // IMPORTANT — how WhatsApp Business messaging actually works:

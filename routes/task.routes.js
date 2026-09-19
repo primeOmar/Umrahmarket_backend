@@ -2,6 +2,7 @@ import express from 'express';
 import { supabaseAdmin as supabase } from '../config/supabase.js';
 import { authenticateSuperadmin } from './superadmin_routes.js';
 import { sendTaskEmail, taskEmailTemplates } from '../services/taskEmail.service.js';
+import { sendTaskAssignedWhatsApp } from '../services/agentVerification.service.js';
 
 const router = express.Router();
 
@@ -228,13 +229,16 @@ router.post('/', authenticateSuperadmin, requireTaskManager, async (req, res) =>
 
     const { data: assigneeAdmins } = await supabase
       .from('superadmin_credentials')
-      .select('id, email, username, full_name')
+      .select('id, email, username, full_name, phone_number')
       .in('id', uniqueAssignees);
 
     await Promise.all((assigneeAdmins || []).map(async (a) => {
       await notify(a.id, task.id, 'assigned', `New task assigned: "${task.title}"`);
       const { subject, html } = taskEmailTemplates.assigned(task, a.full_name || a.username);
-      await sendTaskEmail(a.email, subject, html);
+      await Promise.all([
+        sendTaskEmail(a.email, subject, html),
+        sendTaskAssignedWhatsApp(a.phone_number, a.full_name || a.username, task.title),
+      ]);
     }));
 
     await logTaskAudit(req.superadmin.id, 'TASK_CREATED', task.id, `"${task.title}" — ${uniqueAssignees.length} assignee(s)`, req);

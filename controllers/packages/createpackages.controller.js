@@ -160,6 +160,47 @@ function sanitizePriceTiers(raw, adultPrice) {
   };
 }
 
+// Optional per-nationality price overrides (stored as a single
+// `country_pricing` jsonb column, keyed by ISO country code):
+//   { TZ: { adult, child, minor_child, infant }, SO: { ... } }
+// Kenya has no entry here — it's simply the default `price`/`price_tiers`
+// above. Only the two currently-supported extra countries are accepted;
+// anything else is silently dropped. Within an accepted country, the same
+// adult-price-required / blank-tier-falls-back-to-adult rules as
+// sanitizePriceTiers apply — a country with no valid adult price is
+// dropped entirely (better to have no override than a broken $0 one).
+const ALLOWED_COUNTRY_CODES = ['TZ', 'SO'];
+
+function sanitizeCountryPricing(raw) {
+  let parsed = {};
+  if (raw) {
+    try {
+      parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (!parsed || typeof parsed !== 'object') parsed = {};
+    } catch {
+      parsed = {};
+    }
+  }
+  const out = {};
+  ALLOWED_COUNTRY_CODES.forEach((code) => {
+    const entry = parsed[code];
+    if (!entry || typeof entry !== 'object') return;
+    const adult = sanitizeNumber(entry.adult);
+    if (adult === null || adult <= 0) return;
+    const tierOrFallback = (key) => {
+      const n = sanitizeNumber(entry[key]);
+      return (n !== null && n >= 0) ? n : adult;
+    };
+    out[code] = {
+      adult,
+      child: tierOrFallback('child'),
+      minor_child: tierOrFallback('minor_child'),
+      infant: tierOrFallback('infant'),
+    };
+  });
+  return out;
+}
+
 // Used by both create (duplicate carries photos over) and update (agent kept
 // some existing images) — client sends the URLs it wants to keep as JSON,
 // newly uploaded files always come through req.imageUrls from uploadImagesToR2.
@@ -207,6 +248,7 @@ export const createPackage = async (req, res) => {
   const discount       = sanitizeNumber(req.body.discount);
   const duration       = sanitizeNumber(req.body.duration);
   const price_tiers    = sanitizePriceTiers(req.body.price_tiers, price);
+  const country_pricing = sanitizeCountryPricing(req.body.country_pricing);
 
   const min_group_size = sanitizeNumber(req.body.min_group_size) ?? 1;
   const max_group_size = sanitizeNumber(req.body.max_group_size) ?? 50;
@@ -298,6 +340,7 @@ const madinah_hotel_distance = sanitizeText(req.body.madinah_hotel_distance, 30)
       discount: discount || null,
       duration,
       price_tiers,
+      country_pricing,
       available_from: available_from || null,
       available_to: available_to || null,
       min_group_size,
@@ -331,7 +374,7 @@ const madinah_hotel_distance = sanitizeText(req.body.madinah_hotel_distance, 30)
     const { data, error } = await supabase
       .from('packages')
       .insert([packageToInsert])
-      .select('id, name, type, location, cities, price, price_tiers, duration, status, created_by, agent_name, agent_number');
+      .select('id, name, type, location, cities, price, price_tiers, country_pricing, duration, status, created_by, agent_name, agent_number');
 
     if (error) {
       
@@ -404,6 +447,7 @@ export const updatePackage = async (req, res) => {
   const discount       = sanitizeNumber(req.body.discount);
   const duration       = sanitizeNumber(req.body.duration);
   const price_tiers    = sanitizePriceTiers(req.body.price_tiers, price);
+  const country_pricing = sanitizeCountryPricing(req.body.country_pricing);
 
   const min_group_size = sanitizeNumber(req.body.min_group_size) ?? 1;
   const max_group_size = sanitizeNumber(req.body.max_group_size) ?? 50;
@@ -476,6 +520,7 @@ export const updatePackage = async (req, res) => {
       discount: discount || null,
       duration,
       price_tiers,
+      country_pricing,
       available_from: available_from || null,
       available_to: available_to || null,
       min_group_size,
@@ -503,7 +548,7 @@ export const updatePackage = async (req, res) => {
       .from('packages')
       .update(packageToUpdate)
       .eq('id', id)
-      .select('id, name, type, location, cities, price, price_tiers, duration, status, created_by, agent_name, agent_number, image_urls');
+      .select('id, name, type, location, cities, price, price_tiers, country_pricing, duration, status, created_by, agent_name, agent_number, image_urls');
 
     if (error) {
       

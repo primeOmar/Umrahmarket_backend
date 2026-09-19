@@ -4,7 +4,7 @@ import { supabaseAdmin } from '../config/supabase.js';
 import { createBookingMessage } from './messagesController.js';
 import { sendBookingReceiptEmail } from '../services/bookingReceipt.service.js';
 import { getUsdKesRate, usdToKes, applySellMargin } from '../services/currency.service.js'; 
-import { computeBookingAmount } from '../services/pricing.service.js'; 
+import { computeBookingAmount, deriveClientCountry } from '../services/pricing.service.js'; 
 
 const KES_RATE   = Number(process.env.KES_PER_USD) || 130; // kept for fallback
 const IS_SANDBOX = (process.env.PESAPAL_ENV || 'sandbox') !== 'production';
@@ -119,7 +119,7 @@ export const initiate = async (req, res) => {
     // ── 1. Fetch package price from DB — NEVER trust frontend ────────────────
     const { data: pkg, error: pkgErr } = await supabaseAdmin
       .from('packages')
-      .select('id, name, price, price_tiers, status, created_by, agent_name')
+      .select('id, name, price, price_tiers, country_pricing, status, created_by, agent_name')
       .eq('id', packageId)
       .maybeSingle();
 
@@ -140,10 +140,15 @@ export const initiate = async (req, res) => {
     // ── Compute total from age-tier prices × requested traveler counts ───────
     // NEVER trust a client-sent amount — only the traveler *counts* come from
     // the request; every price comes from the package row fetched above.
+    // `clientCountry` also gates the booking itself: a Tanzanian/Somali
+    // pilgrim can only book if the package has pricing set for their
+    // country (see computeBookingAmount → isCountryPricingAvailable) — the
+    // client-side prompt in BookingFlow.jsx is UX only, this is the real check.
+    const clientCountry = deriveClientCountry(req.user?.phone);
     let travelers, totalTravelers, priceUSD, priceBreakdown;
     try {
       ({ travelers, totalTravelers, totalUSD: priceUSD, breakdown: priceBreakdown } =
-        computeBookingAmount(pkg, rawTravelers));
+        computeBookingAmount(pkg, rawTravelers, clientCountry));
     } catch (calcErr) {
       return res.status(calcErr.status || 400).json({ success: false, message: calcErr.message });
     }

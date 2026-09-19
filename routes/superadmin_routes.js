@@ -866,6 +866,92 @@ router.get('/agents', authenticateSuperadmin, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// PASSPORTS — fetch a client's uploaded passport scans from R2 (signed URLs)
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /clients/:clientId/passports
+// Every traveler on every booking that client made has its own row in
+// passport_verifications (traveler_index). The raw passport scan is stored
+// PRIVATE in R2 (see uploadPassportBuffer — no public-read ACL), so it can
+// only be viewed here via a short-lived signed URL generated on demand,
+// never via the stored passport_image_url column directly.
+router.get('/clients/:clientId/passports', authenticateSuperadmin, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!clientId || typeof clientId !== 'string' || !clientId.trim()) {
+      return res.status(422).json({ success: false, message: 'Invalid client id' });
+    }
+
+    const { data: rows, error } = await supabase
+      .from('passport_verifications')
+      .select(`
+        id, package_id, traveler_index, passport_number, passport_country,
+        passport_expiry, surname, given_names, full_name, date_of_birth,
+        nationality, verification_status, verified, attempts, image_key,
+        passport_image_url, face_photo_url, last_attempt_at, verified_at
+      `)
+      .eq('user_id', clientId)
+      .order('package_id', { ascending: false })
+      .order('traveler_index', { ascending: true });
+
+    if (error) throw error;
+
+    const packageIds = [...new Set((rows || []).map(r => r.package_id).filter(Boolean))];
+    const packageMap = {};
+    if (packageIds.length > 0) {
+      const { data: pkgs } = await supabase
+        .from('packages')
+        .select('id, name')
+        .in('id', packageIds);
+      (pkgs || []).forEach(p => { packageMap[p.id] = p.name; });
+    }
+
+    const normalized = await Promise.all((rows || []).map(async (row) => {
+      let imageUrl = null;
+      if (row.image_key && R2_BUCKET) {
+        try {
+          imageUrl = await getSignedUrl(
+            R2,
+            new GetObjectCommand({ Bucket: R2_BUCKET, Key: row.image_key }),
+            { expiresIn: R2_SIGNED_URL_EXPIRES },
+          );
+        } catch (signErr) {
+          
+        }
+      } else if (row.passport_image_url && !row.passport_image_url.startsWith('pending://')) {
+        imageUrl = row.passport_image_url;
+      }
+
+      return {
+        id:                 row.id,
+        packageId:          row.package_id,
+        packageName:        packageMap[row.package_id] || null,
+        travelerIndex:      row.traveler_index,
+        passportNumber:     row.passport_number,
+        passportCountry:    row.passport_country,
+        passportExpiry:     row.passport_expiry,
+        fullName:           row.full_name || [row.given_names, row.surname].filter(Boolean).join(' ') || null,
+        nationality:        row.nationality,
+        dateOfBirth:        row.date_of_birth,
+        verificationStatus: row.verification_status,
+        verified:           !!row.verified,
+        attempts:           row.attempts,
+        imageUrl,
+        faceImageUrl:       row.face_photo_url && !row.face_photo_url.startsWith('pending://') ? row.face_photo_url : null,
+        lastAttemptAt:       row.last_attempt_at,
+        verifiedAt:          row.verified_at,
+      };
+    }));
+
+    await logAuditAction(req.superadmin.id, 'VIEW_PASSPORT', 'client', clientId, `Viewed ${normalized.length} passport record(s)`, 'success', '', req);
+
+    res.json({ success: true, data: normalized });
+  } catch (err) {
+    
+    res.status(500).json({ success: false, message: 'Failed to fetch passport records' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // AGENTS — Batch Email
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /agents/batch-email

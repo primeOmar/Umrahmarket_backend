@@ -84,6 +84,9 @@ const buildUserObject = (profile, decoded) => ({
   agentNumber: profile.agent_number,
   approved:    profile.approved,
   email:       decoded.email,
+  // Needed server-side to derive which country's package pricing (if any)
+  // a client's booking should use — see pricing.service.js deriveClientCountry.
+  phone:       profile.phone,
 });
 
 // ─────────────────────────────────────────────
@@ -104,7 +107,7 @@ export const verifyToken = async (req, res, next) => {
 
     const { data: profile, error } = await supabaseAdmin
       .from('profiles')
-      .select('id, first_name, last_name, role, company_name, agent_number, approved')
+      .select('id, first_name, last_name, role, company_name, agent_number, approved, phone')
       .eq('id', decoded.userId)
       .single();
 

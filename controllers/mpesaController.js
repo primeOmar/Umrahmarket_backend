@@ -4,7 +4,7 @@ import { stkPush, stkQuery } from '../services/Mpesaservice.js';
 import { createBookingMessage } from './messagesController.js';
 import { sendBookingReceiptEmail } from '../services/bookingReceipt.service.js';
 import { getUsdKesRate, usdToKes, applySellMargin } from '../services/currency.service.js'; // <-- NEW
-import { computeBookingAmount } from '../services/pricing.service.js'; // <-- travelers → total price
+import { computeBookingAmount, deriveClientCountry } from '../services/pricing.service.js'; // <-- travelers → total price
 
 const KES_RATE       = Number(process.env.KES_PER_USD) || 130; // fallback if live rate + service fallback both fail
 const MPESA_PHONE_RE = /^254[17]\d{8}$/;
@@ -57,7 +57,7 @@ export const initiate = async (req, res) => {
     // ── Fetch package from Supabase — NEVER trust FE price ──────────────
     const { data: pkg, error: pkgErr } = await supabaseAdmin
       .from('packages')
-      .select('id, name, price, price_tiers, status, created_by, agent_name')
+      .select('id, name, price, price_tiers, country_pricing, status, created_by, agent_name')
       .eq('id', packageId)
       .maybeSingle();
 
@@ -80,9 +80,14 @@ export const initiate = async (req, res) => {
     // ── Compute total from age-tier prices × requested traveler counts ───────
     // NEVER trust a client-sent amount — only the traveler *counts* come from
     // the request; every price comes from the package row fetched above.
+    // `clientCountry` is derived from the account's own phone on file (NOT
+    // the M-Pesa payment `phone` above, which is always a KE Safaricom
+    // number regardless of the pilgrim's actual nationality) and gates the
+    // booking itself for Tanzanian/Somali pilgrims — see computeBookingAmount.
+    const clientCountry = deriveClientCountry(req.user?.phone);
     let travelers, totalTravelers, priceUSD;
     try {
-      ({ travelers, totalTravelers, totalUSD: priceUSD } = computeBookingAmount(pkg, rawTravelers));
+      ({ travelers, totalTravelers, totalUSD: priceUSD } = computeBookingAmount(pkg, rawTravelers, clientCountry));
     } catch (calcErr) {
       return res.status(calcErr.status || 400).json({ success: false, message: calcErr.message });
     }

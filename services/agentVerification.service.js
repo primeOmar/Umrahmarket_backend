@@ -1,8 +1,3 @@
-// services/agentVerification.service.js
-// Fire-and-forget notifications telling a newly registered agent to upload
-// verification documents, plus the 48hr follow-up sent by
-// cron/verificationReminderJob.js. Never throws into the caller — matches
-// the pattern used by issueVerificationEmail in auth.routes.js.
 import twilio from 'twilio';
 import nodemailer from 'nodemailer';
 import logger from '../config/logger.js';
@@ -82,6 +77,19 @@ const sendVerificationEmail = async (to, firstName, isFollowUp) => {
     logger.error('Verification email notification failed', { error: err.message, to });
     return { sent: false, reason: err.message };
   }
+};
+
+/**
+ * Called from task_routes.js when a task is assigned to a superadmin/task
+ * team member. Fire-and-forget — never blocks or fails the task-creation
+ * response. Requires TWILIO_TEMPLATE_TASK_ASSIGNED_SID to be an approved
+ * WhatsApp content template with two variables: {1: name, 2: taskTitle}.
+ */
+export const sendTaskAssignedWhatsApp = async (phone, fullNameOrUsername, taskTitle) => {
+  return sendWhatsApp(phone, process.env.TWILIO_TEMPLATE_TASK_ASSIGNED_SID, {
+    1: fullNameOrUsername,
+    2: taskTitle,
+  });
 };
 
 /**
