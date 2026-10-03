@@ -36,9 +36,14 @@ if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_WHATSAPP_FROM) {
   console.warn('[whatsappService] Twilio env vars missing — WhatsApp sending is disabled until configured.');
 }
 
-const client = TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
-  ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-  : null;
+let client = null;
+if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
+  try {
+    client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+  } catch (err) {
+    console.error('[whatsappService] Twilio disabled — invalid credentials:', err.message);
+  }
+}
 
 /**
  * Normalise a Kenyan number to E.164 (+254XXXXXXXXX).
