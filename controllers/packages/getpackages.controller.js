@@ -1,5 +1,6 @@
 import supabase from '../../config/supabase.js';
 import { handleDatabaseError } from './createpackages.controller.js';
+import { notExpiredFilter, isPackageExpired, withExpiry } from '../../utils/packageExpiry.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // getAllActivePackages  GET /api/packages/all-active
@@ -21,6 +22,7 @@ export const getAllActivePackages = async (req, res) => {
          status`
       )
       .eq('status', 'Active')
+      .or(notExpiredFilter())
       .order('created_at', { ascending: false });
 
     if (error) {
@@ -97,8 +99,8 @@ export const getPackageById = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Package not found.' });
     }
 
-    // Gate non-Active packages to their owning agent only.
-    if (data.status !== 'Active') {
+    // Gate non-Active and expired packages to their owning agent only.
+    if (data.status !== 'Active' || isPackageExpired(data)) {
       const requester = req.user; // present only if verifyToken ran and a valid token was sent
       const isOwner =
         requester &&
@@ -110,7 +112,7 @@ export const getPackageById = async (req, res) => {
       }
     }
 
-    return res.status(200).json({ success: true, package: data });
+    return res.status(200).json({ success: true, package: withExpiry(data) });
 
   } catch (error) {
     return handleDatabaseError(res, error);
@@ -153,10 +155,12 @@ export const getAgentPackages = async (req, res) => {
       throw error;
     }
 
+    const packages = (data ?? []).map(withExpiry);
+
     return res.status(200).json({
       success:  true,
-      packages: data ?? [],
-      total:    data?.length ?? 0,
+      packages,
+      total:    packages.length,
     });
 
   } catch (error) {

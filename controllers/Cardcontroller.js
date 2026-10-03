@@ -5,6 +5,7 @@ import { createBookingMessage } from './messagesController.js';
 import { sendBookingReceiptEmail } from '../services/bookingReceipt.service.js';
 import { getUsdKesRate, usdToKes, applySellMargin } from '../services/currency.service.js'; 
 import { computeBookingAmount, deriveClientCountry } from '../services/pricing.service.js'; 
+import { isPackageExpired } from '../utils/packageExpiry.js';
 
 const KES_RATE   = Number(process.env.KES_PER_USD) || 130; // kept for fallback
 const IS_SANDBOX = (process.env.PESAPAL_ENV || 'sandbox') !== 'production';
@@ -119,7 +120,7 @@ export const initiate = async (req, res) => {
     // ── 1. Fetch package price from DB — NEVER trust frontend ────────────────
     const { data: pkg, error: pkgErr } = await supabaseAdmin
       .from('packages')
-      .select('id, name, price, price_tiers, country_pricing, status, created_by, agent_name')
+      .select('id, name, price, price_tiers, country_pricing, status, created_by, agent_name, available_from')
       .eq('id', packageId)
       .maybeSingle();
 
@@ -133,6 +134,9 @@ export const initiate = async (req, res) => {
     const pkgStatus = (pkg.status || '').toLowerCase();
     if (!['active', 'published', 'approved'].includes(pkgStatus))
       return res.status(404).json({ success: false, message: 'Package not available for booking' });
+
+    if (isPackageExpired(pkg))
+      return res.status(410).json({ success: false, message: 'This package is no longer available for booking.' });
 
     if ((pkg.price ?? 0) <= 0)
       return res.status(400).json({ success: false, message: 'Package has no valid price' });

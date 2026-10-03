@@ -9,6 +9,7 @@
  * document.routes.js does for GET /api/documents.
  * */
 import express from 'express';
+import { notExpiredFilter } from '../utils/packageExpiry.js';
 import { S3Client, GetObjectCommand, ListObjectsV2Command } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { supabaseAdmin as supabase } from '../config/supabase.js';
@@ -103,7 +104,8 @@ router.get('/', async (req, res) => {
       const { data: pkgRows, error: pkgErr } = await supabase
         .from('packages')
         .select('created_by')
-        .in('created_by', agentIds);
+        .in('created_by', agentIds)
+        .or(notExpiredFilter());
 
       if (pkgErr) throw pkgErr;
       countMap = pkgRows.reduce((acc, p) => {
@@ -158,6 +160,7 @@ router.get('/:id', async (req, res) => {
       .from('packages')
       .select('id, name, price, original_price, discount, duration, image_urls, status, location')
       .eq('created_by', id)
+      .or(notExpiredFilter())
       .order('created_at', { ascending: false });
 
     if (pkgErr) throw pkgErr;
