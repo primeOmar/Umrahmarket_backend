@@ -89,7 +89,7 @@ Env: `TWILIO_TEMPLATE_AGENT_PACKAGE_REMINDER_SID` · Code: `services/agentPackag
 ```
 Assalamu alaikum {{1}}, your UmrahMarket agent account is ready but travellers cannot book what is not listed yet. Log in to your dashboard to add your Umrah packages and start receiving bookings.
 ```
-Sample: `{{1}}` = `Omar`. Optional button (URL, static): `https://umrahmarket.net/agent/dashboard` — label `Open dashboard`.
+Sample: `{{1}}` = `Omar`. Optional button (URL, static): `` — label `Open dashboard`.
 
 How it is triggered:
 - **Superadmin dashboard → WhatsApp → "Remind agents"** (optionally only agents with no packages). Agents already reminded within `AGENT_REMINDER_COOLDOWN_DAYS` (default 6) are skipped.
