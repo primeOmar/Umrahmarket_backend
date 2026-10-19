@@ -3,7 +3,7 @@ import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
 import { supabase, supabaseAdmin } from '../config/supabase.js';
 import config from '../config/security.config.js';
-import { sendVerificationEmail } from '../services/email.service.js';
+import { sendVerificationEmail, sendPasswordResetEmail } from '../services/email.service.js';
 import { notifyNewAgent } from '../services/agentVerification.service.js';
 import logger, { 
   logAuthAttempt, 
@@ -913,7 +913,7 @@ router.post(
 
       const { data: account, error: lookupError } = await supabaseAdmin
         .from('profiles')
-        .select('id')
+        .select('id, first_name')
         .ilike('email', email)
         .maybeSingle();
 
@@ -927,12 +927,30 @@ router.post(
         });
       }
 
-      const { error } = await supabase.auth.resetPasswordForEmail(email, {
-        redirectTo: `${FRONTEND_BASE_URL}/reset-password`,
+      // Generate the recovery token ourselves and email it via our own SMTP
+      // (Supabase's built-in mailer is rate-limited/unreliable, and the PKCE
+      // client here can't produce usable email links anyway).
+      const { data: linkData, error: linkError } = await supabaseAdmin.auth.admin.generateLink({
+        type: 'recovery',
+        email,
       });
+      const tokenHash = linkData?.properties?.hashed_token;
+      if (linkError || !tokenHash) {
+        logger.error('Password reset link generation failed', { error: linkError?.message, email });
+        return res.status(502).json({
+          success: false,
+          error: 'We could not create a reset link right now. Please try again shortly.',
+        });
+      }
 
-      if (error) {
-        logger.error('Password reset request failed', { error: error.message, email });
+      try {
+        await sendPasswordResetEmail({
+          to: email,
+          firstName: account.first_name,
+          resetUrl: `${FRONTEND_BASE_URL}/reset-password?token_hash=${encodeURIComponent(tokenHash)}`,
+        });
+      } catch (mailErr) {
+        logger.error('Password reset email failed to send', { error: mailErr.message, email });
         return res.status(502).json({
           success: false,
           error: 'We could not send the reset email right now. Please try again shortly.',
@@ -966,11 +984,15 @@ router.post(
   validatePasswordReset,
   async (req, res) => {
     try {
-      // `token` is the recovery access token Supabase put in the email link
+      // `token` is the one-time recovery token_hash from the emailed link
       const { token, password } = req.body;
 
-      const { data: authData, error: tokenError } = await supabaseAdmin.auth.getUser(token);
-      if (tokenError || !authData?.user) {
+      const { data: otpData, error: tokenError } = await supabaseAdmin.auth.verifyOtp({
+        type: 'recovery',
+        token_hash: token,
+      });
+      const authData = { user: otpData?.user };
+      if (tokenError || !authData.user) {
         return res.status(400).json({
           success: false,
           error: 'This reset link is invalid or has expired. Please request a new one.',

@@ -343,6 +343,44 @@ export const sendVerificationEmail = async ({ to, firstName, verifyUrl }) => {
 };
 
 // ===========================================
+// Send: Password reset email
+// ===========================================
+export const sendPasswordResetEmail = async ({ to, firstName, resetUrl }) => {
+  const safeName = escapeHtml(firstName || 'there');
+
+  const bodyHtml = `
+    <h1 style="margin:0 0 12px;font-size:20px;font-weight:700;color:#101828;">Reset your password</h1>
+    <p style="margin:0 0 20px;font-size:14px;line-height:22px;color:#475467;">
+      Hi ${safeName}, we received a request to reset your UmrahMarket password. Click the button below to choose a new one.
+    </p>
+    <table role="presentation" cellpadding="0" cellspacing="0">
+      <tr>
+        <td style="border-radius:10px;background:linear-gradient(135deg,#10b981,#0d9488);">
+          <a href="${resetUrl}" style="display:inline-block;padding:12px 28px;font-size:14px;font-weight:600;color:#ffffff;text-decoration:none;border-radius:10px;">
+            Reset my password
+          </a>
+        </td>
+      </tr>
+    </table>
+    <p style="margin:24px 0 0;font-size:12px;line-height:20px;color:#98a2b3;">
+      This link expires in 1 hour and can only be used once. If you didn't ask for this, you can safely ignore this email — your password won't change.<br /><br />
+      If the button doesn't work, copy and paste this URL into your browser:<br />
+      <span style="color:#0d9488;word-break:break-all;">${resetUrl}</span>
+    </p>
+  `;
+
+  const info = await getTransporter().sendMail({
+    from: `"${FROM_NAME}" <${FROM_ADDRESS}>`,
+    to,
+    subject: 'Reset your UmrahMarket password',
+    html: brandShell({ preheader: 'Use this link to reset your UmrahMarket password.', bodyHtml }),
+  });
+
+  logger.info('Password reset email sent', { to, messageId: info.messageId });
+  return info;
+};
+
+// ===========================================
 // Send: Agent New Booking Notification Email
 // ===========================================
 // Fired whenever a client successfully books a package, so the agent knows
