@@ -215,7 +215,7 @@ export const validatePasswordReset = [
   body('token')
     .trim()
     .notEmpty().withMessage('Reset token is required')
-    .isLength({ min: 20, max: 500 }).withMessage('Invalid reset token'),
+    .isLength({ min: 20, max: 4000 }).withMessage('Invalid reset token'),
   
   body('password')
     .notEmpty().withMessage('Password is required')

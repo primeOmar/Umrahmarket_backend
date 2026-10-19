@@ -910,21 +910,38 @@ router.post(
   async (req, res) => {
     try {
       const { email } = req.body;
-      
+
+      const { data: account, error: lookupError } = await supabaseAdmin
+        .from('profiles')
+        .select('id')
+        .ilike('email', email)
+        .maybeSingle();
+
+      if (lookupError) throw lookupError;
+
+      if (!account) {
+        return res.status(404).json({
+          success: false,
+          code: 'EMAIL_NOT_FOUND',
+          error: 'No account found with that email address. Please check it and try again.',
+        });
+      }
+
       const { error } = await supabase.auth.resetPasswordForEmail(email, {
         redirectTo: `${FRONTEND_BASE_URL}/reset-password`,
       });
-      
+
       if (error) {
-        logger.error('Password reset request failed', {
-          error: error.message,
-          email,
+        logger.error('Password reset request failed', { error: error.message, email });
+        return res.status(502).json({
+          success: false,
+          error: 'We could not send the reset email right now. Please try again shortly.',
         });
       }
-      
+
       res.json({
         success: true,
-        message: 'If an account exists with this email, a password reset link has been sent.',
+        message: 'Check your email — we have sent you a link to reset your password.',
       });
     } catch (error) {
       logger.error('Password reset request error', {
@@ -949,26 +966,63 @@ router.post(
   validatePasswordReset,
   async (req, res) => {
     try {
+      // `token` is the recovery access token Supabase put in the email link
       const { token, password } = req.body;
-      
-      const { error } = await supabase.auth.updateUser({
-        password,
-      });
-      
-      if (error) {
+
+      const { data: authData, error: tokenError } = await supabaseAdmin.auth.getUser(token);
+      if (tokenError || !authData?.user) {
         return res.status(400).json({
           success: false,
-          error: error.message,
+          error: 'This reset link is invalid or has expired. Please request a new one.',
         });
       }
-      
-      logSecurityEvent('Password reset completed', {
-        ip: req.ip,
-      });
-      
+
+      const authUser = authData.user;
+      const { error: updateError } = await supabaseAdmin.auth.admin.updateUserById(authUser.id, { password });
+      if (updateError) {
+        return res.status(400).json({ success: false, error: updateError.message });
+      }
+
+      resetLoginAttempts(authUser.email);
+
+      const { data: profile } = await supabaseAdmin
+        .from('profiles')
+        .select('role, agent_number, company_name, first_name, last_name, approved, email_verified, logo_url')
+        .eq('id', authUser.id)
+        .maybeSingle();
+
+      const userRole = profile?.role || authUser.user_metadata?.role || 'client';
+      const accessToken = generateAccessToken(authUser.id, userRole, authUser.email);
+      const refreshToken = generateRefreshToken(authUser.id, userRole, authUser.email);
+
+      const isProd = process.env.NODE_ENV === 'production';
+      const cookieOpts = { httpOnly: true, secure: isProd, sameSite: isProd ? 'none' : 'lax' };
+      res.cookie('access_token', accessToken, { ...cookieOpts, maxAge: 15 * 60 * 1000 });
+      res.cookie('refresh_token', refreshToken, { ...cookieOpts, maxAge: 7 * 24 * 60 * 60 * 1000 });
+
+      logSecurityEvent('Password reset completed', { userId: authUser.id, ip: req.ip });
+
       res.json({
         success: true,
         message: 'Password has been reset successfully',
+        data: {
+          user: {
+            id: authUser.id,
+            email: authUser.email,
+            role: userRole,
+            firstName: profile?.first_name,
+            lastName: profile?.last_name,
+            approved: profile?.approved,
+            emailVerified: profile?.email_verified ?? true,
+            ...(userRole === 'agent' && {
+              agentNumber: profile?.agent_number || null,
+              agentName:   profile?.company_name || null,
+              logoUrl:     profile?.logo_url || null,
+            }),
+          },
+          accessToken,
+          refreshToken,
+        },
       });
     } catch (error) {
       logger.error('Password reset error', {
