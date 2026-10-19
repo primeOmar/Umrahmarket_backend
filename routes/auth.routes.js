@@ -2,6 +2,7 @@ import express from 'express';
 import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
 import { supabase, supabaseAdmin } from '../config/supabase.js';
+import { createClient } from '@supabase/supabase-js';
 import config from '../config/security.config.js';
 import { sendVerificationEmail, sendPasswordResetEmail } from '../services/email.service.js';
 import { notifyNewAgent } from '../services/agentVerification.service.js';
@@ -987,7 +988,12 @@ router.post(
       // `token` is the one-time recovery token_hash from the emailed link
       const { token, password } = req.body;
 
-      const { data: otpData, error: tokenError } = await supabaseAdmin.auth.verifyOtp({
+      // Throwaway client: verifyOtp stores the resulting session on whichever client
+      // calls it, which would turn the shared admin client into a user-scoped one.
+      const otpClient = createClient(config.supabase.url, config.supabase.anonKey, {
+        auth: { autoRefreshToken: false, persistSession: false, detectSessionInUrl: false },
+      });
+      const { data: otpData, error: tokenError } = await otpClient.auth.verifyOtp({
         type: 'recovery',
         token_hash: token,
       });
