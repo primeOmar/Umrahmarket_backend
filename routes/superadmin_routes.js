@@ -15,7 +15,7 @@ import taskRouter from './task.routes.js';
 import whatsappAdminRouter from './whatsappRoutes.js';
 // ⚠️ Adjust this path if email.service.js doesn't live under ../services/
 // in your repo — this mirrors config/security.config.js's relative depth.
-import { sendBroadcastEmail } from '../services/email.service.js';
+import { sendBroadcastEmail, sendPasswordResetEmail } from '../services/email.service.js';
 const router = express.Router();
 const R2 = new S3Client({
   region: 'auto',
@@ -585,6 +585,117 @@ router.post('/login', async (req, res) => {
   } catch (err) {
     
     res.status(500).json({ success: false, message: 'Login failed' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AUTH – FORGOT / RESET PASSWORD
+// Stateless one-time token: signed with a purpose-specific secret and bound to
+// a fingerprint of the current password hash, so it stops working the moment the
+// password changes (or after 1 hour). No extra table needed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const RESET_SECRET = () => `${process.env.JWT_SECRET}:superadmin-password-reset`;
+const resetFingerprint = (passwordHash) => hashToken(String(passwordHash || ''));
+const resetCooldown = new Map();
+
+router.post('/forgot-password', async (req, res) => {
+  const generic = {
+    success: true,
+    message: 'If that email belongs to a superadmin account, a password reset link has been sent.',
+  };
+  try {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    if (!validateEmail(email)) {
+      return res.status(422).json({ success: false, message: 'Please enter a valid email address' });
+    }
+
+    const last = resetCooldown.get(email) || 0;
+    if (Date.now() - last < 60 * 1000) return res.json(generic);
+    resetCooldown.set(email, Date.now());
+
+    const { data: admin } = await supabase
+      .from('superadmin_credentials')
+      .select('id, email, full_name, status, password_hash')
+      .eq('email', email)
+      .maybeSingle();
+
+    if (admin && admin.status !== 'suspended' && admin.status !== 'inactive') {
+      const token = jwt.sign(
+        { sid: admin.id, fp: resetFingerprint(admin.password_hash), purpose: 'superadmin_reset' },
+        RESET_SECRET(),
+        { expiresIn: '1h' }
+      );
+      const base = (process.env.FRONTEND_URL || process.env.APP_URL || 'https://www.umrahmarket.net').replace(/\/$/, '');
+      try {
+        await sendPasswordResetEmail({
+          to: admin.email,
+          firstName: (admin.full_name || '').split(' ')[0],
+          resetUrl: `${base}/superadmin/reset-password?token=${encodeURIComponent(token)}`,
+        });
+        await logAuditAction(admin.id, 'PASSWORD_RESET_REQUESTED', 'superadmin', admin.id, 'Reset email sent', 'success', '', req);
+      } catch (mailErr) {
+        console.error('[superadmin] reset email failed:', mailErr.message);
+      }
+    }
+
+    res.json(generic);
+  } catch (err) {
+    console.error('[superadmin] forgot-password error:', err.message);
+    res.status(500).json({ success: false, message: 'Could not process request. Please try again.' });
+  }
+});
+
+router.post('/reset-password', async (req, res) => {
+  try {
+    const { token, password } = req.body || {};
+    if (!token || typeof token !== 'string') {
+      return res.status(400).json({ success: false, message: 'Reset token is required' });
+    }
+    if (!password || password.length < 8) {
+      return res.status(422).json({ success: false, message: 'Password must be at least 8 characters' });
+    }
+
+    let payload;
+    try {
+      payload = jwt.verify(token, RESET_SECRET());
+    } catch {
+      return res.status(400).json({ success: false, message: 'This reset link is invalid or has expired. Please request a new one.' });
+    }
+    if (payload.purpose !== 'superadmin_reset') {
+      return res.status(400).json({ success: false, message: 'Invalid reset link' });
+    }
+
+    const { data: admin } = await supabase
+      .from('superadmin_credentials')
+      .select('id, password_hash, status')
+      .eq('id', payload.sid)
+      .maybeSingle();
+
+    if (!admin || admin.status === 'suspended' || admin.status === 'inactive' ||
+        resetFingerprint(admin.password_hash) !== payload.fp) {
+      return res.status(400).json({ success: false, message: 'This reset link is invalid or has already been used. Please request a new one.' });
+    }
+
+    const { error: updErr } = await supabase
+      .from('superadmin_credentials')
+      .update({ password_hash: hashPassword(password), failed_login_attempts: 0, locked_until: null })
+      .eq('id', admin.id);
+    if (updErr) throw updErr;
+
+    // Sign out every existing session
+    await supabase
+      .from('superadmin_sessions')
+      .update({ revoked_at: new Date().toISOString() })
+      .eq('superadmin_id', admin.id)
+      .is('revoked_at', null);
+
+    await logAuditAction(admin.id, 'PASSWORD_RESET', 'superadmin', admin.id, 'Password reset via email link', 'success', '', req);
+
+    res.json({ success: true, message: 'Password updated. You can now sign in.' });
+  } catch (err) {
+    console.error('[superadmin] reset-password error:', err.message);
+    res.status(500).json({ success: false, message: 'Could not reset password. Please try again.' });
   }
 });
 
