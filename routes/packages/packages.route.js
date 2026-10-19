@@ -2,6 +2,7 @@ import express from 'express';
 import { parseFormData, uploadImagesToR2 } from '../../middleware/uploads/Uploadtocloudflare.js';
 import { getAgentPackages, getAllActivePackages, getPackageById } from '../../controllers/packages/getpackages.controller.js';
 import { createPackage, updatePackage, deletePackage } from '../../controllers/packages/createpackages.controller.js';
+import { createPackageBatch, confirmBatchPricing } from '../../controllers/packages/batchpackages.controller.js';
 import { getItinerary, saveItinerary } from '../../controllers/packages/itinerary.controller.js';
 import { verifyToken } from '../../middleware/auth.middleware.js';
 import { validatePackage } from '../../middleware/uploads/validatePackage.js';
@@ -37,6 +38,11 @@ router.post(
   uploadImagesToR2,
   createPackage
 );
+
+// POST /api/packages/batch — one template + up to a year of departures → Draft packages
+router.post('/batch', verifyToken, parseFormData, uploadImagesToR2, createPackageBatch);
+// POST /api/packages/batch/confirm — agent confirms pricing; packages then auto-activate
+router.post('/batch/confirm', verifyToken, confirmBatchPricing);
 
 // GET /api/packages/getagentpackages
 router.get('/getagentpackages', verifyToken, getAgentPackages);

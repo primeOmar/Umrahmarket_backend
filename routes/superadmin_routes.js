@@ -12,6 +12,7 @@ import PDFDocument from 'pdfkit';
 import accountingRouter from './accounting.routes.js';
 import blogRouter from './blog.routes.js';
 import taskRouter from './task.routes.js';
+import whatsappAdminRouter from './whatsappRoutes.js';
 // ⚠️ Adjust this path if email.service.js doesn't live under ../services/
 // in your repo — this mirrors config/security.config.js's relative depth.
 import { sendBroadcastEmail } from '../services/email.service.js';
@@ -2315,4 +2316,5 @@ router.get('/export/:dataType', authenticateSuperadmin, async (req, res) => {
 router.use('/blog', blogRouter);
 router.use('/accounting', accountingRouter);
 router.use('/tasks', taskRouter);
+router.use('/whatsapp', authenticateSuperadmin, whatsappAdminRouter);
 export default router;

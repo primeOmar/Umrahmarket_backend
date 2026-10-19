@@ -1,5 +1,6 @@
 import supabase from '../../config/supabase.js';
 import { handleDatabaseError } from './createpackages.controller.js';
+import { activationDateFor } from '../../utils/packageActivation.js';
 import { notExpiredFilter, isPackageExpired, withExpiry } from '../../utils/packageExpiry.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -142,7 +143,7 @@ export const getAgentPackages = async (req, res) => {
          madinah_hotel_address, madinah_check_in_date, madinah_check_out_date,
          highlights, inclusions, exclusions,
          image_urls, created_by, agent_name, agent_number,
-         status, created_at, updated_at`
+         status, batch_id, pricing_confirmed_at, created_at, updated_at`
       )
       // Match on agent_name + agent_number so two agents with the same full
       // name can never see each other's packages.
@@ -155,7 +156,7 @@ export const getAgentPackages = async (req, res) => {
       throw error;
     }
 
-    const packages = (data ?? []).map(withExpiry);
+    const packages =     (data ?? []).map((p) => ({ ...withExpiry(p), activates_at: activationDateFor(p.available_from) }));
 
     return res.status(200).json({
       success:  true,

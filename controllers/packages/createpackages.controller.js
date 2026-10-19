@@ -11,7 +11,7 @@ const ALLOWED_TYPES     = ['umrah', 'hajj'];
 // single city — keep in sync with validatePackage.js's ALLOWED_LOCATIONS.
 const ALLOWED_LOCATIONS = ['makkah', 'makkah_madinah', 'makkah_madinah_jeddah'];
 
-function sanitizeText(value = '', maxLen = 120) {
+export function sanitizeText(value = '', maxLen = 120) {
   return String(value)
     .replace(/\0/g, '')
     .replace(/<[^>]*>/g, '')
@@ -22,12 +22,12 @@ function sanitizeText(value = '', maxLen = 120) {
     .slice(0, maxLen);
 }
 
-function sanitizeNumber(value) {
+export function sanitizeNumber(value) {
   const n = parseFloat(String(value).replace(/[^\d.]/g, ''));
   return isNaN(n) ? null : n;
 }
 
-function sanitizeDate(value = '') {
+export function sanitizeDate(value = '') {
   return /^\d{4}-\d{2}-\d{2}$/.test(String(value).trim()) ? value.trim() : null;
 }
 
@@ -44,7 +44,7 @@ function sanitizeDatePair(inRaw, outRaw) {
   return { in: inD, out: outD };
 }
 
-function sanitizeTags(arr, maxLen = 80, maxCount = 30) {
+export function sanitizeTags(arr, maxLen = 80, maxCount = 30) {
   if (!Array.isArray(arr)) return [];
   return arr.slice(0, maxCount).map((t) => sanitizeText(t, maxLen)).filter(Boolean);
 }
@@ -66,7 +66,7 @@ const MAX_CITIES = 12; // sane cap — nobody's building a 12-city Umrah package
 
 // `cities`: the full list of cities this package covers, Makkah always
 // first and always present regardless of what the client sent.
-function sanitizeCities(raw) {
+export function sanitizeCities(raw) {
   let parsed = [];
   if (raw) {
     try {
@@ -94,7 +94,7 @@ function sanitizeCities(raw) {
 // city the agent deselected (or never selected) is dropped rather than
 // trusted from the client. An entry without a hotel name is dropped too, so
 // a half-filled block can never create a stray empty record.
-function sanitizeCityHotels(raw, cities = []) {
+export function sanitizeCityHotels(raw, cities = []) {
   let parsed = {};
   if (raw) {
     try {
@@ -137,7 +137,7 @@ function sanitizeCityHotels(raw, cities = []) {
 // Any tier the agent leaves blank/invalid falls back to the adult price —
 // never null — so a booking for that age group always resolves to a real
 // amount instead of the booking modal having to guess.
-function sanitizePriceTiers(raw, adultPrice) {
+export function sanitizePriceTiers(raw, adultPrice) {
   let parsed = {};
   if (raw) {
     try {
@@ -171,7 +171,7 @@ function sanitizePriceTiers(raw, adultPrice) {
 // dropped entirely (better to have no override than a broken $0 one).
 const ALLOWED_COUNTRY_CODES = ['TZ', 'SO'];
 
-function sanitizeCountryPricing(raw) {
+export function sanitizeCountryPricing(raw) {
   let parsed = {};
   if (raw) {
     try {
@@ -204,7 +204,7 @@ function sanitizeCountryPricing(raw) {
 // Used by both create (duplicate carries photos over) and update (agent kept
 // some existing images) — client sends the URLs it wants to keep as JSON,
 // newly uploaded files always come through req.imageUrls from uploadImagesToR2.
-function parseImageUrls(raw) {
+export function parseImageUrls(raw) {
   if (!raw) return [];
   try {
     const arr = JSON.parse(raw);

@@ -23,7 +23,7 @@
 //   WHATSAPP_TEMPLATE_BOOKING_CONFIRMED=HXxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 import twilio from 'twilio';
-import { supabase } from '../supabaseClient.js'; // adjust to your existing Supabase server client path
+import { supabaseAdmin as supabase } from '../config/supabase.js';
 
 const {
   TWILIO_ACCOUNT_SID,

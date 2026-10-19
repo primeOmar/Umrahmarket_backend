@@ -11,6 +11,7 @@ import { handleValidationErrors } from './middleware/validation.middleware.js';
 import authRoutes from './routes/auth.routes.js';
 import uploadRoutes from './routes/upload.routes.js';
 import documentRoutes from './routes/document.routes.js';
+import inquiriesRoutes, { publicRouter as inquiriesPublicRoutes } from './routes/inquiries.routes.js';
 import packagesRoutes    from './routes/packages/packages.route.js';
 import favouritesRoutes from './routes/packages/favourites.route.js';
 import mpesaRoutes from './routes/mpesa.routes.js';
@@ -30,6 +31,9 @@ import blogPublicRoutes from './routes/blog.public.routes.js';
 import publicChatRoutes from './routes/publicchat.route.js';
 import visitsRoutes from './routes/visits.routes.js';
 import { startTaskReminderJob } from './jobs/taskReminder.job.js';
+import { startPackageActivationJob } from './jobs/packageActivation.job.js';
+import { startAgentPackageReminderJob } from './jobs/agentPackageReminder.job.js';
+import { publicWhatsappRoutes } from './routes/whatsappRoutes.js';
 const router = express.Router();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -211,6 +215,11 @@ app.use('/api/auth', authRoutes);
 app.use('/api/upload', uploadRoutes);
 app.use('/api/documents', documentRoutes);
 app.use('/api/packages', packagesRoutes);
+// Guest (unauthenticated) custom-request routes must be reachable without a
+// bearer token — mounted first so they're matched before the authenticated
+// router's own verifyToken middleware runs.
+app.use('/api/inquiries', inquiriesPublicRoutes);
+app.use('/api/inquiries', inquiriesRoutes);
 app.use('/api/favourites', favouritesRoutes);
 app.use('/api/payments/mpesa', mpesaRoutes);
 app.use('/api/payments/card',  cardRoutes);
@@ -227,6 +236,7 @@ app.use('/api/publicchat', publicChatRoutes);
 app.use('/api/visits', visitsRoutes);
 app.use('/api/agent_accounting', accountingRoutes);
 app.use('/api/fx', fxRoutes);
+app.use('/api/whatsapp', publicWhatsappRoutes);
 
 // ═══════════════════════════════════════════════════════════════════════
 // MESSAGES ROUTES WITH RATE LIMITING
@@ -367,6 +377,8 @@ const server = app.listen(PORT, '0.0.0.0', async () => {
   }
 
   startTaskReminderJob();
+  startPackageActivationJob();
+  startAgentPackageReminderJob();
 
   logger.info('✅ Server is ready', {
     port: PORT,

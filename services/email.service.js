@@ -479,4 +479,57 @@ export const sendBroadcastEmail = async ({ to, agentName, subject, message, reci
   return { success: true, messageId: info.messageId };
 };
 
-export default { sendVerificationEmail, sendAgentBookingNotificationEmail, sendBroadcastEmail, verifyEmailTransport };
+// ===========================================
+// Send: Custom Package Request — Agent Replied (guest clients)
+// ===========================================
+// Guests who submit a custom package request have no dashboard, so the
+// agent's offer (or decline) must reach them directly by email — this is
+// their only record of it besides the matching WhatsApp message.
+export const sendCustomRequestReplyEmail = async ({ to, ref, agentName, decline, message, price }) => {
+  const recipient = String(to || '').trim();
+  if (!recipient) {
+    logger.warn('Custom request reply email: missing recipient, skipping', { ref });
+    return { success: false, reason: 'missing_email' };
+  }
+
+  const safeAgent = escapeHtml(agentName || 'An agent');
+  const safeRef = escapeHtml(ref || '');
+  const formattedPrice = typeof price === 'number' && price > 0
+    ? `$${price.toLocaleString('en-US')}`
+    : null;
+
+  const bodyHtml = decline
+    ? `
+      <h1 style="margin:0 0 12px;font-size:20px;font-weight:700;color:#101828;">Update on request #${safeRef}</h1>
+      <p style="margin:0 0 20px;font-size:14px;line-height:22px;color:#475467;">
+        ${safeAgent} isn't able to take on your custom package request this time. Other agents you contacted may still respond —
+        you'll get a WhatsApp message and an email the moment one does.
+      </p>
+    `
+    : `
+      <h1 style="margin:0 0 12px;font-size:20px;font-weight:700;color:#101828;">${safeAgent} replied to request #${safeRef} 🎉</h1>
+      <p style="margin:0 0 16px;font-size:14px;line-height:22px;color:#475467;white-space:pre-wrap;">${escapeHtml(message || '')}</p>
+      ${formattedPrice ? `<p style="margin:0 0 20px;font-size:16px;font-weight:700;color:#0d9488;">Offer: ${formattedPrice}</p>` : ''}
+      <p style="margin:0 0 0;font-size:13px;line-height:21px;color:#667085;">
+        Reply on WhatsApp to the number this code was sent to, to discuss details or confirm your booking with ${safeAgent}.
+      </p>
+    `;
+
+  const info = await getTransporter().sendMail({
+    from: `"${FROM_NAME}" <${FROM_ADDRESS}>`,
+    to: recipient,
+    subject: decline ? `Update on your custom package request #${ref || ''}` : `${agentName || 'An agent'} replied to your custom package request`,
+    html: brandShell({
+      preheader: decline ? `${agentName || 'An agent'} declined request #${ref || ''}.` : `${agentName || 'An agent'} sent you an offer for request #${ref || ''}.`,
+      bodyHtml,
+    }),
+  });
+
+  logger.info('Custom request reply email sent', { to: recipient, ref, messageId: info.messageId });
+  return { success: true, messageId: info.messageId };
+};
+
+export default {
+  sendVerificationEmail, sendAgentBookingNotificationEmail, sendBroadcastEmail,
+  sendCustomRequestReplyEmail, verifyEmailTransport,
+};
