@@ -227,12 +227,23 @@ const CTA_BLOCK_RE = new RegExp(
 );
 
 const renderCtaButton = (label, url) => `
-    <table role="presentation" cellpadding="0" cellspacing="0" style="margin:4px 0 24px;">
+    <table role="presentation" align="center" cellpadding="0" cellspacing="0" style="margin:8px auto 28px;">
       <tr>
-        <td style="border-radius:10px;background:linear-gradient(135deg,#10b981,#0d9488);box-shadow:0 6px 16px rgba(13,148,136,0.28);">
-          <a href="${url}" style="display:inline-block;padding:13px 30px;font-size:14px;font-weight:700;color:#ffffff;text-decoration:none;border-radius:10px;letter-spacing:0.01em;">
-            ${label} &rarr;
+        <td align="center" bgcolor="#0d9488" style="border-radius:999px;background:#0d9488;background-image:linear-gradient(135deg,#10b981 0%,#0d9488 100%);">
+          <a href="${url}" style="display:inline-block;padding:17px 40px;font-size:16px;font-weight:700;color:#ffffff;text-decoration:none;border-radius:999px;">
+            ${label}&nbsp;&rarr;
           </a>
+        </td>
+      </tr>
+    </table>`;
+
+// Standalone "![alt](https://image)" line → full-width rounded image.
+const IMAGE_BLOCK_RE = /^!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)$/;
+const renderImageBlock = (alt, url) => `
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 28px;">
+      <tr>
+        <td>
+          <img src="${url}" alt="${alt}" width="520" style="display:block;width:100%;max-width:520px;height:auto;border:0;border-radius:24px;" />
         </td>
       </tr>
     </table>`;
@@ -249,10 +260,16 @@ const renderBulletList = (lines, firstName) => `
           );
           return `
       <tr>
-        <td style="padding:0 10px 12px 0;width:22px;vertical-align:top;">
-          <span style="display:inline-block;width:18px;height:18px;border-radius:50%;background:#d1fae5;color:#0d9488;font-size:11px;line-height:18px;text-align:center;font-weight:700;">&#10003;</span>
+        <td style="padding:0 0 10px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="#f0fdf9" style="background:#f0fdf9;border-radius:16px;">
+            <tr>
+              <td style="padding:14px 0 14px 16px;width:30px;vertical-align:top;">
+                <span style="display:inline-block;width:24px;height:24px;border-radius:50%;background:#0d9488;color:#ffffff;font-size:13px;line-height:24px;text-align:center;font-weight:700;">&#10003;</span>
+              </td>
+              <td style="padding:14px 16px 14px 10px;font-size:16px;line-height:24px;color:#1f2937;">${text}</td>
+            </tr>
+          </table>
         </td>
-        <td style="padding:0 0 12px;font-size:14px;line-height:22px;color:#475467;">${text}</td>
       </tr>`;
         })
         .join('')}
@@ -284,6 +301,9 @@ const renderMessageBody = (rawMessage, firstName) =>
     .map((block) => block.trim())
     .filter(Boolean)
     .map((block) => {
+      const imgMatch = block.match(IMAGE_BLOCK_RE);
+      if (imgMatch) return renderImageBlock(escapeHtml(imgMatch[1]), escapeHtml(imgMatch[2]));
+
       const escapedBlock = applyPersonalization(escapeHtml(block), firstName);
 
       const ctaMatch = escapedBlock.match(CTA_BLOCK_RE);
@@ -301,9 +321,109 @@ const renderMessageBody = (rawMessage, firstName) =>
       }
 
       const html = applyInlineMarkdown(escapedBlock).replace(/\n/g, '<br/>');
-      return `<p style="margin:0 0 16px;font-size:14px;line-height:23px;color:#475467;">${html}</p>`;
+      return `<p style="margin:0 0 22px;font-size:17px;line-height:27px;color:#334155;text-align:center;">${html}</p>`;
     })
     .join('');
+
+// ===========================================
+// Marketing shell — clean, centered, ChatGPT-style layout for broadcasts:
+// wordmark, big headline, short copy, pill CTA, rounded image, and a
+// proper footer. The hero (image or gradient fallback) is optional.
+// ===========================================
+const marketingShell = ({ preheader, eyebrow, headline, bodyHtml, heroImageUrl, showDefaultHero = true, footerNote }) => {
+  const year = new Date().getFullYear();
+  // Optional photo below the copy (set EMAIL_HERO_URL). Without one, the
+  // gradient banner at the top carries the visual weight on its own.
+  const hero = !showDefaultHero || !heroImageUrl ? '' : renderImageBlock('', escapeHtml(heroImageUrl));
+  const trustItems = ['Verified agents', 'Secure payments', '24/7 support'];
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="light" />
+<meta name="supported-color-schemes" content="light" />
+<title>UmrahMarket</title>
+<style>
+  :root { color-scheme: light only; supported-color-schemes: light only; }
+  @media only screen and (max-width:600px) {
+    .mk-pad { padding-left:22px !important; padding-right:22px !important; }
+    .mk-h1 { font-size:30px !important; line-height:36px !important; }
+  }
+</style>
+</head>
+<body style="margin:0;padding:0;background-color:#eef2f1;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+  <span style="display:none;font-size:1px;color:#eef2f1;line-height:1px;max-height:0;max-width:0;opacity:0;overflow:hidden;">${preheader}</span>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="#eef2f1" style="background:#eef2f1;">
+    <tr>
+      <td align="center" class="mk-outer" style="padding:28px 16px 40px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;">
+          <tr>
+            <td align="center" style="padding:0 0 20px;">
+              <img src="${LOGO_URL}" alt="UmrahMarket" width="150" style="display:block;height:auto;max-width:150px;border:0;" />
+            </td>
+          </tr>
+          <tr>
+            <td>
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="#ffffff" style="background:#ffffff;border-radius:28px;overflow:hidden;">
+                <tr>
+                  <td align="center" class="mk-pad" bgcolor="#064e3b" style="background:#064e3b;background-image:linear-gradient(135deg,#022c22 0%,#065f46 55%,#0d9488 100%);padding:52px 40px 48px;">
+                    <table role="presentation" cellpadding="0" cellspacing="0" style="margin:0 auto 22px;">
+                      <tr>
+                        <td align="center" bgcolor="#0b6b56" style="background:rgba(255,255,255,0.14);border:1px solid rgba(255,255,255,0.28);border-radius:999px;padding:7px 16px;font-size:11px;font-weight:700;letter-spacing:0.14em;text-transform:uppercase;color:#d1fae5;">${eyebrow}</td>
+                      </tr>
+                    </table>
+                    <div class="mk-h1" style="font-size:40px;line-height:46px;font-weight:800;letter-spacing:-0.03em;color:#ffffff;">${headline}</div>
+                    <div style="margin-top:20px;font-size:34px;line-height:40px;">🕋</div>
+                  </td>
+                </tr>
+                <tr>
+                  <td class="mk-pad" style="padding:40px 40px 12px;">
+                    ${bodyHtml}
+                    ${hero}
+                  </td>
+                </tr>
+                <tr>
+                  <td class="mk-pad" style="padding:0 40px 40px;">
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-top:1px solid #e7eeec;">
+                      <tr>
+                        ${trustItems
+                          .map(
+                            (t) =>
+                              `<td align="center" style="padding:20px 4px 0;font-size:12px;font-weight:600;color:#0f766e;">&#10003;&nbsp;${t}</td>`
+                          )
+                          .join('')}
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td align="center" class="mk-pad" style="padding:32px 24px 0;">
+              <div style="font-size:14px;font-weight:700;color:#0f172a;padding:0 0 6px;">UmrahMarket</div>
+              <div style="font-size:13px;line-height:20px;color:#64748b;padding:0 0 14px;">Book Umrah &amp; Hajj with verified agents you can trust.</div>
+              <div style="font-size:13px;line-height:20px;padding:0 0 16px;">
+                <a href="${FRONTEND_BASE_URL_FOR_ASSETS}" style="color:#0f766e;font-weight:600;text-decoration:none;">Website</a>
+                <span style="color:#cbd5e1;">&nbsp;&nbsp;&bull;&nbsp;&nbsp;</span>
+                <a href="mailto:support@umrahmarket.net" style="color:#0f766e;font-weight:600;text-decoration:none;">Support</a>
+                <span style="color:#cbd5e1;">&nbsp;&nbsp;&bull;&nbsp;&nbsp;</span>
+                <a href="${FRONTEND_BASE_URL_FOR_ASSETS}/privacy" style="color:#0f766e;font-weight:600;text-decoration:none;">Privacy</a>
+              </div>
+              <div style="font-size:12px;line-height:19px;color:#94a3b8;">
+                ${footerNote}<br />&copy; ${year} UmrahMarket. All rights reserved.
+              </div>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+};
 
 // ===========================================
 // Send: Account Confirmation Email
@@ -482,34 +602,34 @@ export const sendBroadcastEmail = async ({ to, agentName, subject, message, reci
   // greeting. Falls back to "there" the same way the greeting above does,
   // so external/unrecognized recipients still get a coherent sentence.
   const firstName = (agentName || 'there').trim().split(/\s+/)[0];
-  const messageHtml = renderMessageBody(message, firstName);
+  const hasOwnImage = /^!\[[^\]]*\]\(https?:\/\/[^\s)]+\)\s*$/m.test(String(message || ''));
 
-  const bodyHtml = `
-    <p style="margin:0 0 8px;font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#0d9488;">${eyebrow}</p>
-    <h1 style="margin:0 0 20px;font-size:23px;line-height:30px;font-weight:800;color:#101828;letter-spacing:-0.02em;">${safeSubject}</h1>
-    <p style="margin:0 0 18px;font-size:14px;line-height:22px;color:#475467;">Hi ${safeName},</p>
-    ${messageHtml}
-  `;
+  const bodyHtml = renderMessageBody(message, firstName);
 
-  const footerText =
+  const footerNote =
     normalizedRecipientType === 'external'
-      ? "You're receiving this message because it was sent directly to you by the UmrahMarket team. If this email was sent to you by mistake, you can safely ignore it."
-      : "You're receiving this because you're a registered agent on UmrahMarket. Questions? Reply to this email or contact support@umrahmarket.net.";
+      ? "You're receiving this because the UmrahMarket team sent it to you directly. Not for you? Just ignore it."
+      : "You're receiving this because you're a registered agent on UmrahMarket.";
 
   const info = await getTransporter().sendMail({
     from: `"${FROM_NAME}" <${FROM_ADDRESS}>`,
     to: recipient,
     subject: subject || 'A message from UmrahMarket',
-    html: brandShell({
+    html: marketingShell({
       preheader: String(message || '')
         .replace(AGENT_NAME_TOKEN_RE, firstName || 'there')
+        .replace(/!\[[^\]]*\]\([^)]+\)/g, '')
         .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
         .replace(/\*\*/g, '')
         .replace(/\s+/g, ' ')
         .trim()
         .slice(0, 120),
+      eyebrow,
+      headline: safeSubject,
       bodyHtml,
-      footerText,
+      heroImageUrl: process.env.EMAIL_HERO_URL || null,
+      showDefaultHero: !hasOwnImage,
+      footerNote,
     }),
   });
 
