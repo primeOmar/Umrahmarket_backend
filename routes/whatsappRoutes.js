@@ -2,7 +2,12 @@ import express from 'express';
 import twilio from 'twilio';
 import { supabaseAdmin as supabase } from '../config/supabase.js';
 import logger from '../config/logger.js';
-import { sendWhatsAppBroadcast, handleStatusWebhook, toE164Kenya } from '../services/whatsappService.js';
+import {
+  sendWhatsAppBroadcast,
+  handleStatusWebhook,
+  toE164Kenya,
+  getWhatsAppConfigStatus,
+} from '../services/whatsappService.js';
 import {
   resolveReminderRecipients,
   sendAgentPackageReminders,
@@ -43,6 +48,33 @@ const fillVariables = (variables, recipient) => {
   }
   return out;
 };
+
+// GET /whatsapp/config — whether sending is ready, and why not (shown in the compose UI)
+router.get('/config', (_req, res) => {
+  res.json({ success: true, ...getWhatsAppConfigStatus() });
+});
+
+// GET /whatsapp/broadcasts/:id/messages — per-recipient delivery status for one broadcast
+router.get('/broadcasts/:id/messages', async (req, res) => {
+  if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) {
+    return res.status(400).json({ success: false, message: 'Invalid broadcast id' });
+  }
+  try {
+    const { data, error } = await supabase
+      .from('whatsapp_messages')
+      .select('to_number, status, error_code, error_message, twilio_sid, created_at')
+      .eq('broadcast_id', req.params.id)
+      .order('created_at', { ascending: true })
+      .limit(MAX_RECIPIENTS);
+    if (error) throw error;
+    const summary = {};
+    for (const m of data || []) summary[m.status] = (summary[m.status] || 0) + 1;
+    res.json({ success: true, summary, messages: data || [] });
+  } catch (err) {
+    logger.error('[whatsapp] broadcast messages failed', { error: err.message });
+    res.status(500).json({ success: false, message: 'Could not load delivery status' });
+  }
+});
 
 // GET /whatsapp/templates — approved Twilio Content Templates for the compose dropdown
 router.get('/templates', async (_req, res) => {
@@ -143,6 +175,14 @@ router.post('/broadcast', async (req, res) => {
     return res.status(400).json({ success: false, message: 'Invalid audience' });
   }
 
+  // Refuse up-front if the sender/credentials are broken, instead of recording
+  // one identical failure per recipient.
+  const config = getWhatsAppConfigStatus();
+  if (!config.ready) {
+    logger.error('[whatsapp] broadcast blocked — WhatsApp not configured', { problems: config.problems });
+    return res.status(503).json({ success: false, message: `WhatsApp is not configured: ${config.problems.join(' ')}` });
+  }
+
   try {
     let recipients = [];
 
@@ -203,7 +243,11 @@ router.post('/broadcast', async (req, res) => {
       .single();
     if (bErr) throw bErr;
 
-    const { sentCount, failedCount, failed } = await sendWhatsAppBroadcast({
+    logger.info('[whatsapp] broadcast started', {
+      broadcastId: broadcast.id, by: req.superadmin?.id || null, audience, recipients: recipients.length, templateSid,
+    });
+
+    const { sentCount, failedCount, failed, abortedReason } = await sendWhatsAppBroadcast({
       recipients,
       templateSid,
       templateName: templateName || templateSid,
@@ -223,6 +267,7 @@ router.post('/broadcast', async (req, res) => {
       sentCount,
       failedCount,
       failed,
+      abortedReason: abortedReason || null,
       invalidNumbers: invalid,
     });
   } catch (err) {

@@ -1,6 +1,7 @@
 import twilio from 'twilio';
 import nodemailer from 'nodemailer';
 import logger from '../config/logger.js';
+import { resolveWhatsAppSender } from './twilioWhatsApp.config.js';
 
 // A misconfigured SID must not crash the whole server at boot; WhatsApp just stays disabled.
 let twilioClient = null;
@@ -9,7 +10,8 @@ try {
 } catch (err) {
   logger.error('Twilio disabled — invalid credentials (TWILIO_ACCOUNT_SID must start with "AC")', { error: err.message });
 }
-const WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM; // e.g. 'whatsapp:+17372212163'
+// Normalised so "+1737…" and "whatsapp:+1737…" both work (Twilio error 21910 otherwise).
+const WHATSAPP_SENDER = resolveWhatsAppSender();
 
 // Reuses the same Zoho SMTP credentials as the rest of the app's email
 // (issueVerificationEmail / sendVerificationEmail). If email.service.js
@@ -34,10 +36,10 @@ const sendWhatsApp = async (phone, contentSid, variables) => {
     logger.warn('Skipping WhatsApp notification — agent has no phone on file', { variables });
     return { sent: false, reason: 'no_phone' };
   }
-  if (!twilioClient) return { sent: false, reason: 'twilio_not_configured' };
+  if (!twilioClient || !WHATSAPP_SENDER.ok) return { sent: false, reason: 'twilio_not_configured' };
   try {
     await twilioClient.messages.create({
-      from: WHATSAPP_FROM,
+      ...WHATSAPP_SENDER.params,
       to,
       contentSid,
       contentVariables: JSON.stringify(variables),

@@ -18,32 +18,62 @@
 // Env vars required (add to .env, never commit):
 //   TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 //   TWILIO_AUTH_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-//   TWILIO_WHATSAPP_FROM=whatsapp:+14155238886        // sandbox number until you have your own
+//   TWILIO_WHATSAPP_FROM=whatsapp:+14155238886        // "whatsapp:" prefix optional — normalised in twilioWhatsApp.config.js
+//   (or) TWILIO_WHATSAPP_MESSAGING_SERVICE_SID=MGxxxx   // alternative: a Messaging Service with a WhatsApp sender
 //   TWILIO_STATUS_CALLBACK_URL=https://yourdomain.com/api/whatsapp/status
-//   WHATSAPP_TEMPLATE_BOOKING_CONFIRMED=HXxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+//   WHATSAPP_TEMPLATE_BOOKING_CONFIRMED=HXxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 import twilio from 'twilio';
 import { supabaseAdmin as supabase } from '../config/supabase.js';
+import logger from '../config/logger.js';
+import {
+  resolveWhatsAppSender,
+  toWhatsAppAddress,
+  friendlyTwilioError,
+  FATAL_CONFIG_CODES,
+  RETRYABLE_CODES,
+} from './twilioWhatsApp.config.js';
 
 const {
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
-  TWILIO_WHATSAPP_FROM,
   TWILIO_STATUS_CALLBACK_URL,
 } = process.env;
 
-if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_WHATSAPP_FROM) {
-  console.warn('[whatsappService] Twilio env vars missing — WhatsApp sending is disabled until configured.');
+const sender = resolveWhatsAppSender();
+if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
+  logger.warn('[whatsappService] Twilio credentials missing — WhatsApp sending is disabled until configured.');
 }
+if (!sender.ok) logger.warn(`[whatsappService] ${sender.error}`);
+else logger.info(`[whatsappService] WhatsApp sender: ${sender.label}`);
 
 let client = null;
 if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
   try {
     client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
   } catch (err) {
-    console.error('[whatsappService] Twilio disabled — invalid credentials:', err.message);
+    logger.error('[whatsappService] Twilio disabled — invalid credentials', { error: err.message });
   }
 }
+
+/**
+ * Is WhatsApp sending usable right now? Checked by the admin routes before a
+ * broadcast so a misconfiguration is reported once, not once per recipient.
+ */
+export function getWhatsAppConfigStatus() {
+  const problems = [];
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) problems.push('TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN are not set.');
+  else if (!client) problems.push('Twilio credentials are invalid (TWILIO_ACCOUNT_SID must start with "AC").');
+  if (!sender.ok) problems.push(sender.error);
+  return {
+    ready: problems.length === 0,
+    sender: sender.ok ? sender.label : null,
+    statusCallback: !!TWILIO_STATUS_CALLBACK_URL,
+    problems,
+  };
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
  * Normalise a Kenyan number to E.164 (+254XXXXXXXXX).
@@ -56,7 +86,7 @@ export function toE164Kenya(raw) {
   if (d.startsWith('254') && d.length === 12) return `+${d}`;
   if (d.startsWith('0') && d.length === 10) return `+254${d.slice(1)}`;
   if ((d.startsWith('7') || d.startsWith('1')) && d.length === 9) return `+254${d}`;
-  if (raw.startsWith('+')) return raw; // already E.164 (e.g. non-Kenyan agent)
+  if (String(raw).trim().startsWith('+')) return `+${d}`; // already E.164 (e.g. non-Kenyan agent)
   return null;
 }
 
@@ -70,7 +100,7 @@ export function toE164Kenya(raw) {
  * @param {Object} [opts.variables]       Template variables, e.g. {"1": "Tonny", "2": "UM-2481"}
  * @param {string} opts.category          'booking_confirmation' | 'marketing_broadcast' | 'agent_notice' | 'other'
  * @param {Object} [opts.meta]            { recipientType, recipientId, bookingId, broadcastId }
- * @returns {Promise<{ok: boolean, sid?: string, error?: string}>}
+ * @returns {Promise<{ok: boolean, sid?: string, error?: string, errorCode?: number|null, fatal?: boolean}>}
  */
 export async function sendWhatsAppTemplate({
   to,
@@ -81,50 +111,52 @@ export async function sendWhatsAppTemplate({
   meta = {},
 }) {
   const e164 = toE164Kenya(to);
-  if (!e164) {
+  if (!e164 || !/^\+[1-9]\d{7,14}$/.test(e164)) {
     return logAndReturn({ ok: false, to, templateSid, templateName, variables, category, meta, error: 'Invalid phone number' });
   }
-  if (!client) {
-    return logAndReturn({ ok: false, to: e164, templateSid, templateName, variables, category, meta, error: 'Twilio not configured' });
+  if (!client || !sender.ok) {
+    return logAndReturn({
+      ok: false, to: e164, templateSid, templateName, variables, category, meta,
+      error: sender.ok ? 'Twilio not configured' : sender.error,
+      fatal: true,
+    });
   }
 
-  try {
-    const msg = await client.messages.create({
-      from: TWILIO_WHATSAPP_FROM,
-      to: `whatsapp:${e164}`,
-      contentSid: templateSid,
-      contentVariables: JSON.stringify(variables),
-      ...(TWILIO_STATUS_CALLBACK_URL ? { statusCallback: TWILIO_STATUS_CALLBACK_URL } : {}),
-    });
+  const payload = {
+    ...sender.params, // { from: 'whatsapp:+…' } or { messagingServiceSid: 'MG…' }
+    to: toWhatsAppAddress(e164),
+    contentSid: templateSid,
+    contentVariables: JSON.stringify(variables),
+    ...(TWILIO_STATUS_CALLBACK_URL ? { statusCallback: TWILIO_STATUS_CALLBACK_URL } : {}),
+  };
 
-    return logAndReturn({
-      ok: true,
-      to: e164,
-      templateSid,
-      templateName,
-      variables,
-      category,
-      meta,
-      twilioSid: msg.sid,
-      status: msg.status,
-    });
-  } catch (err) {
-    return logAndReturn({
-      ok: false,
-      to: e164,
-      templateSid,
-      templateName,
-      variables,
-      category,
-      meta,
-      error: err.message,
-      errorCode: err.code,
-    });
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const msg = await client.messages.create(payload);
+      return logAndReturn({
+        ok: true, to: e164, templateSid, templateName, variables, category, meta,
+        twilioSid: msg.sid,
+        status: msg.status,
+      });
+    } catch (err) {
+      const code = Number(err.code) || null;
+      if (code && RETRYABLE_CODES.has(code) && attempt < 3) {
+        await sleep(1000 * attempt);
+        continue;
+      }
+      logger.error('[whatsappService] send failed', { to: e164, code, error: err.message, category });
+      return logAndReturn({
+        ok: false, to: e164, templateSid, templateName, variables, category, meta,
+        error: friendlyTwilioError(code, err.message),
+        errorCode: code,
+        fatal: !!code && FATAL_CONFIG_CODES.has(code),
+      });
+    }
   }
 }
 
-async function logAndReturn({ ok, to, templateSid, templateName, variables, category, meta, twilioSid, status, error, errorCode }) {
-  await supabase.from('whatsapp_messages').insert({
+async function logAndReturn({ ok, to, templateSid, templateName, variables, category, meta, twilioSid, status, error, errorCode, fatal }) {
+  const { error: logErr } = await supabase.from('whatsapp_messages').insert({
     twilio_sid: twilioSid || null,
     category,
     to_number: to,
@@ -138,8 +170,12 @@ async function logAndReturn({ ok, to, templateSid, templateName, variables, cate
     booking_id: meta.bookingId || null,
     broadcast_id: meta.broadcastId || null,
   });
+  // A logging failure must never turn a delivered message into a "failed" one.
+  if (logErr) logger.error('[whatsappService] could not log message', { error: logErr.message, twilioSid });
 
-  return ok ? { ok: true, sid: twilioSid } : { ok: false, error };
+  return ok
+    ? { ok: true, sid: twilioSid }
+    : { ok: false, error, errorCode: errorCode || null, fatal: !!fatal };
 }
 
 /**
@@ -147,11 +183,15 @@ async function logAndReturn({ ok, to, templateSid, templateName, variables, cate
  * endpoint). Runs with a small concurrency cap to stay well under Twilio's
  * rate limits — WhatsApp Business API is capped per messaging-tier, and
  * sending thousands at once will get throttled or flagged.
+ *
+ * Stops early on configuration errors (bad sender/credentials) since every
+ * remaining message would fail the same way.
  */
 export async function sendWhatsAppBroadcast({ recipients, templateSid, templateName, category, broadcastId, buildVariables }) {
   const CONCURRENCY = 5;
   let sentCount = 0;
   const failed = [];
+  let abortedReason = null;
 
   for (let i = 0; i < recipients.length; i += CONCURRENCY) {
     const batch = recipients.slice(i, i + CONCURRENCY);
@@ -174,11 +214,21 @@ export async function sendWhatsAppBroadcast({ recipients, templateSid, templateN
 
     for (const res of results) {
       if (res.ok) sentCount++;
-      else failed.push({ id: res.recipient.id, phone: res.recipient.phone, error: res.error });
+      else failed.push({ id: res.recipient.id, phone: res.recipient.phone, error: res.error, code: res.errorCode || null });
+    }
+
+    const fatal = results.find((r) => !r.ok && r.fatal);
+    if (fatal) {
+      abortedReason = fatal.error;
+      for (const r of recipients.slice(i + CONCURRENCY)) {
+        failed.push({ id: r.id, phone: r.phone, error: 'Not sent — broadcast stopped after a configuration error', code: null });
+      }
+      logger.error('[whatsappService] broadcast aborted', { broadcastId, reason: abortedReason });
+      break;
     }
   }
 
-  return { sentCount, failedCount: failed.length, failed };
+  return { sentCount, failedCount: failed.length, failed, abortedReason };
 }
 
 /**
@@ -187,14 +237,15 @@ export async function sendWhatsAppBroadcast({ recipients, templateSid, templateN
  * TWILIO_STATUS_CALLBACK_URL so delivery/read receipts sync back.
  */
 export async function handleStatusWebhook(body) {
-  const { MessageSid, MessageStatus, ErrorCode } = body;
-  if (!MessageSid) return;
+  const { MessageSid, MessageStatus, ErrorCode, ErrorMessage } = body;
+  if (!MessageSid || !MessageStatus) return;
 
   await supabase
     .from('whatsapp_messages')
     .update({
       status: MessageStatus,
       error_code: ErrorCode || null,
+      ...(ErrorCode ? { error_message: friendlyTwilioError(ErrorCode, ErrorMessage) } : {}),
       updated_at: new Date().toISOString(),
     })
     .eq('twilio_sid', MessageSid);
@@ -207,7 +258,7 @@ export async function handleStatusWebhook(body) {
 export async function sendBookingConfirmationWhatsApp(booking) {
   const templateSid = process.env.WHATSAPP_TEMPLATE_BOOKING_CONFIRMED;
   if (!templateSid) {
-    console.warn('[whatsappService] WHATSAPP_TEMPLATE_BOOKING_CONFIRMED not set — skipping WhatsApp confirmation.');
+    logger.warn('[whatsappService] WHATSAPP_TEMPLATE_BOOKING_CONFIRMED not set — skipping WhatsApp confirmation.');
     return { ok: false, error: 'Template not configured' };
   }
 
