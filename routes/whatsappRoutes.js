@@ -7,6 +7,7 @@ import {
   handleStatusWebhook,
   toE164Kenya,
   getWhatsAppConfigStatus,
+  verifyTwilioAccount,
 } from '../services/whatsappService.js';
 import {
   resolveReminderRecipients,
@@ -50,8 +51,17 @@ const fillVariables = (variables, recipient) => {
 };
 
 // GET /whatsapp/config — whether sending is ready, and why not (shown in the compose UI)
-router.get('/config', (_req, res) => {
-  res.json({ success: true, ...getWhatsAppConfigStatus() });
+router.get('/config', async (req, res) => {
+  const status = getWhatsAppConfigStatus();
+  if (req.query.verify === '1' && status.ready) {
+    const twilioCheck = await verifyTwilioAccount();
+    if (!twilioCheck.ok) {
+      status.ready = false;
+      status.problems.push(`Twilio rejected the credentials: ${twilioCheck.error}`);
+    }
+    status.twilio = twilioCheck;
+  }
+  res.json({ success: true, ...status });
 });
 
 // GET /whatsapp/broadcasts/:id/messages — per-recipient delivery status for one broadcast

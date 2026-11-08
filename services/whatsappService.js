@@ -70,7 +70,29 @@ export function getWhatsAppConfigStatus() {
     sender: sender.ok ? sender.label : null,
     statusCallback: !!TWILIO_STATUS_CALLBACK_URL,
     problems,
+    // Which deployment answered — lets the dashboard prove it is talking to
+    // the backend (and commit) you think it is. RENDER_GIT_COMMIT is set by Render.
+    build: {
+      commit: (process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || '').slice(0, 7) || 'local',
+      env: process.env.NODE_ENV || 'development',
+      service: process.env.RENDER_SERVICE_NAME || null,
+    },
   };
+}
+
+/**
+ * Live check against Twilio: are the credentials accepted and the account
+ * active? Kept off the send path (one API call) and only run on demand.
+ */
+export async function verifyTwilioAccount() {
+  if (!client) return { ok: false, error: 'Twilio client not initialised' };
+  try {
+    const acct = await client.api.v2010.accounts(TWILIO_ACCOUNT_SID).fetch();
+    if (acct.status !== 'active') return { ok: false, error: `Twilio account status is "${acct.status}"` };
+    return { ok: true, accountName: acct.friendlyName, accountType: acct.type };
+  } catch (err) {
+    return { ok: false, error: friendlyTwilioError(err.code, err.message), code: err.code || null };
+  }
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
