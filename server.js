@@ -35,6 +35,10 @@ import { startTaskReminderJob } from './jobs/taskReminder.job.js';
 import { startPackageActivationJob } from './jobs/packageActivation.job.js';
 import { startAgentPackageReminderJob } from './jobs/agentPackageReminder.job.js';
 import { publicWhatsappRoutes } from './routes/whatsappRoutes.js';
+import savingsRoutes from './routes/savings.routes.js';
+import savingsAdminRoutes from './routes/savings.admin.routes.js';
+import { authenticateSuperadmin } from './routes/superadmin_routes.js';
+import { startSavingsReconcileJob } from './jobs/savingsReconcile.job.js';
 const router = express.Router();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -112,6 +116,7 @@ const corsMiddleware = cors({
 const CORS_EXEMPT_PATHS = [
   '/api/payments/card/ipn',
   '/api/payments/mpesa/callback',
+  '/api/savings/mpesa/callback',
 ];
 
 app.use((req, res, next) => {
@@ -231,7 +236,10 @@ app.use('/api/agent-documents', agentDocumentsRoutes);
 app.use('/api/agents', agentsRoutes);
 app.use('/api/agents', agentProfileRoutes);
 app.use('/api/profiles', profilesRoutes);
+// Mounted before the main superadmin router so its catch-alls never shadow it.
+app.use('/api/superadmin/savings', authenticateSuperadmin, savingsAdminRoutes);
 app.use('/api/superadmin', superadminRoutes);
+app.use('/api/savings', savingsRoutes);
 app.use('/api/resources', resourcesRoutes);
 app.use('/api/blog', blogPublicRoutes);
 app.use('/api/publicchat', publicChatRoutes);
@@ -381,6 +389,7 @@ const server = app.listen(PORT, '0.0.0.0', async () => {
   startTaskReminderJob();
   startPackageActivationJob();
   startAgentPackageReminderJob();
+  startSavingsReconcileJob();
 
   logger.info('✅ Server is ready', {
     port: PORT,

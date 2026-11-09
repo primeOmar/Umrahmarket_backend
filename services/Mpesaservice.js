@@ -79,11 +79,13 @@ function buildPassword() {
 
 // ── STK Push ─────────────────────────────────────────────────────────────────
 // Returns the full Daraja response object (PascalCase keys from Safaricom)
-export async function stkPush({ phone, amount, accountRef, description }) {
+// `callbackUrl` overrides MPESA_CALLBACK_URL for flows with their own
+// callback handler (e.g. Lipa Mdogo Mdogo savings deposits).
+export async function stkPush({ phone, amount, accountRef, description, callbackUrl: callbackOverride }) {
   const token              = await getAccessToken();
   const { password, timestamp } = buildPassword();
   const shortcode          = process.env.MPESA_SHORTCODE;
-  const callbackUrl        = process.env.MPESA_CALLBACK_URL;
+  const callbackUrl        = callbackOverride || process.env.MPESA_CALLBACK_URL;
 
   if (!callbackUrl) throw new Error('MPESA_CALLBACK_URL is not set');
 

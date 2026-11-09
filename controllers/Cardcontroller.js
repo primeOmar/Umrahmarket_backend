@@ -16,7 +16,7 @@ const BASE_URL   = IS_SANDBOX
 // ── In-memory token cache ─────────────────────────────────────────────────────
 let _tokenCache = { token: null, expiresAt: 0 };
 
-async function getPesapalToken() {
+export async function getPesapalToken() {
   if (_tokenCache.token && Date.now() < _tokenCache.expiresAt) {
     return _tokenCache.token;
   }
@@ -41,7 +41,7 @@ async function getPesapalToken() {
 // ── Register IPN URL once (idempotent) ───────────────────────────────────────
 let _ipnId = null;
 
-async function getIpnId(token) {
+export async function getIpnId(token) {
   if (_ipnId) return _ipnId;
 
   const ipnUrl = process.env.PESAPAL_IPN_URL;
@@ -69,7 +69,7 @@ async function getIpnId(token) {
 }
 
 // ── Query a transaction status ────────────────────────────────────────────────
-async function queryTransaction(orderTrackingId, token) {
+export async function queryTransaction(orderTrackingId, token) {
   const { data } = await axios.get(
     `${BASE_URL}/api/Transactions/GetTransactionStatus?orderTrackingId=${orderTrackingId}`,
     { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }, timeout: 15_000 }
@@ -642,7 +642,20 @@ export const ipn = async (req, res) => {
       .eq('pesapal_order_tracking_id', orderTrackingId)
       .maybeSingle();
 
-    if (!payment || payment.status !== 'PENDING') {
+    // Pesapal only lets us register one IPN URL, so Lipa Mdogo Mdogo savings
+    // deposits arrive here too. Anything that isn't a booking payment is
+    // handed to the savings handler (imported lazily to avoid a cycle).
+    if (!payment) {
+      try {
+        const { handleSavingsPesapalIpn } = await import('./savings.controller.js');
+        await handleSavingsPesapalIpn(orderTrackingId);
+      } catch (savErr) {
+        console.error('[Cardcontroller] savings IPN handling failed', { orderTrackingId, error: savErr.message });
+      }
+      return res.status(200).json({ orderNotificationType: 'IPNCHANGE', orderTrackingId, orderMerchantReference, status: '200' });
+    }
+
+    if (payment.status !== 'PENDING') {
       return res.status(200).json({ orderNotificationType: 'IPNCHANGE', orderTrackingId, orderMerchantReference, status: '200' });
     }
 

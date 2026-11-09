@@ -687,6 +687,26 @@ export const sendCustomRequestReplyEmail = async ({ to, ref, agentName, decline,
   return { success: true, messageId: info.messageId };
 };
 
+// ===========================================
+// Send: generic branded email (used by Lipa Mdogo Mdogo savings)
+// ===========================================
+// `bodyHtml` must already be escaped by the caller. Attachments are passed
+// straight to nodemailer (e.g. a PDF receipt buffer).
+export const sendBrandedEmail = async ({ to, subject, preheader, bodyHtml, text, attachments, footerText }) => {
+  const info = await getTransporter().sendMail({
+    from: `"${FROM_NAME}" <${FROM_ADDRESS}>`,
+    to,
+    subject,
+    text,
+    html: brandShell({ preheader: preheader || subject, bodyHtml, footerText }),
+    attachments,
+  });
+  logger.info('Branded email sent', { to, subject, messageId: info.messageId });
+  return info;
+};
+
+export { escapeHtml as escapeEmailHtml };
+
 export default {
   sendVerificationEmail, sendAgentBookingNotificationEmail, sendBroadcastEmail,
   sendCustomRequestReplyEmail, verifyEmailTransport,
