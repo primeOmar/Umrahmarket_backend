@@ -1,5 +1,6 @@
 import express from 'express';
 import crypto from 'crypto';
+import validatorLib from 'validator';
 import bcrypt from 'bcryptjs';
 import { supabase, supabaseAdmin } from '../config/supabase.js';
 import { createClient } from '@supabase/supabase-js';
@@ -307,7 +308,9 @@ router.post(
             email: authData.user.email,
             firstName,
             lastName,
+            phone: phone || null,
             role: 'client',
+            emailVerified: false,
           },
           accessToken,
           refreshToken,
@@ -576,7 +579,7 @@ router.post(
       // at login time (Supabase sync lag) and causes the dummy-user bug
       let { data: profile, error: profileError } = await supabaseAdmin
         .from('profiles')
-        .select('role, agent_number, company_name, first_name, last_name, approved, email_verified, logo_url')
+        .select('role, agent_number, company_name, first_name, last_name, approved, email_verified, logo_url, phone')
         .eq('id', data.user.id)
         .maybeSingle(); // ← never throws on 0 rows (unlike .single())
 
@@ -609,7 +612,7 @@ router.post(
             email_verified: true, // legacy/pre-existing account — don't retroactively nag
             created_at: new Date().toISOString(),
           }, { onConflict: 'id' })
-          .select('role, agent_number, company_name, first_name, last_name, approved, email_verified, logo_url')
+          .select('role, agent_number, company_name, first_name, last_name, approved, email_verified, logo_url, phone')
           .single();
 
         if (createError || !created) {
@@ -661,6 +664,7 @@ router.post(
             lastName: profile.last_name,
             approved: profile.approved,
             emailVerified: profile.email_verified ?? false,
+            phone: profile.phone || null,
             ...(userRole === 'agent' && {
               agentNumber: profile.agent_number || null,
               agentName:   profile.company_name || null,
@@ -731,7 +735,7 @@ router.post('/google', authRateLimiter, async (req, res) => {
           email_verified: true, // Google already verified this address
           created_at: new Date().toISOString(),
         }, { onConflict: 'id' })
-        .select('role, agent_number, company_name, first_name, last_name, approved, email_verified, logo_url')
+        .select('role, agent_number, company_name, first_name, last_name, approved, email_verified, logo_url, phone')
         .single();
 
       if (googleProfileError) {
@@ -783,6 +787,7 @@ router.post('/google', authRateLimiter, async (req, res) => {
           lastName:  dbProfile?.last_name || '',
           approved:  dbProfile?.approved ?? true,
           emailVerified: dbProfile?.email_verified ?? true,
+          phone: dbProfile?.phone || null,
           ...(googleRole === 'agent' && {
             agentNumber: dbProfile?.agent_number || null,
             agentName:   dbProfile?.company_name || null,
@@ -1015,7 +1020,7 @@ router.post(
 
       const { data: profile } = await supabaseAdmin
         .from('profiles')
-        .select('role, agent_number, company_name, first_name, last_name, approved, email_verified, logo_url')
+        .select('role, agent_number, company_name, first_name, last_name, approved, email_verified, logo_url, phone')
         .eq('id', authUser.id)
         .maybeSingle();
 
@@ -1042,6 +1047,7 @@ router.post(
             lastName: profile?.last_name,
             approved: profile?.approved,
             emailVerified: profile?.email_verified ?? true,
+            phone: profile?.phone || null,
             ...(userRole === 'agent' && {
               agentNumber: profile?.agent_number || null,
               agentName:   profile?.company_name || null,
@@ -1081,7 +1087,7 @@ router.post('/verify-email', authRateLimiter, async (req, res) => {
 
     const { data: profile, error: lookupError } = await supabaseAdmin
       .from('profiles')
-      .select('id, email, first_name, last_name, role, approved, agent_number, company_name, email_verified, email_verify_expires_at')
+      .select('id, email, first_name, last_name, role, approved, agent_number, company_name, email_verified, email_verify_expires_at, phone')
       .eq('email_verify_token_hash', tokenHash)
       .maybeSingle();
 
@@ -1131,6 +1137,7 @@ router.post('/verify-email', authRateLimiter, async (req, res) => {
           lastName: profile.last_name,
           approved: profile.approved,
           emailVerified: true,
+          phone: profile.phone || null,
           ...(profile.role === 'agent' && {
             agentNumber: profile.agent_number || null,
             agentName: profile.company_name || null,
@@ -1197,7 +1204,14 @@ router.post('/verify-email', authRateLimiter, async (req, res) => {
 // ===========================================
 // 9b. RESEND VERIFICATION EMAIL
 // ===========================================
-router.post('/verify-email/resend', authRateLimiter, validateEmail, async (req, res) => {
+// NOTE: deliberately NOT using the shared validateEmail chain here. Its
+// default normalizeEmail() strips dots from Gmail addresses
+// ("john.doe@gmail.com" → "johndoe@gmail.com"), so any profile stored WITH
+// dots (e.g. every Google sign-up) never matched and the resend silently did
+// nothing while still telling the user "a new link has been sent".
+const RESEND_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+router.post('/verify-email/resend', authRateLimiter, async (req, res) => {
   // Always return the same generic message whether or not the account
   // exists / is already verified — avoids leaking which emails are
   // registered (same pattern as password-reset/request below).
@@ -1208,13 +1222,27 @@ router.post('/verify-email/resend', authRateLimiter, validateEmail, async (req, 
     });
 
   try {
-    const { email } = req.body;
+    const rawEmail = String(req.body?.email ?? '').trim().toLowerCase();
+    if (!rawEmail || rawEmail.length > 254 || !RESEND_EMAIL_RE.test(rawEmail)) {
+      return res.status(400).json({ success: false, error: 'Please provide a valid email address' });
+    }
 
-    const { data: profile, error: lookupError } = await supabaseAdmin
-      .from('profiles')
-      .select('id, first_name, email_verified, email_verify_last_sent_at')
-      .eq('email', email)
-      .maybeSingle();
+    // Match the address as typed (case-insensitive), then the normalised form
+    // the registration validator stores, so both kinds of account are found.
+    const fields = 'id, email, first_name, email_verified, email_verify_last_sent_at';
+    const candidates = [...new Set([rawEmail, validatorLib.normalizeEmail(rawEmail) || rawEmail])];
+    let profile = null;
+    let lookupError = null;
+    for (const candidate of candidates) {
+      const { data, error } = await supabaseAdmin
+        .from('profiles')
+        .select(fields)
+        .ilike('email', candidate.replace(/[%_\\]/g, '\\$&'))
+        .limit(1);
+      if (error) { lookupError = error; break; }
+      if (data?.[0]) { profile = data[0]; break; }
+    }
+    const email = profile?.email || rawEmail;
 
     if (lookupError) {
       logger.error('Resend verification lookup failed', { error: lookupError.message });

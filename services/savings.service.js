@@ -515,7 +515,7 @@ export async function notifyDepositCredited(txId) {
 
   const encouragementLine = progress.reached
     ? 'Alhamdulillah, you have saved enough for an Umrah package. Log in to choose your package.'
-    : `You are ${progress.percent}% of the way. An Umrah package costs ${fmtUsd(quote.targetMinUsd)} - ${fmtUsd(quote.targetMaxUsd)}. Keep going, insha'Allah!`;
+    : `You are ${progress.percent}% of the way. An Umrah package costs ${fmtUsd(quote.targetMinUsd)} - ${fmtUsd(quote.targetMaxUsd)}. Keep up your weekly or monthly savings, insha'Allah!`;
 
   // 1) In-app
   await createNotification(userId, {
