@@ -95,9 +95,17 @@ const sendVerificationEmail = async (to, firstName, isFollowUp) => {
  * WhatsApp content template with two variables: {1: name, 2: taskTitle}.
  */
 export const sendTaskAssignedWhatsApp = async (phone, fullNameOrUsername, taskTitle) => {
-  return sendWhatsApp(phone, process.env.TWILIO_TEMPLATE_TASK_ASSIGNED_SID, {
-    1: fullNameOrUsername,
-    2: taskTitle,
+  const contentSid = String(process.env.TWILIO_TEMPLATE_TASK_ASSIGNED_SID || '').trim();
+  if (!/^HX[0-9a-f]{32}$/i.test(contentSid)) {
+    logger.warn('[taskWhatsApp] TWILIO_TEMPLATE_TASK_ASSIGNED_SID missing/invalid (must be an approved HX… content SID)');
+    return { sent: false, reason: 'template_not_configured' };
+  }
+  // Twilio content variables must be non-empty strings without newlines;
+  // WhatsApp also rejects very long variable values.
+  const clean = (v, max) => String(v || '').replace(/\s+/g, ' ').trim().slice(0, max) || '-';
+  return sendWhatsApp(phone, contentSid, {
+    1: clean(fullNameOrUsername, 60),
+    2: clean(taskTitle, 200),
   });
 };
 

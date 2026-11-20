@@ -16,6 +16,7 @@ import whatsappAdminRouter from './whatsappRoutes.js';
 // ⚠️ Adjust this path if email.service.js doesn't live under ../services/
 // in your repo — this mirrors config/security.config.js's relative depth.
 import { sendBroadcastEmail, sendPasswordResetEmail } from '../services/email.service.js';
+import logger from '../config/logger.js';
 const router = express.Router();
 const R2 = new S3Client({
   region: 'auto',
@@ -610,38 +611,58 @@ router.post('/forgot-password', async (req, res) => {
       return res.status(422).json({ success: false, message: 'Please enter a valid email address' });
     }
 
+    // Per-email cooldown (in-memory; per instance). Prune old entries so the
+    // map can't grow without bound from junk emails.
+    const now = Date.now();
     const last = resetCooldown.get(email) || 0;
-    if (Date.now() - last < 60 * 1000) return res.json(generic);
-    resetCooldown.set(email, Date.now());
+    if (now - last < 60 * 1000) return res.json(generic);
+    resetCooldown.set(email, now);
+    if (resetCooldown.size > 1000) {
+      for (const [k, t] of resetCooldown) if (now - t > 60 * 1000) resetCooldown.delete(k);
+    }
 
-    const { data: admin } = await supabase
+    const { data: admin, error: lookupErr } = await supabase
       .from('superadmin_credentials')
       .select('id, email, full_name, status, password_hash')
       .eq('email', email)
       .maybeSingle();
 
-    if (admin && admin.status !== 'suspended' && admin.status !== 'inactive') {
+    if (lookupErr) {
+      // Previously ignored — a DB error looked identical to "no such account".
+      logger.error('[superadmin] forgot-password lookup failed', { error: lookupErr.message });
+      return res.json(generic);
+    }
+
+    if (!admin) {
+      logger.info('[superadmin] forgot-password: no matching account');
+    } else if (admin.status === 'suspended' || admin.status === 'inactive') {
+      logger.warn('[superadmin] forgot-password: account not eligible', { id: admin.id, status: admin.status });
+    } else {
       const token = jwt.sign(
         { sid: admin.id, fp: resetFingerprint(admin.password_hash), purpose: 'superadmin_reset' },
         RESET_SECRET(),
         { expiresIn: '1h' }
       );
       const base = (process.env.FRONTEND_URL || process.env.APP_URL || 'https://www.umrahmarket.net').replace(/\/$/, '');
-      try {
-        await sendPasswordResetEmail({
-          to: admin.email,
-          firstName: (admin.full_name || '').split(' ')[0],
-          resetUrl: `${base}/superadmin/reset-password?token=${encodeURIComponent(token)}`,
+
+      // Send in the background so response time is identical whether or not
+      // the account exists (prevents timing-based account enumeration).
+      sendPasswordResetEmail({
+        to: admin.email,
+        firstName: (admin.full_name || '').split(' ')[0],
+        resetUrl: `${base}/superadmin/reset-password?token=${encodeURIComponent(token)}`,
+      })
+        .then(() => logAuditAction(admin.id, 'PASSWORD_RESET_REQUESTED', 'superadmin', admin.id, 'Reset email sent', 'success', '', req))
+        .catch((mailErr) => {
+          // Never logs the token/URL. Surfaces SMTP problems (e.g. 535 auth failed).
+          logger.error('[superadmin] reset email failed', { id: admin.id, error: mailErr.message, code: mailErr.code, response: mailErr.response });
+          logAuditAction(admin.id, 'PASSWORD_RESET_REQUESTED', 'superadmin', admin.id, 'Reset email failed', 'failed', mailErr.message, req).catch(() => {});
         });
-        await logAuditAction(admin.id, 'PASSWORD_RESET_REQUESTED', 'superadmin', admin.id, 'Reset email sent', 'success', '', req);
-      } catch (mailErr) {
-        console.error('[superadmin] reset email failed:', mailErr.message);
-      }
     }
 
     res.json(generic);
   } catch (err) {
-    console.error('[superadmin] forgot-password error:', err.message);
+    logger.error('[superadmin] forgot-password error', { error: err.message });
     res.status(500).json({ success: false, message: 'Could not process request. Please try again.' });
   }
 });
@@ -652,8 +673,13 @@ router.post('/reset-password', async (req, res) => {
     if (!token || typeof token !== 'string') {
       return res.status(400).json({ success: false, message: 'Reset token is required' });
     }
-    if (!password || password.length < 8) {
-      return res.status(422).json({ success: false, message: 'Password must be at least 8 characters' });
+    // Same strength rule as /register — the reset must not allow a weaker password.
+    if (!password || typeof password !== 'string' || password.length > 128 ||
+        !/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&]).{8,}$/.test(password)) {
+      return res.status(422).json({
+        success: false,
+        message: 'Password must be at least 8 characters with uppercase, lowercase, number and special character (@$!%*?&)',
+      });
     }
 
     let payload;

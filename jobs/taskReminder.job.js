@@ -6,10 +6,14 @@ import logger from '../config/logger.js';
 const OVERDUE_OFFSET_SENTINEL = -1;
 
 async function getRecipients(task) {
-  const { data: assignees } = await supabase
+  // Explicit FK — task_assignees has two FKs to superadmin_credentials, and
+  // the ambiguous embed made this query fail, so reminders reached nobody
+  // but the creator.
+  const { data: assignees, error } = await supabase
     .from('task_assignees')
-    .select('superadmin_credentials(id, email, username, full_name)')
+    .select('superadmin_credentials!task_assignees_admin_id_fkey(id, email, username, full_name)')
     .eq('task_id', task.id);
+  if (error) logger.error('[taskReminderJob] failed to load assignees', { taskId: task.id, error: error.message });
 
   const { data: creator } = await supabase
     .from('superadmin_credentials')
